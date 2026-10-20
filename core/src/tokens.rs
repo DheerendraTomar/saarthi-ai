@@ -38,11 +38,13 @@ pub fn take_first(text: &str, max_tokens: usize) -> &str {
 /// Start offset of a cache-stable tail of `text` (the text before a cursor).
 ///
 /// `prev` (a start returned earlier for the same document) is kept while it
-/// is still a line start in `text` and the tail from it fits in
-/// `budget_tokens + slack_tokens`, so typing does not move the start. Else
-/// the tail is cut back to at most `budget_tokens`, starting at a line
-/// boundary (or, for a single line longer than the budget, at a char
-/// boundary). Texts within `budget_tokens` always start at 0.
+/// is a char boundary and the tail from it is between
+/// `budget_tokens − slack_tokens` and `budget_tokens + slack_tokens`, so
+/// typing does not move the start and moving up or deleting text never
+/// leaves a short prefix. Otherwise the tail is cut back to at most
+/// `budget_tokens`, at the first line start that still leaves at least
+/// `budget_tokens − slack_tokens` (or, failing that, at a char boundary).
+/// Texts within `budget_tokens` always start at 0.
 pub fn stable_tail_start(
     text: &str,
     budget_tokens: usize,
@@ -53,20 +55,24 @@ pub fn stable_tail_start(
     if text.len() <= budget {
         return 0;
     }
-    let limit = budget.saturating_add(slack_tokens.saturating_mul(4));
+    let slack = slack_tokens.saturating_mul(4);
+    let (lo, hi) = (budget.saturating_sub(slack), budget.saturating_add(slack));
+    let fits = |start: usize| (lo..=hi).contains(&(text.len() - start));
     if let Some(prev) = prev
         && prev <= text.len()
-        && text.len() - prev <= limit
-        && (prev == 0 || text.as_bytes()[prev - 1] == b'\n')
+        && text.is_char_boundary(prev)
+        && fits(prev)
     {
         return prev;
     }
     // First line start at or after `text.len() - budget` (>= 1 here).
     let min = text.len() - budget;
-    match text.as_bytes()[min - 1..].iter().position(|&b| b == b'\n') {
-        Some(i) => min + i,
-        None => text.len() - take_last(text, budget_tokens).len(),
-    }
+    let line_start = text.as_bytes()[min - 1..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| min + i)
+        .filter(|&start| text.len() - start >= lo);
+    line_start.unwrap_or_else(|| text.len() - take_last(text, budget_tokens).len())
 }
 
 #[cfg(test)]
@@ -139,9 +145,11 @@ mod tests {
         let moved = stable_tail_start(&typed, 10, 5, Some(start));
         assert!(moved > start && typed.len() - moved <= 40);
         assert_eq!(&typed[moved - 1..moved], "\n");
-        // A stale start that is no longer a line start is recomputed.
-        assert_eq!(stable_tail_start(&text, 10, 5, Some(61)), 60);
+        // Any in-range char boundary is kept (stable for long lines too);
+        // an out-of-range start is recomputed.
+        assert_eq!(stable_tail_start(&text, 10, 5, Some(61)), 61);
         assert_eq!(stable_tail_start(&text, 10, 5, Some(999)), 60);
+        assert_eq!(stable_tail_start(&text, 10, 5, Some(95)), 60);
     }
 
     #[test]
@@ -150,5 +158,32 @@ mod tests {
         let start = stable_tail_start(&text, 10, 5, None);
         assert!(text.is_char_boundary(start));
         assert!(text.len() - start <= 40);
+    }
+
+    #[test]
+    fn stable_tail_start_never_keeps_a_short_tail() {
+        let line = "x".repeat(9) + "\n";
+        let text = line.repeat(100); // 1000 bytes; budget 40, slack 5 -> [20, 60]
+        let start = stable_tail_start(&text, 10, 5, None);
+        assert_eq!(start, 960);
+        // Cursor moves up 500 bytes: `prev` would leave a tail of -460/0.
+        let up = &text[..500];
+        let moved = stable_tail_start(up, 10, 5, Some(start));
+        assert!(up.len() - moved >= 20 && up.len() - moved <= 40);
+        // Cursor just past `prev`: tail of 10 bytes is too short, recut.
+        let near = &text[..start + 10];
+        let recut = stable_tail_start(near, 10, 5, Some(start));
+        assert!(near.len() - recut >= 20);
+        assert_eq!(&near[recut - 1..recut], "\n");
+    }
+
+    #[test]
+    fn stable_tail_start_is_stable_on_one_long_line() {
+        let mut text = "a".repeat(1000);
+        let start = stable_tail_start(&text, 10, 5, None);
+        for _ in 0..20 {
+            text.push('b');
+            assert_eq!(stable_tail_start(&text, 10, 5, Some(start)), start);
+        }
     }
 }

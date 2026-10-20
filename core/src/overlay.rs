@@ -540,8 +540,9 @@ mod tests {
             character: 1,
         };
         let w = s.cursor_window(uri, pos, tiny, None).unwrap();
-        assert_eq!(w.prefix, "x"); // cut back to the line start
-        assert_eq!(w.prefix_start, 8);
+        // A line-aligned cut would leave less than budget - slack: char cut.
+        assert_eq!(w.prefix, "f\r\nx");
+        assert_eq!(w.prefix_start, 5);
         assert_eq!(w.suffix, "yz_1");
         assert_eq!(w.next_char, Some('y'));
         assert_eq!(w.doc_len, 15);

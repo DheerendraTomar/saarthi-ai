@@ -33,12 +33,13 @@ pub struct FimPrompt {
     pub suffix: String,
 }
 
-/// Tokens left for related snippets once prefix and suffix are budgeted:
-/// `completion_context_tokens − 2048 − 512` (1024 by default).
+/// Tokens left for related snippets once the largest prefix window and the
+/// suffix are budgeted: `completion_context_tokens − (2048 + 256) − 512`
+/// (768 by default), so the whole prompt stays within the context budget.
 pub fn snippet_budget(settings: &Settings) -> usize {
     settings
         .completion_context_tokens
-        .saturating_sub(PREFIX_TOKENS + SUFFIX_TOKENS)
+        .saturating_sub(PREFIX_TOKENS + PREFIX_SLACK_TOKENS + SUFFIX_TOKENS)
 }
 
 /// Line-comment token of `lang`, used for the snippets' `Path:` headers.
@@ -169,6 +170,6 @@ mod tests {
         assert_eq!(block, "");
         let block = snippet_block(&[small], Lang::Python, 100);
         assert_eq!(block, "# Path: b.py\ny\n\n");
-        assert_eq!(snippet_budget(&Settings::default()), 1024);
+        assert_eq!(snippet_budget(&Settings::default()), 768);
     }
 }

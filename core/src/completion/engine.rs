@@ -302,15 +302,8 @@ impl CompletionEngine {
             return;
         };
         let budget = prompt::snippet_budget(&read(&self.inner.settings));
-        let id = start_refresh(&self.inner, uri);
-        refresh(
-            self.inner.clone(),
-            uri.to_owned(),
-            window_lines(&window),
-            budget,
-            id,
-        )
-        .await;
+        let mark = start_refresh(&self.inner, uri);
+        refresh(mark, window_lines(&window), budget).await;
     }
 
     /// Drops the cached snippets and remembered cursor for `uri` (e.g. on
@@ -341,14 +334,18 @@ impl CompletionEngine {
         }
     }
 
+    #[cfg(test)]
+    fn refresh_running(&self, uri: &str) -> bool {
+        lock(&self.inner.snippets_by_uri)
+            .get(uri)
+            .is_some_and(|slot| slot.refresh.is_some())
+    }
+
     /// Waits until no snippet refresh for `uri` is running.
     #[cfg(test)]
     async fn wait_snippets_settled(&self, uri: &str) {
         for _ in 0..500 {
-            let busy = lock(&self.inner.snippets_by_uri)
-                .get(uri)
-                .is_some_and(|slot| slot.refresh.is_some());
-            if !busy {
+            if !self.refresh_running(uri) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -389,7 +386,7 @@ impl CompletionEngine {
         }
 
         // Serve what is cached, even if stale; refresh in the background.
-        let (snippets, refresh_id) = {
+        let (snippets, mark) = {
             let mut map = lock(&inner.snippets_by_uri);
             let slot = map.entry(uri.to_owned()).or_default();
             let fresh = slot
@@ -401,17 +398,13 @@ impl CompletionEngine {
                 .as_ref()
                 .map(|e| e.snippets.clone())
                 .unwrap_or_default();
-            let refresh_id = (!fresh && slot.refresh.is_none()).then(|| {
-                let id = inner.next_refresh.fetch_add(1, Ordering::Relaxed);
-                slot.refresh = Some(id);
-                id
-            });
-            (snippets, refresh_id)
+            // Claimed under the same lock as the check: one refresh per uri.
+            let mark = (!fresh && slot.refresh.is_none()).then(|| claim_refresh(inner, slot, uri));
+            (snippets, mark)
         };
-        if let Some(id) = refresh_id {
+        if let Some(mark) = mark {
             let budget = prompt::snippet_budget(settings);
-            let around = window_lines(&window);
-            tokio::spawn(refresh(inner.clone(), uri.to_owned(), around, budget, id));
+            tokio::spawn(refresh(mark, window_lines(&window), budget));
         }
 
         let lang = Lang::from_path(&uri_to_path(uri));
@@ -427,36 +420,63 @@ impl CompletionEngine {
     }
 }
 
-/// Marks a new refresh of `uri` as the newest one and returns its id.
-fn start_refresh(inner: &Inner, uri: &str) -> u64 {
-    let id = inner.next_refresh.fetch_add(1, Ordering::Relaxed);
-    lock(&inner.snippets_by_uri)
-        .entry(uri.to_owned())
-        .or_default()
-        .refresh = Some(id);
-    id
+/// Marks a new refresh of `uri` as the newest one.
+fn start_refresh(inner: &Arc<Inner>, uri: &str) -> RefreshMark {
+    let mut map = lock(&inner.snippets_by_uri);
+    claim_refresh(inner, map.entry(uri.to_owned()).or_default(), uri)
 }
 
-/// Computes the snippets for `uri` from the lines `around` the cursor (off
-/// the async threads: it reads files) and stores them if refresh `id` is
-/// still the newest for a uri that was not invalidated meanwhile. A failed
-/// computation keeps the previous snippets.
-async fn refresh(inner: Arc<Inner>, uri: String, around: String, budget: usize, id: u64) {
-    let task_inner = inner.clone();
-    let task_uri = uri.clone();
+/// Marks a new refresh as the newest for `slot` (whose map lock the caller
+/// holds; the returned mark must outlive that lock guard).
+fn claim_refresh(inner: &Arc<Inner>, slot: &mut SnippetSlot, uri: &str) -> RefreshMark {
+    let id = inner.next_refresh.fetch_add(1, Ordering::Relaxed);
+    slot.refresh = Some(id);
+    RefreshMark {
+        inner: inner.clone(),
+        uri: uri.to_owned(),
+        id,
+    }
+}
+
+/// Ownership of a slot's "refresh `id` running" mark. Dropping it clears the
+/// mark if it is still this refresh's, so a refresh whose future is dropped
+/// (or whose task fails) never blocks later refreshes of the uri.
+struct RefreshMark {
+    inner: Arc<Inner>,
+    uri: String,
+    id: u64,
+}
+
+impl Drop for RefreshMark {
+    fn drop(&mut self) {
+        let mut map = lock(&self.inner.snippets_by_uri);
+        if let Some(slot) = map.get_mut(&self.uri)
+            && slot.refresh == Some(self.id)
+        {
+            slot.refresh = None;
+        }
+    }
+}
+
+/// Computes the snippets for the marked uri from the lines `around` the
+/// cursor (off the async threads: it reads files) and stores them if this
+/// refresh is still the newest for a uri that was not invalidated meanwhile.
+/// A failed computation keeps the previous snippets.
+async fn refresh(mark: RefreshMark, around: String, budget: usize) {
+    let task_inner = mark.inner.clone();
+    let task_uri = mark.uri.clone();
     let computed = tokio::task::spawn_blocking(move || {
         compute_snippets(&task_inner, &task_uri, &around, budget)
     })
     .await;
-    let mut map = lock(&inner.snippets_by_uri);
-    let Some(slot) = map.get_mut(&uri) else {
-        return;
+    let Ok(snippets) = computed else {
+        return; // `mark` clears the running flag
     };
-    if slot.refresh != Some(id) {
-        return;
-    }
-    slot.refresh = None;
-    if let Ok(snippets) = computed {
+    let mut map = lock(&mark.inner.snippets_by_uri);
+    if let Some(slot) = map.get_mut(&mark.uri)
+        && slot.refresh == Some(mark.id)
+    {
+        slot.refresh = None;
         slot.entry = Some(SnippetEntry {
             snippets: Arc::new(snippets),
             computed_at: Instant::now(),
@@ -771,10 +791,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_prefix_stable_on_large_file() {
         // ~30 KB of code before the cursor: far over the 8 KB prefix budget.
-        let body: String = (0..800)
-            .map(|i| format!("value_{i} = helper_value({i})  # pad\n"))
-            .collect();
-        let main = format!("from util import helper_value\n{body}print(resul\n");
+        let main = large_main();
         assert!(main.len() > 3 * PREFIX_BYTES);
         let f = fixture(&main);
         f.engine.refresh_snippets(&f.uri).await;
@@ -820,6 +837,110 @@ mod tests {
     }
 
     const PREFIX_BYTES: usize = prompt::PREFIX_TOKENS * 4;
+    const MIN_PREFIX_BYTES: usize = (prompt::PREFIX_TOKENS - prompt::PREFIX_SLACK_TOKENS) * 4;
+
+    fn large_main() -> String {
+        let body: String = (0..800)
+            .map(|i| format!("value_{i} = helper_value({i})  # pad\n"))
+            .collect();
+        format!("from util import helper_value\n{body}print(resul\n")
+    }
+
+    /// The prefix window is long enough and starts at a line boundary.
+    fn assert_full_window(p: &Prepared, text_before: &str) {
+        let prefix = &p.key.1;
+        assert!(
+            (MIN_PREFIX_BYTES..=PREFIX_BYTES + prompt::PREFIX_SLACK_TOKENS * 4)
+                .contains(&prefix.len()),
+            "prefix of {} bytes",
+            prefix.len()
+        );
+        assert!(text_before.ends_with(prefix.as_str()));
+        assert!(text_before[..text_before.len() - prefix.len()].ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn prefix_stays_full_after_moving_up_or_deleting_above() {
+        let main = large_main();
+        let f = fixture(&main);
+        f.engine.refresh_snippets(&f.uri).await;
+        let end = Position {
+            line: 801,
+            character: 11,
+        };
+        f.engine.prepare(&f.uri, end).await.unwrap();
+
+        // Move the cursor up, to the end of a line well above the old window.
+        let line_599 = main.lines().nth(599).unwrap();
+        let up = Position {
+            line: 599,
+            character: line_599.len() as u32,
+        };
+        let before_up = &main[..crate::overlay::offset_of(&main, up)];
+        assert!(before_up.ends_with(line_599));
+        let p = f.engine.prepare(&f.uri, up).await.unwrap();
+        assert_full_window(&p, before_up);
+
+        // Typing there keeps the prompt stable.
+        type_char(&f, up, 2);
+        let next = Position {
+            character: up.character + 1,
+            ..up
+        };
+        let typed = f.engine.prepare(&f.uri, next).await.unwrap();
+        assert_eq!(typed.prompt.prompt, format!("{}t", p.prompt.prompt));
+
+        // Delete a large block above the window, back at the end.
+        f.engine.prepare(&f.uri, end).await.unwrap();
+        let cut = ContentChange {
+            range: Some(Range {
+                start: Position {
+                    line: 300,
+                    character: 0,
+                },
+                end: Position {
+                    line: 790,
+                    character: 0,
+                },
+            }),
+            text: String::new(),
+        };
+        f.store.write().unwrap().did_change(&f.uri, 3, vec![cut]);
+        let text = f.store.read().unwrap().text(&f.uri).unwrap();
+        let at = Position {
+            line: 311,
+            character: 11,
+        };
+        let before = &text[..crate::overlay::offset_of(&text, at)];
+        assert!(before.ends_with("print(resul"));
+        let p = f.engine.prepare(&f.uri, at).await.unwrap();
+        assert_full_window(&p, before);
+    }
+
+    #[tokio::test]
+    async fn dropped_refresh_does_not_leave_the_running_mark() {
+        use futures::FutureExt;
+        let f = fixture(MAIN);
+        // Polled once (the blocking computation is still running), then dropped.
+        let _ = f.engine.refresh_snippets(&f.uri).now_or_never();
+        assert!(!f.engine.refresh_running(&f.uri));
+        // A later request can still start a background refresh.
+        let pos = Position {
+            line: 3,
+            character: 11,
+        };
+        f.engine.invalidate_snippets(&f.uri);
+        f.engine.prepare(&f.uri, pos).await.unwrap();
+        f.engine.wait_snippets_settled(&f.uri).await;
+        assert!(
+            f.engine
+                .prepare(&f.uri, pos)
+                .await
+                .unwrap()
+                .snippet_block()
+                .contains("helper_value")
+        );
+    }
 
     #[tokio::test]
     async fn stale_or_missing_snippets_refresh_in_background() {
