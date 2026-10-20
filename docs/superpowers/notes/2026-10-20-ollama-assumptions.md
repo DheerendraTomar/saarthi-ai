@@ -18,7 +18,8 @@
 | 4 | `think:false` suppresses thinking | **PASS** | `think:false`: `message` has no `thinking` key; wall 0.68 s. `think:true`: `thinking` string (110 chars), wall 1.52 s |
 | 5 | Both models resident simultaneously with default settings | **PASS** | `/api/ps` lists both (`mlx` 20.06 GB + `llamacpp` 2.12 GB); `OLLAMA_MAX_LOADED_MODELS` unset |
 | 6 | Prompt (KV) cache reuse for identical FIM prefix | **PASS** | run 1: `prompt_eval_count` 1509, `prompt_eval_cached_count` 1, `prompt_eval_duration` 696.7 ms; run 2: 1509 / 1502 / 11.4 ms (~61× faster) |
-| 7 | Dropping a streaming request frees the model promptly | **PASS** | curl killed at 1 s (exit 28, 165 chunks received); next request TTFB 0.0086 s, total 0.051 s |
+| 7 | Dropping a streaming request frees the model promptly | **PASS** | curl killed at 1 s (exit 28, 163 chunks received); next request TTFB 0.0084 s, total 0.051 s |
+| 8 | Streaming chunk shapes for `/api/generate` and `/api/chat` (incl. tool calls) | recorded | verbatim chunks below; chat `tool_calls` arrive whole in one `done:false` chunk, before the `done:true` chunk |
 
 ## Evidence (raw JSON, trimmed)
 
@@ -112,14 +113,78 @@ the FIM template puts prefix first and the suffix after, and cache reuse works a
 ### 7. Streaming cancel
 
 `POST /api/generate` `{"model":"qwen2.5-coder:1.5b-base","prompt":"# A long essay about Python\n","stream":true,"options":{"num_predict":512},"keep_alive":"30m"}`
-dropped with `curl --max-time 1`: `curl: (28) Operation timed out after 1001 milliseconds with 17948 bytes received`,
-165 NDJSON chunks received, each shaped `{"model":…,"created_at":…,"response":"<token>","done":false}`.
+dropped with `curl --max-time 1` (re-run during review fix, 2026-10-20T16:13):
+`curl: (28) Operation timed out after 1002 milliseconds with 17712 bytes received`, 163 NDJSON chunks received.
+First chunk verbatim:
+```json
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:02.517804Z","response":"#","done":false}
+```
 `/api/ps` immediately after: both models still loaded (cancel does not unload).
-Second request (streaming, `num_predict:8`): `http=200 ttfb=0.0086s total=0.051s`.
+Second request `{"model":"qwen2.5-coder:1.5b-base","prompt":"def hello():\n    ","stream":true,"options":{"num_predict":8},"keep_alive":"30m"}`:
+`http=200 ttfb=0.008376s total=0.051108s`. Its full body:
+```json
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.535337Z","response":" return","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.541227Z","response":" \"","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.547511Z","response":"Hello","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.553595Z","response":",","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.559609Z","response":" World","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.565747Z","response":"\"\n","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.571813Z","response":"    ","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.577716Z","response":" print","done":false}
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.577813Z","response":"","done":true,"done_reason":"length","context":[750,23811,3932,257,470,330,9707,11,4337,698,257,1173],"total_duration":50466292,"load_duration":397292,"prompt_eval_count":4,"prompt_eval_cached_count":3,"prompt_eval_duration":6221000,"eval_count":8,"eval_duration":42423000}
+```
 
 Caveat: at ~6 ms/token the cancelled stream would have needed ~2 more seconds to finish 512 tokens, so a 9 ms TTFB
 indicates it was aborted (or ran in a parallel slot — `OLLAMA_NUM_PARALLEL` is default). Cancel was only exercised
 on the `llamacpp` runner (completion model), not on the `mlx` 27B.
+
+### 8. Streaming chunk shapes
+
+**8a. Streaming `/api/generate`** — request:
+`{"model":"qwen2.5-coder:1.5b-base","prompt":"def hello():\n    ","stream":true,"options":{"num_predict":8,"temperature":0},"keep_alive":"30m"}`
+(`http=200 ttfb=0.007821s total=0.049927s`, 8 `done:false` chunks + 1 `done:true` chunk).
+
+Mid-stream chunk (verbatim):
+```json
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.609255Z","response":"Hello","done":false}
+```
+Final chunk (verbatim):
+```json
+{"model":"qwen2.5-coder:1.5b-base","created_at":"2026-10-20T16:13:03.638916Z","response":"","done":true,"done_reason":"length","context":[750,23811,3932,257,1173,445,9707,4337,1138,257,1173,445],"total_duration":49229958,"load_duration":371875,"prompt_eval_count":4,"prompt_eval_cached_count":3,"prompt_eval_duration":6027000,"eval_count":8,"eval_duration":41815000}
+```
+- Mid-stream chunks carry only `model`, `created_at`, `response`, `done:false`.
+- The final chunk has `response:""` and carries `done_reason` (`"length"` when `num_predict` is hit, `"stop"` otherwise),
+  `context`, all counts and durations.
+
+**8b. Streaming `/api/chat` with tools, `think:false`** — request:
+`{"model":"qwen3.8:27b-mlx","messages":[{"role":"user","content":"What is the weather in Paris? Use the tool."}],"tools":[…get_weather, same as check 2…],"stream":true,"think":false,"keep_alive":"30m"}`
+(`http=200 ttfb=0.689145s total=0.689178s`). Full body — exactly two chunks:
+```json
+{"model":"qwen3.8:27b-mlx","created_at":"2026-10-20T16:13:04.33821Z","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_cg2x9d3s","function":{"index":0,"name":"get_weather","arguments":{"city":"Paris"}}}]},"done":false}
+{"model":"qwen3.8:27b-mlx","created_at":"2026-10-20T16:13:04.338257Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","total_duration":688732750,"load_duration":329667,"prompt_eval_count":288,"prompt_eval_cached_count":284,"prompt_eval_duration":71498542,"eval_count":25,"eval_duration":616131959}
+```
+- `tool_calls` arrive **complete** (parsed `arguments` object, `id`, `index`) in a single `done:false` chunk; they are
+  not streamed incrementally and are **not** repeated in the `done:true` chunk. The client must accumulate
+  `tool_calls` from `done:false` chunks.
+- No text chunks were emitted before the tool call (the model's tool-call tokens are swallowed by the parser), so the
+  TTFB equals the full generation time for a tool-call turn.
+- With one tool call only one tool-call chunk was seen; whether parallel calls arrive in one chunk or several was not tested.
+
+**8c. Streaming `/api/chat` plain text, `think:false`, no tools** — request:
+`{"model":"qwen3.8:27b-mlx","messages":[{"role":"user","content":"Say hello in exactly five words."}],"stream":true,"think":false,"keep_alive":"30m"}`
+(`http=200 ttfb=0.390203s total=0.698775s`, 7 text chunks + final).
+
+Text chunk (verbatim):
+```json
+{"model":"qwen3.8:27b-mlx","created_at":"2026-10-20T16:13:04.740228Z","message":{"role":"assistant","content":" there"},"done":false}
+```
+Final chunk (verbatim):
+```json
+{"model":"qwen3.8:27b-mlx","created_at":"2026-10-20T16:13:05.048745Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","total_duration":698338042,"load_duration":264917,"prompt_eval_count":19,"prompt_eval_cached_count":0,"prompt_eval_duration":264856375,"eval_count":7,"eval_duration":432776375}
+```
+- Every chat chunk has `message.role:"assistant"`; `content` is a delta. The final chunk has `content:""`, no
+  `tool_calls`, and the counts/durations. Chat chunks have no `context` field.
+- MLX chunks are delivered in small bursts (pairs with near-identical `created_at`).
 
 ## Consequences for the plan
 
@@ -134,6 +199,10 @@ on the `llamacpp` runner (completion model), not on the `mlx` 27B.
   - `message.thinking` is optional (absent when `think:false`); `message.content` is present (may be `""`).
   - Final responses carry `prompt_eval_count`, `prompt_eval_cached_count`, `prompt_eval_duration`, `eval_count`,
     `eval_duration`, `load_duration`, `total_duration`, `done_reason`; `/api/generate` also returns `context`.
+  - Streaming: one NDJSON object per line. `/api/generate` chunk = `{model, created_at, response, done}` plus, on
+    `done:true` only, `done_reason`, `context` and the counts/durations. `/api/chat` chunk = `{model, created_at,
+    message{role, content, tool_calls?, thinking?}, done}` plus the same final-only fields (no `context`).
+    `tool_calls` arrive whole in a `done:false` chunk and must be accumulated; the `done:true` chunk does not repeat them.
   - `/api/ps` entries: `name`, `model`, `size`, `digest`, `details{format,family,families(nullable),parameter_size,quantization_level}`, `expires_at`, `size_vram`, `context_length`, `runner`.
 - Thinking should default off for chat (`think:false`): ~2× latency even on trivial prompts.
 - Keep FIM prefixes stable (prefix first, suffix varies) to benefit from the KV cache (~61× faster prompt eval at 1.5k tokens).

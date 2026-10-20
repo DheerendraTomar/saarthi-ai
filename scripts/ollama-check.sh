@@ -109,7 +109,33 @@ echo "--- /api/ps right after cancel:"
 curl -sS -m 10 "$OLLAMA_URL/api/ps"; echo
 echo "--- second request (streaming, small), ttfb = time to first chunk:"
 SECOND=$(jq -nc --arg m "$FIM_MODEL" '{model:$m, prompt:"def hello():\n    ", stream:true, options:{num_predict:8}, keep_alive:"30m"}')
-curl -sS -m 60 -X POST "$OLLAMA_URL/api/generate" -d "$SECOND" -o /dev/null \
+curl -sS -m 60 -X POST "$OLLAMA_URL/api/generate" -d "$SECOND" -o /tmp/ollama-second.out \
   -w 'second request: http=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n'
+echo "--- second request body (NDJSON):"
+cat /tmp/ollama-second.out
+
+# ---------------------------------------------------------------------------
+# stream_post PATH JSON -> prints every NDJSON line verbatim, then curl timing
+stream_post() {
+  curl -sS -m 600 -X POST "$OLLAMA_URL$1" -H 'Content-Type: application/json' -d "$2" \
+    -w '[http=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s]\n'
+}
+
+hr "8a. Streaming /api/generate (full NDJSON)"
+REQ8A=$(jq -nc --arg m "$FIM_MODEL" '{model:$m, prompt:"def hello():\n    ", stream:true, options:{num_predict:8, temperature:0}, keep_alive:"30m"}')
+echo "REQUEST: $REQ8A"
+stream_post /api/generate "$REQ8A"
+
+hr "8b. Streaming /api/chat with tools, think:false (full NDJSON)"
+REQ8B=$(jq -nc --arg m "$CHAT_MODEL" --argjson msgs "[$USER_MSG]" --argjson tools "$TOOLS" \
+  '{model:$m, messages:$msgs, tools:$tools, stream:true, think:false, keep_alive:"30m"}')
+echo "REQUEST: $REQ8B"
+stream_post /api/chat "$REQ8B"
+
+hr "8c. Streaming /api/chat plain text (no tools), think:false (full NDJSON)"
+REQ8C=$(jq -nc --arg m "$CHAT_MODEL" \
+  '{model:$m, messages:[{role:"user", content:"Say hello in exactly five words."}], stream:true, think:false, keep_alive:"30m"}')
+echo "REQUEST: $REQ8C"
+stream_post /api/chat "$REQ8C"
 
 hr "done"
