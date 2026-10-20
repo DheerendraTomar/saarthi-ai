@@ -17,6 +17,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{ContentChange, Position, Range};
+use crate::tokens;
 
 /// One open document: its text plus line-start byte offsets, rebuilt per change.
 #[derive(Debug)]
@@ -136,6 +137,32 @@ impl DocumentStore {
         Some((prefix.to_string(), suffix.to_string()))
     }
 
+    /// The text around `pos` in the open document `uri`, copying only the
+    /// last `prefix_tokens` before and the first `suffix_tokens` after the
+    /// cursor (by [`tokens::take_last`] / [`tokens::take_first`]), so the
+    /// cost does not grow with the document.
+    pub fn cursor_window(
+        &self,
+        uri: &str,
+        pos: Position,
+        prefix_tokens: usize,
+        suffix_tokens: usize,
+    ) -> Option<CursorWindow> {
+        let doc = self.docs.get(&normalize_uri(uri))?;
+        let (prefix, suffix) = doc.text.split_at(doc.offset(pos));
+        let crlf = doc
+            .line_starts
+            .get(1)
+            .is_some_and(|&start| doc.text.as_bytes()[..start].ends_with(b"\r\n"));
+        Some(CursorWindow {
+            prefix: tokens::take_last(prefix, prefix_tokens).to_owned(),
+            suffix: tokens::take_first(suffix, suffix_tokens).to_owned(),
+            next_char: suffix.chars().next(),
+            doc_len: doc.text.len(),
+            crlf,
+        })
+    }
+
     /// Up to `n` URIs of open documents that have been edited, most recently
     /// changed first.
     pub fn recently_edited(&self, n: usize) -> Vec<String> {
@@ -151,6 +178,21 @@ impl DocumentStore {
             .map(|(_, uri)| uri.to_string())
             .collect()
     }
+}
+
+/// Bounded text around a cursor; see [`DocumentStore::cursor_window`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorWindow {
+    /// Tail of the text before the cursor.
+    pub prefix: String,
+    /// Head of the text after the cursor.
+    pub suffix: String,
+    /// The character right after the cursor, if any.
+    pub next_char: Option<char>,
+    /// Length of the whole document in bytes.
+    pub doc_len: usize,
+    /// The document's first line ends with `\r\n`.
+    pub crlf: bool,
 }
 
 /// Point-in-time copy of the open documents, keyed by normalized absolute
@@ -458,5 +500,33 @@ mod tests {
         let uri = path_to_uri(&path);
         assert_eq!(uri, "file:///Users/me/My%20Project/na%C3%AFve%231.rs");
         assert_eq!(uri_to_path(&uri), path);
+    }
+
+    #[test]
+    fn cursor_window_is_bounded_and_reports_line_endings() {
+        let mut s = store();
+        let uri = "file:///ws/a.py";
+        s.did_open(uri, "abcdef\r\nxyz_1\r\n".to_string(), 1);
+        let pos = Position {
+            line: 1,
+            character: 1,
+        };
+        let w = s.cursor_window(uri, pos, 1, 1).unwrap();
+        assert_eq!(w.prefix, "f\r\nx");
+        assert_eq!(w.suffix, "yz_1");
+        assert_eq!(w.next_char, Some('y'));
+        assert_eq!(w.doc_len, 15);
+        assert!(w.crlf);
+
+        s.did_open(uri, "ab\ncd".to_string(), 2);
+        let far = Position {
+            line: 9,
+            character: 9,
+        };
+        let w = s.cursor_window(uri, far, 512, 512).unwrap();
+        assert_eq!((w.prefix.as_str(), w.suffix.as_str()), ("ab\ncd", ""));
+        assert_eq!(w.next_char, None);
+        assert!(!w.crlf);
+        assert!(s.cursor_window("file:///ws/none.py", far, 1, 1).is_none());
     }
 }

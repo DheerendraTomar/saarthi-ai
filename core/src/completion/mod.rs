@@ -1,0 +1,12 @@
+//! Inline (ghost-text) completions: prompt assembly, caching, stop rules and
+//! the engine that drives the fill-in-the-middle model through Ollama.
+
+pub mod cache;
+pub mod engine;
+pub mod prompt;
+pub mod stop;
+
+pub use cache::CompletionCache;
+pub use engine::CompletionEngine;
+pub use prompt::FimPrompt;
+pub use stop::{StopMode, Trimmer};
