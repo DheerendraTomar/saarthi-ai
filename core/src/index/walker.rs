@@ -83,17 +83,18 @@ pub fn root_ignore(root: &Path) -> Gitignore {
     })
 }
 
-/// Cheap, I/O-free checks on a root-relative path: hidden or always-ignored
+/// Cheap, I/O-free checks on a root-relative path (`is_dir` matters for
+/// directory-only patterns like `logs/`): hidden or always-ignored
 /// components, or a match in the root ignore files (for the path or any parent
 /// directory).
-pub fn excluded_by_path(rel: &Path, ignore: &Gitignore) -> bool {
+pub fn excluded_by_path(rel: &Path, is_dir: bool, ignore: &Gitignore) -> bool {
     let hidden_or_ignored = rel.components().any(|c| match c {
         Component::Normal(name) => {
             is_always_ignored(name) || name.to_str().is_some_and(|n| n.starts_with('.'))
         }
         _ => true,
     });
-    hidden_or_ignored || ignore.matched_path_or_any_parents(rel, false).is_ignore()
+    hidden_or_ignored || ignore.matched_path_or_any_parents(rel, is_dir).is_ignore()
 }
 
 /// Reads `path` for indexing: `None` if it is unreadable, larger than

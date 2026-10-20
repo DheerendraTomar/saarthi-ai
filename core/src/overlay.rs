@@ -11,6 +11,7 @@
 //! to the start of that character. Line endings (`\n`, `\r\n`, `\r`) are kept
 //! byte-for-byte.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,19 @@ impl DocumentStore {
         }
     }
 
+    /// Owned copy of every open document's text, so a caller can release the
+    /// store lock before doing disk I/O (e.g. workspace search).
+    pub fn overlay_snapshot(&self) -> OverlaySnapshot {
+        OverlaySnapshot {
+            workspace_root: self.workspace_root.clone(),
+            docs: self
+                .docs
+                .iter()
+                .map(|(uri, d)| (uri_to_path(uri), d.text.clone()))
+                .collect(),
+        }
+    }
+
     /// The overlay text for `uri`, if open.
     pub fn text(&self, uri: &str) -> Option<String> {
         self.docs.get(&normalize_uri(uri)).map(|d| d.text.clone())
@@ -136,6 +150,37 @@ impl DocumentStore {
             .take(n)
             .map(|(_, uri)| uri.to_string())
             .collect()
+    }
+}
+
+/// Point-in-time copy of the open documents, keyed by normalized absolute
+/// path. Reads with the same overlay-then-disk semantics as
+/// [`DocumentStore::read`] without needing the store (or its lock).
+#[derive(Debug, Clone, Default)]
+pub struct OverlaySnapshot {
+    workspace_root: PathBuf,
+    docs: HashMap<PathBuf, String>,
+}
+
+impl OverlaySnapshot {
+    /// Reads `path` from the snapshot if it was open, else from disk. Relative
+    /// paths resolve against the workspace root.
+    /// Open documents are borrowed, not copied.
+    pub fn read(&self, path: &Path) -> io::Result<Cow<'_, str>> {
+        let abs = normalize_path(&self.workspace_root.join(path));
+        match self.docs.get(&abs) {
+            Some(text) => Ok(Cow::Borrowed(text)),
+            None => std::fs::read_to_string(&abs).map(Cow::Owned),
+        }
+    }
+
+    /// Number of open documents captured.
+    pub fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
     }
 }
 

@@ -2,10 +2,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use localpilot_core::index::search::{self, SearchQuery};
+use localpilot_core::index::search::{self, SearchError, SearchQuery};
 use localpilot_core::index::symbols::{self, Lang};
 use localpilot_core::index::{WorkspaceIndex, watcher};
 use localpilot_core::overlay::{DocumentStore, path_to_uri};
@@ -65,6 +66,8 @@ fn build_respects_gitignore_and_size_limit() {
     write(root, "src/lib.rs", "pub fn lib_fn() {}\n");
     let mut index = index;
     index.update(&root.join("ignored/later.rs"));
+    // A directory event for a dir-only pattern (`ignored/`) must not walk it.
+    index.update(&root.join("ignored"));
     index.update(Path::new("src/lib.rs"));
     assert!(!index.files().contains(&rel("ignored/later.rs")));
     assert!(index.files().contains(&rel("src/lib.rs")));
@@ -174,6 +177,15 @@ fn rust_and_go_imports_resolve() {
     );
 }
 
+fn query(q: &str, regex: bool, glob: Option<&str>, max_results: usize) -> SearchQuery {
+    SearchQuery {
+        query: q.into(),
+        regex,
+        glob: glob.map(Into::into),
+        max_results,
+    }
+}
+
 #[test]
 fn search_literal_and_regex_with_glob_and_limit() {
     let dir = tempfile::tempdir().unwrap();
@@ -182,74 +194,58 @@ fn search_literal_and_regex_with_glob_and_limit() {
     write(root, "b.py", "def alpha():\n    pass\n");
     write(root, "c.rs", "fn alpha2() {}\n");
     let index = WorkspaceIndex::build(root);
-    let store = DocumentStore::new(root.to_path_buf());
+    let files = index.files();
+    let overlay = DocumentStore::new(root.to_path_buf()).overlay_snapshot();
 
     // Literal: '.' is not a wildcard.
-    let hits = search::search(
-        &index,
-        &store,
-        SearchQuery {
-            query: "a.b".into(),
-            regex: false,
-            glob: None,
-            max_results: 10,
-        },
-    );
-    assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!(
-        (hits[0].path.as_path(), hits[0].line),
-        (Path::new("a.rs"), 2)
-    );
-    assert_eq!(hits[0].text, "let x = a.b;");
+    let res = search::search(&files, &overlay, query("a.b", false, None, 10)).unwrap();
+    assert!(!res.truncated);
+    assert_eq!(res.matches.len(), 1, "{res:?}");
+    let m = &res.matches[0];
+    assert_eq!((m.path.as_path(), m.line), (Path::new("a.rs"), 2));
+    assert_eq!(m.text, "let x = a.b;");
 
     // Regex restricted by glob.
-    let hits = search::search(
-        &index,
-        &store,
-        SearchQuery {
-            query: r"fn \w+\(".into(),
-            regex: true,
-            glob: Some("*.rs".into()),
-            max_results: 10,
-        },
-    );
-    let got: Vec<_> = hits.iter().map(|m| (m.path.clone(), m.line)).collect();
+    let res = search::search(&files, &overlay, query(r"fn \w+\(", true, Some("*.rs"), 10)).unwrap();
+    let got: Vec<_> = res
+        .matches
+        .iter()
+        .map(|m| (m.path.clone(), m.line))
+        .collect();
     assert_eq!(
         got,
         vec![(rel("a.rs"), 1), (rel("a.rs"), 3), (rel("c.rs"), 1)]
     );
+    assert!(!res.truncated);
 
-    // Limit.
-    let hits = search::search(
-        &index,
-        &store,
-        SearchQuery {
-            query: "alpha".into(),
-            regex: false,
-            glob: None,
-            max_results: 2,
-        },
-    );
-    assert_eq!(hits.len(), 2);
+    // Limit: 3 matches exist, 2 returned and flagged truncated.
+    let res = search::search(&files, &overlay, query("alpha", false, None, 2)).unwrap();
+    assert_eq!(res.matches.len(), 2);
+    assert!(res.truncated);
+    // Exactly at the limit is not truncated.
+    let res = search::search(&files, &overlay, query("alpha", false, None, 3)).unwrap();
+    assert_eq!(res.matches.len(), 3);
+    assert!(!res.truncated);
 
-    // Invalid regex yields no matches rather than panicking.
-    let hits = search::search(
-        &index,
-        &store,
-        SearchQuery {
-            query: "(".into(),
-            regex: true,
-            glob: None,
-            max_results: 10,
-        },
-    );
-    assert!(hits.is_empty());
+    // Bad patterns are descriptive errors, not empty results.
+    assert!(matches!(
+        search::search(&files, &overlay, query("(", true, None, 10)),
+        Err(SearchError::InvalidRegex(msg)) if !msg.is_empty()
+    ));
+    assert!(matches!(
+        search::search(&files, &overlay, query("x", false, Some("a[b"), 10)),
+        Err(SearchError::InvalidGlob(_))
+    ));
+    assert!(matches!(
+        search::list_files(&index, Some("a[b")),
+        Err(SearchError::InvalidGlob(_))
+    ));
 
     assert_eq!(
-        search::list_files(&index, Some("*.rs")),
+        search::list_files(&index, Some("*.rs")).unwrap(),
         vec![rel("a.rs"), rel("c.rs")]
     );
-    assert_eq!(search::list_files(&index, None).len(), 3);
+    assert_eq!(search::list_files(&index, None).unwrap().len(), 3);
 }
 
 #[test]
@@ -264,17 +260,16 @@ fn search_sees_overlay_content() {
         "first\nunsaved_marker\n".into(),
         1,
     );
+    // The store is only needed to take the snapshot; search runs without it.
+    let overlay = store.overlay_snapshot();
+    drop(store);
+    let files = index.files();
 
-    let query = |q: &str| SearchQuery {
-        query: q.into(),
-        regex: false,
-        glob: None,
-        max_results: 10,
-    };
-    let hits = search::search(&index, &store, query("unsaved_marker"));
-    assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!(hits[0].line, 2);
-    assert!(search::search(&index, &store, query("on_disk_marker")).is_empty());
+    let res = search::search(&files, &overlay, query("unsaved_marker", false, None, 10)).unwrap();
+    assert_eq!(res.matches.len(), 1, "{res:?}");
+    assert_eq!(res.matches[0].line, 2);
+    let res = search::search(&files, &overlay, query("on_disk_marker", false, None, 10)).unwrap();
+    assert!(res.matches.is_empty());
 }
 
 #[tokio::test]
@@ -310,5 +305,99 @@ async fn watcher_picks_up_new_file() {
             .identifiers
             .contains("fresh_symbol")
     );
+    handle.abort();
+}
+
+/// Rewrites `rels` under `root` every 20 ms until `stop` is set.
+fn churn(
+    root: PathBuf,
+    rels: &'static [&'static str],
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut i = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            for r in rels {
+                write(&root, r, format!("// churn {i}\n"));
+            }
+            i += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+}
+
+/// Polls `index` every 25 ms until `done` holds or `limit` passes.
+async fn wait_for(
+    index: &Arc<RwLock<WorkspaceIndex>>,
+    limit: Duration,
+    done: impl Fn(&WorkspaceIndex) -> bool,
+) -> bool {
+    tokio::time::timeout(limit, async {
+        while !done(&index.read().unwrap()) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn watcher_ignored_churn_does_not_delay_real_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write(&root, ".gitignore", "logs/\n");
+    write(&root, "main.rs", "fn main() {}\n");
+    let index = Arc::new(RwLock::new(WorkspaceIndex::build(&root)));
+    let handle = watcher::spawn(&root, index.clone());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let churner = churn(
+        root.clone(),
+        &[
+            "target/debug/out.rs",
+            "node_modules/dep/index.js",
+            ".git/index",
+            "logs/app.log",
+        ],
+        stop.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    write(&root, "real.rs", "fn real_edit() {}\n");
+
+    // Well under MAX_WAIT: only filtering (not the cap) can make this pass
+    // while the churn continues.
+    assert!(watcher::MAX_WAIT > Duration::from_millis(1500));
+    let seen = wait_for(&index, Duration::from_millis(1500), |i| {
+        i.contains(Path::new("real.rs"))
+    })
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    churner.join().unwrap();
+    assert!(seen, "files: {:?}", index.read().unwrap().files());
+    assert_eq!(
+        index.read().unwrap().files(),
+        vec![rel("main.rs"), rel("real.rs")]
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn watcher_flushes_within_max_wait_under_constant_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let index = Arc::new(RwLock::new(WorkspaceIndex::build(&root)));
+    let handle = watcher::spawn(&root, index.clone());
+
+    // A non-ignored file rewritten every 20 ms never lets the debounce go quiet.
+    let stop = Arc::new(AtomicBool::new(false));
+    let churner = churn(root.clone(), &["hot.rs"], stop.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    write(&root, "real.rs", "fn real_edit() {}\n");
+
+    let limit = watcher::MAX_WAIT + Duration::from_millis(1000);
+    let seen = wait_for(&index, limit, |i| i.contains(Path::new("real.rs"))).await;
+    stop.store(true, Ordering::Relaxed);
+    churner.join().unwrap();
+    assert!(seen, "files: {:?}", index.read().unwrap().files());
     handle.abort();
 }
