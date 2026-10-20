@@ -137,26 +137,37 @@ impl DocumentStore {
         Some((prefix.to_string(), suffix.to_string()))
     }
 
-    /// The text around `pos` in the open document `uri`, copying only the
-    /// last `prefix_tokens` before and the first `suffix_tokens` after the
-    /// cursor (by [`tokens::take_last`] / [`tokens::take_first`]), so the
-    /// cost does not grow with the document.
+    /// The text around `pos` in the open document `uri`, copying only a
+    /// bounded window so the cost does not grow with the document.
+    ///
+    /// The prefix starts at [`tokens::stable_tail_start`] of the text before
+    /// the cursor, given `prev_prefix_start` (the `prefix_start` this returned
+    /// for the previous request on `uri`): line-aligned and unmoved while
+    /// typing, so consecutive prefixes extend each other. The suffix is
+    /// [`tokens::take_first`] of the text after the cursor.
     pub fn cursor_window(
         &self,
         uri: &str,
         pos: Position,
-        prefix_tokens: usize,
-        suffix_tokens: usize,
+        budget: WindowBudget,
+        prev_prefix_start: Option<usize>,
     ) -> Option<CursorWindow> {
         let doc = self.docs.get(&normalize_uri(uri))?;
         let (prefix, suffix) = doc.text.split_at(doc.offset(pos));
+        let prefix_start = tokens::stable_tail_start(
+            prefix,
+            budget.prefix_tokens,
+            budget.prefix_slack_tokens,
+            prev_prefix_start,
+        );
         let crlf = doc
             .line_starts
             .get(1)
             .is_some_and(|&start| doc.text.as_bytes()[..start].ends_with(b"\r\n"));
         Some(CursorWindow {
-            prefix: tokens::take_last(prefix, prefix_tokens).to_owned(),
-            suffix: tokens::take_first(suffix, suffix_tokens).to_owned(),
+            prefix: prefix[prefix_start..].to_owned(),
+            prefix_start,
+            suffix: tokens::take_first(suffix, budget.suffix_tokens).to_owned(),
             next_char: suffix.chars().next(),
             doc_len: doc.text.len(),
             crlf,
@@ -180,11 +191,23 @@ impl DocumentStore {
     }
 }
 
+/// Size limits for [`DocumentStore::cursor_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBudget {
+    /// The prefix is cut back to at most this many tokens...
+    pub prefix_tokens: usize,
+    /// ...once it has grown this many tokens past `prefix_tokens`.
+    pub prefix_slack_tokens: usize,
+    pub suffix_tokens: usize,
+}
+
 /// Bounded text around a cursor; see [`DocumentStore::cursor_window`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorWindow {
     /// Tail of the text before the cursor.
     pub prefix: String,
+    /// Byte offset of `prefix` in the document.
+    pub prefix_start: usize,
     /// Head of the text after the cursor.
     pub suffix: String,
     /// The character right after the cursor, if any.
@@ -506,13 +529,19 @@ mod tests {
     fn cursor_window_is_bounded_and_reports_line_endings() {
         let mut s = store();
         let uri = "file:///ws/a.py";
+        let tiny = WindowBudget {
+            prefix_tokens: 1,
+            prefix_slack_tokens: 0,
+            suffix_tokens: 1,
+        };
         s.did_open(uri, "abcdef\r\nxyz_1\r\n".to_string(), 1);
         let pos = Position {
             line: 1,
             character: 1,
         };
-        let w = s.cursor_window(uri, pos, 1, 1).unwrap();
-        assert_eq!(w.prefix, "f\r\nx");
+        let w = s.cursor_window(uri, pos, tiny, None).unwrap();
+        assert_eq!(w.prefix, "x"); // cut back to the line start
+        assert_eq!(w.prefix_start, 8);
         assert_eq!(w.suffix, "yz_1");
         assert_eq!(w.next_char, Some('y'));
         assert_eq!(w.doc_len, 15);
@@ -523,10 +552,18 @@ mod tests {
             line: 9,
             character: 9,
         };
-        let w = s.cursor_window(uri, far, 512, 512).unwrap();
+        let big = WindowBudget {
+            prefix_tokens: 512,
+            prefix_slack_tokens: 0,
+            suffix_tokens: 512,
+        };
+        let w = s.cursor_window(uri, far, big, None).unwrap();
         assert_eq!((w.prefix.as_str(), w.suffix.as_str()), ("ab\ncd", ""));
         assert_eq!(w.next_char, None);
         assert!(!w.crlf);
-        assert!(s.cursor_window("file:///ws/none.py", far, 1, 1).is_none());
+        assert!(
+            s.cursor_window("file:///ws/none.py", far, big, None)
+                .is_none()
+        );
     }
 }

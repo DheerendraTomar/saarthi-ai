@@ -10,6 +10,13 @@ use std::collections::VecDeque;
 /// Default number of entries kept.
 pub const DEFAULT_CAPACITY: usize = 256;
 
+/// A cache hit: the text to suggest and the matched entry's prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheHit {
+    pub text: String,
+    pub entry_prefix: String,
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     uri: String,
@@ -41,16 +48,26 @@ impl CompletionCache {
     /// starts with the text typed since; returns the rest of the completion.
     /// A hit that would leave nothing to suggest is a miss.
     pub fn get(&mut self, uri: &str, prefix: &str, suffix: &str) -> Option<String> {
+        self.lookup(uri, prefix, suffix).map(|hit| hit.text)
+    }
+
+    /// Like [`get`](Self::get), also returning the prefix of the entry that
+    /// matched (the key to [`remove`](Self::remove) it by).
+    pub fn lookup(&mut self, uri: &str, prefix: &str, suffix: &str) -> Option<CacheHit> {
         let (index, remainder) = self
             .entries
             .iter()
             .enumerate()
             .rev()
             .find_map(|(i, e)| typed_remainder(e, uri, prefix, suffix).map(|rest| (i, rest)))?;
-        let remainder = remainder.to_owned();
+        let text = remainder.to_owned();
         let entry = self.entries.remove(index)?;
+        let hit = CacheHit {
+            text,
+            entry_prefix: entry.prefix.clone(),
+        };
         self.entries.push_back(entry);
-        Some(remainder)
+        Some(hit)
     }
 
     /// Stores `completion` for the exact key, replacing any previous value.
@@ -113,6 +130,11 @@ mod tests {
         let mut c = CompletionCache::new(DEFAULT_CAPACITY);
         c.put("u", "foo", "\n", "bar()");
         assert_eq!(c.get("u", "foob", "\n").as_deref(), Some("ar()"));
+        let hit = c.lookup("u", "foob", "\n").unwrap();
+        assert_eq!(hit.entry_prefix, "foo");
+        c.remove("u", &hit.entry_prefix, "\n");
+        assert_eq!(c.get("u", "foob", "\n"), None);
+        c.put("u", "foo", "\n", "bar()");
         assert_eq!(c.get("u", "fooba", "\n").as_deref(), Some("r()"));
         // Typed text that diverges from the suggestion is a miss.
         assert_eq!(c.get("u", "foox", "\n"), None);

@@ -6,7 +6,7 @@ pub mod engine;
 pub mod prompt;
 pub mod stop;
 
-pub use cache::CompletionCache;
+pub use cache::{CacheHit, CompletionCache};
 pub use engine::CompletionEngine;
 pub use prompt::FimPrompt;
 pub use stop::{StopMode, Trimmer};

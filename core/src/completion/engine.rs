@@ -8,9 +8,12 @@
 //! **KV-cache reuse.** Related-file snippets are computed by
 //! [`related::snippets`] only on [`refresh_snippets`](CompletionEngine::refresh_snippets)
 //! (didOpen / didSave / watcher change) or when a uri's entry is missing or
-//! older than [`SNIPPET_TTL`] at request time. Between refreshes every request
-//! reuses the identical snippet block, so consecutive prompts differ only in
-//! the typed tail and Ollama reuses its KV cache for the shared prefix.
+//! older than [`SNIPPET_TTL`] at request time; that refresh runs in the
+//! background (one at a time per uri) while the request is served with the
+//! stale block (or none). Between refreshes every request reuses the
+//! identical snippet block, and the prefix window is line-aligned with
+//! hysteresis (see [`DocumentStore::cursor_window`]), so consecutive prompts
+//! differ only in the typed tail and Ollama reuses its KV cache.
 //!
 //! **Generations** are owned by an in-flight entry, not by a requester: an
 //! identical `(uri, prefix, suffix)` request joins the running generation.
@@ -28,9 +31,10 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::cache::{self, CompletionCache};
-use super::prompt::{self, FimPrompt, PREFIX_TOKENS, SUFFIX_TOKENS};
+use super::prompt::{self, FimPrompt, WINDOW_BUDGET};
 use super::stop::{self, StopMode, Trimmer};
 use crate::index::related::{self, Snippet};
+use crate::index::symbols::Lang;
 use crate::index::{RelPath, WorkspaceIndex};
 use crate::ollama::{
     GenerateRequest, OllamaClient, OllamaError, OllamaState, OllamaStatus, Options,
@@ -68,9 +72,9 @@ struct Inner {
     paused: AtomicBool,
     cache_enabled: AtomicBool,
     cache: Mutex<CompletionCache>,
-    snippets_by_uri: Mutex<HashMap<String, SnippetEntry>>,
-    /// Last requested cursor per uri: the retrieval window for refreshes.
-    cursors: Mutex<HashMap<String, Position>>,
+    snippets_by_uri: Mutex<HashMap<String, SnippetSlot>>,
+    /// Last requested cursor and prefix-window start per uri.
+    cursors: Mutex<HashMap<String, CursorState>>,
     inflight: Mutex<HashMap<Key, Flight>>,
     /// Cancellation token of every request currently being answered.
     requests: Mutex<HashMap<String, CancellationToken>>,
@@ -78,7 +82,23 @@ struct Inner {
     served: Mutex<VecDeque<(String, Key)>>,
     last_status: Mutex<Option<OllamaStatus>>,
     snippet_refreshes: AtomicUsize,
+    next_refresh: AtomicU64,
     next_flight: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorState {
+    position: Position,
+    /// `CursorWindow::prefix_start` of the last request: kept while typing.
+    prefix_start: usize,
+}
+
+/// Snippets for one uri plus the bookkeeping of their refresh.
+#[derive(Default)]
+struct SnippetSlot {
+    entry: Option<SnippetEntry>,
+    /// Id of the newest refresh started; only its result is stored.
+    refresh: Option<u64>,
 }
 
 struct SnippetEntry {
@@ -135,6 +155,7 @@ impl CompletionEngine {
                 served: Mutex::new(VecDeque::new()),
                 last_status: Mutex::new(None),
                 snippet_refreshes: AtomicUsize::new(0),
+                next_refresh: AtomicU64::new(0),
                 next_flight: AtomicU64::new(0),
             }),
         }
@@ -160,20 +181,23 @@ impl CompletionEngine {
         else {
             return Ok(CompletionResult::default());
         };
-        // Chat may have started, or the caller moved on, during a refresh.
-        if self.is_paused() || cancel.is_cancelled() {
-            return Ok(CompletionResult::default());
-        }
         let key = prepared.key.clone();
 
+        let mut served_key = key.clone();
         let cached = self
             .cache_enabled()
-            .then(|| lock(&inner.cache).get(&key.0, &key.1, &key.2))
+            .then(|| lock(&inner.cache).lookup(&key.0, &key.1, &key.2))
             .flatten();
         let text = match cached {
-            Some(text) => text,
+            Some(hit) => {
+                // A typed-prefix hit is stored under the shorter prefix.
+                served_key.1 = hit.entry_prefix;
+                hit.text
+            }
             None => {
-                let mut waiter = join_or_start(inner, prepared, &settings);
+                let Some(mut waiter) = join_or_start(inner, prepared, &settings) else {
+                    return Ok(CompletionResult::default());
+                };
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
@@ -191,7 +215,7 @@ impl CompletionEngine {
         if text.is_empty() || cancel.is_cancelled() {
             return Ok(CompletionResult::default());
         }
-        remember_served(inner, &params.request_id, key);
+        remember_served(inner, &params.request_id, served_key);
         let at = params.position;
         Ok(CompletionResult {
             items: vec![CompletionItem {
@@ -260,23 +284,33 @@ impl CompletionEngine {
     }
 
     /// Recomputes the related snippets for `uri` (call on didOpen, didSave
-    /// and watcher changes to that file). Uses the 40 lines around the last
-    /// requested cursor in `uri` (the top of the file if none). No-op if the
-    /// document is not open.
+    /// and watcher changes to that file) and returns when they are stored.
+    /// Uses the 40 lines around the last requested cursor in `uri` (the top
+    /// of the file if none). No-op if the document is not open.
     pub async fn refresh_snippets(&self, uri: &str) {
-        let pos = lock(&self.inner.cursors)
-            .get(uri)
-            .copied()
-            .unwrap_or(Position {
+        let last = lock(&self.inner.cursors).get(uri).copied();
+        let pos = last.map_or(
+            Position {
                 line: 0,
                 character: 0,
-            });
-        let window = read(&self.inner.store).cursor_window(uri, pos, PREFIX_TOKENS, SUFFIX_TOKENS);
+            },
+            |c| c.position,
+        );
+        let prev_start = last.map(|c| c.prefix_start);
+        let window = read(&self.inner.store).cursor_window(uri, pos, WINDOW_BUDGET, prev_start);
         let Some(window) = window else {
             return;
         };
         let budget = prompt::snippet_budget(&read(&self.inner.settings));
-        refresh(&self.inner, uri, &window, budget).await;
+        let id = start_refresh(&self.inner, uri);
+        refresh(
+            self.inner.clone(),
+            uri.to_owned(),
+            window_lines(&window),
+            budget,
+            id,
+        )
+        .await;
     }
 
     /// Drops the cached snippets and remembered cursor for `uri` (e.g. on
@@ -299,9 +333,27 @@ impl CompletionEngine {
 
     #[cfg(test)]
     fn age_snippets(&self, uri: &str, by: Duration) {
-        if let Some(entry) = lock(&self.inner.snippets_by_uri).get_mut(uri) {
+        if let Some(entry) = lock(&self.inner.snippets_by_uri)
+            .get_mut(uri)
+            .and_then(|slot| slot.entry.as_mut())
+        {
             entry.computed_at -= by;
         }
+    }
+
+    /// Waits until no snippet refresh for `uri` is running.
+    #[cfg(test)]
+    async fn wait_snippets_settled(&self, uri: &str) {
+        for _ in 0..500 {
+            let busy = lock(&self.inner.snippets_by_uri)
+                .get(uri)
+                .is_some_and(|slot| slot.refresh.is_some());
+            if !busy {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("snippet refresh for {uri} did not finish");
     }
 
     fn cache_enabled(&self) -> bool {
@@ -317,30 +369,53 @@ impl CompletionEngine {
         settings: &Settings,
     ) -> Option<Prepared> {
         let inner = &self.inner;
-        let window =
-            read(&inner.store).cursor_window(uri, position, PREFIX_TOKENS, SUFFIX_TOKENS)?;
+        let prev_start = lock(&inner.cursors).get(uri).map(|c| c.prefix_start);
+        let window = read(&inner.store).cursor_window(uri, position, WINDOW_BUDGET, prev_start)?;
         if window.doc_len > MAX_DOCUMENT_BYTES {
             return None;
         }
+        lock(&inner.cursors).insert(
+            uri.to_owned(),
+            CursorState {
+                position,
+                prefix_start: window.prefix_start,
+            },
+        );
         if window
             .next_char
             .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             return None;
         }
-        lock(&inner.cursors).insert(uri.to_owned(), position);
 
-        let budget = prompt::snippet_budget(settings);
-        let fresh = lock(&inner.snippets_by_uri)
-            .get(uri)
-            .filter(|e| e.computed_at.elapsed() <= SNIPPET_TTL)
-            .map(|e| e.snippets.clone());
-        let snippets = match fresh {
-            Some(snippets) => snippets,
-            None => refresh(inner, uri, &window, budget).await,
+        // Serve what is cached, even if stale; refresh in the background.
+        let (snippets, refresh_id) = {
+            let mut map = lock(&inner.snippets_by_uri);
+            let slot = map.entry(uri.to_owned()).or_default();
+            let fresh = slot
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.computed_at.elapsed() <= SNIPPET_TTL);
+            let snippets = slot
+                .entry
+                .as_ref()
+                .map(|e| e.snippets.clone())
+                .unwrap_or_default();
+            let refresh_id = (!fresh && slot.refresh.is_none()).then(|| {
+                let id = inner.next_refresh.fetch_add(1, Ordering::Relaxed);
+                slot.refresh = Some(id);
+                id
+            });
+            (snippets, refresh_id)
         };
+        if let Some(id) = refresh_id {
+            let budget = prompt::snippet_budget(settings);
+            let around = window_lines(&window);
+            tokio::spawn(refresh(inner.clone(), uri.to_owned(), around, budget, id));
+        }
 
-        let prompt = prompt::build(&snippets, &window.prefix, &window.suffix, settings);
+        let lang = Lang::from_path(&uri_to_path(uri));
+        let prompt = prompt::build(&snippets, &window.prefix, &window.suffix, lang, settings);
         let mode = stop::mode_for(&window.prefix, &prompt.suffix);
         let key = (uri.to_owned(), window.prefix, prompt.suffix.clone());
         Some(Prepared {
@@ -352,31 +427,41 @@ impl CompletionEngine {
     }
 }
 
-/// Computes and stores the snippets for `uri` from `window` (off the async
-/// threads: it reads files). Returns the new snippets.
-async fn refresh(
-    inner: &Arc<Inner>,
-    uri: &str,
-    window: &CursorWindow,
-    budget: usize,
-) -> Arc<Vec<Snippet>> {
-    let around = window_lines(&window.prefix, &window.suffix);
+/// Marks a new refresh of `uri` as the newest one and returns its id.
+fn start_refresh(inner: &Inner, uri: &str) -> u64 {
+    let id = inner.next_refresh.fetch_add(1, Ordering::Relaxed);
+    lock(&inner.snippets_by_uri)
+        .entry(uri.to_owned())
+        .or_default()
+        .refresh = Some(id);
+    id
+}
+
+/// Computes the snippets for `uri` from the lines `around` the cursor (off
+/// the async threads: it reads files) and stores them if refresh `id` is
+/// still the newest for a uri that was not invalidated meanwhile. A failed
+/// computation keeps the previous snippets.
+async fn refresh(inner: Arc<Inner>, uri: String, around: String, budget: usize, id: u64) {
     let task_inner = inner.clone();
-    let task_uri = uri.to_owned();
+    let task_uri = uri.clone();
     let computed = tokio::task::spawn_blocking(move || {
         compute_snippets(&task_inner, &task_uri, &around, budget)
     })
-    .await
-    .unwrap_or_default();
-    let snippets = Arc::new(computed);
-    lock(&inner.snippets_by_uri).insert(
-        uri.to_owned(),
-        SnippetEntry {
-            snippets: snippets.clone(),
+    .await;
+    let mut map = lock(&inner.snippets_by_uri);
+    let Some(slot) = map.get_mut(&uri) else {
+        return;
+    };
+    if slot.refresh != Some(id) {
+        return;
+    }
+    slot.refresh = None;
+    if let Ok(snippets) = computed {
+        slot.entry = Some(SnippetEntry {
+            snippets: Arc::new(snippets),
             computed_at: Instant::now(),
-        },
-    );
-    snippets
+        });
+    }
 }
 
 fn compute_snippets(inner: &Inner, uri: &str, window: &str, budget: usize) -> Vec<Snippet> {
@@ -408,8 +493,9 @@ fn compute_snippets(inner: &Inner, uri: &str, window: &str, budget: usize) -> Ve
 }
 
 /// The [`SNIPPET_WINDOW_LINES`] lines around the cursor: the last half from
-/// `prefix` (including the cursor line) and the first half from `suffix`.
-fn window_lines(prefix: &str, suffix: &str) -> String {
+/// the prefix (including the cursor line) and the first half from the suffix.
+fn window_lines(window: &CursorWindow) -> String {
+    let (prefix, suffix) = (window.prefix.as_str(), window.suffix.as_str());
     let half = SNIPPET_WINDOW_LINES / 2;
     let start = prefix
         .rmatch_indices('\n')
@@ -423,17 +509,22 @@ fn window_lines(prefix: &str, suffix: &str) -> String {
 }
 
 /// Registers the requester on the in-flight generation for `prepared.key`,
-/// starting one if there is none.
-fn join_or_start(inner: &Arc<Inner>, prepared: Prepared, settings: &Settings) -> Waiter {
+/// starting one if there is none. `None` if completions are paused: checked
+/// under the `inflight` lock, so a flight started here is always seen (and
+/// cancelled) by a concurrent [`CompletionEngine::set_paused`].
+fn join_or_start(inner: &Arc<Inner>, prepared: Prepared, settings: &Settings) -> Option<Waiter> {
     let mut inflight = lock(&inner.inflight);
+    if inner.paused.load(Ordering::SeqCst) {
+        return None;
+    }
     if let Some(flight) = inflight.get_mut(&prepared.key) {
         flight.waiters += 1;
-        return Waiter {
+        return Some(Waiter {
             inner: inner.clone(),
             key: prepared.key,
             flight: flight.id,
             result: flight.result.clone(),
-        };
+        });
     }
     let id = inner.next_flight.fetch_add(1, Ordering::Relaxed);
     let http_cancel = CancellationToken::new();
@@ -478,12 +569,12 @@ fn join_or_start(inner: &Arc<Inner>, prepared: Prepared, settings: &Settings) ->
         remove_flight(&task_inner, &key, id);
         let _ = tx.send(Some(outcome));
     });
-    Waiter {
+    Some(Waiter {
         inner: inner.clone(),
         key: prepared.key,
         flight: id,
         result: rx,
-    }
+    })
 }
 
 /// Streams one generation through `trimmer`, dropping the HTTP stream as
@@ -613,42 +704,54 @@ mod tests {
     const UTIL: &str = "def helper_value(x):\n    return x * 2\n\n\ndef other_thing():\n    pass\n";
     const MAIN: &str = "from util import helper_value\n\nresult = helper_value(3)\nprint(resul\n";
 
-    fn engine_over(
-        root: &std::path::Path,
-    ) -> (CompletionEngine, Arc<RwLock<DocumentStore>>, String) {
+    struct Fixture {
+        engine: CompletionEngine,
+        store: Arc<RwLock<DocumentStore>>,
+        uri: String,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fixture(main: &str) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root: PathBuf = dir.path().canonicalize().unwrap();
         std::fs::write(root.join("util.py"), UTIL).unwrap();
-        std::fs::write(root.join("main.py"), MAIN).unwrap();
+        std::fs::write(root.join("main.py"), main).unwrap();
         let uri = path_to_uri(&root.join("main.py"));
-        let mut store = DocumentStore::new(root.to_path_buf());
-        store.did_open(&uri, MAIN.to_owned(), 1);
+        let mut store = DocumentStore::new(root.clone());
+        store.did_open(&uri, main.to_owned(), 1);
         let store = Arc::new(RwLock::new(store));
-        let index = Arc::new(RwLock::new(WorkspaceIndex::build(root)));
+        let index = Arc::new(RwLock::new(WorkspaceIndex::build(&root)));
         let ollama = OllamaClient::new("http://127.0.0.1:9".to_owned(), "30m".to_owned());
         let engine = CompletionEngine::new(ollama, store.clone(), index, Settings::default());
-        (engine, store, uri)
+        Fixture {
+            engine,
+            store,
+            uri,
+            _dir: dir,
+        }
+    }
+
+    fn type_char(f: &Fixture, at: Position, version: i32) {
+        let change = ContentChange {
+            range: Some(Range { start: at, end: at }),
+            text: "t".to_owned(),
+        };
+        f.store
+            .write()
+            .unwrap()
+            .did_change(&f.uri, version, vec![change]);
     }
 
     #[tokio::test]
     async fn prompt_prefix_unchanged_across_consecutive_keystrokes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root: PathBuf = dir.path().canonicalize().unwrap();
-        let (engine, store, uri) = engine_over(&root);
-        engine.refresh_snippets(&uri).await; // didOpen
-        assert_eq!(engine.snippet_refresh_count(), 1);
+        let f = fixture(MAIN);
+        f.engine.refresh_snippets(&f.uri).await; // didOpen
+        assert_eq!(f.engine.snippet_refresh_count(), 1);
 
         let at = |character| Position { line: 3, character };
-        let first = engine.prepare(&uri, at(11)).await.expect("not skipped");
-
-        // The user types `t`.
-        let change = ContentChange {
-            range: Some(crate::protocol::Range {
-                start: at(11),
-                end: at(11),
-            }),
-            text: "t".to_owned(),
-        };
-        store.write().unwrap().did_change(&uri, 2, vec![change]);
-        let second = engine.prepare(&uri, at(12)).await.expect("not skipped");
+        let first = f.engine.prepare(&f.uri, at(11)).await.expect("not skipped");
+        type_char(&f, at(11), 2);
+        let second = f.engine.prepare(&f.uri, at(12)).await.expect("not skipped");
 
         let block = first.snippet_block();
         assert!(
@@ -659,43 +762,106 @@ mod tests {
         assert_eq!(block, second.snippet_block());
         assert_eq!(second.prompt.prompt, format!("{}t", first.prompt.prompt));
         assert_eq!(
-            engine.snippet_refresh_count(),
+            f.engine.snippet_refresh_count(),
             1,
             "no per-keystroke retrieval"
         );
     }
 
     #[tokio::test]
-    async fn stale_or_missing_snippets_are_computed_at_request_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let root: PathBuf = dir.path().canonicalize().unwrap();
-        let (engine, _store, uri) = engine_over(&root);
+    async fn prompt_prefix_stable_on_large_file() {
+        // ~30 KB of code before the cursor: far over the 8 KB prefix budget.
+        let body: String = (0..800)
+            .map(|i| format!("value_{i} = helper_value({i})  # pad\n"))
+            .collect();
+        let main = format!("from util import helper_value\n{body}print(resul\n");
+        assert!(main.len() > 3 * PREFIX_BYTES);
+        let f = fixture(&main);
+        f.engine.refresh_snippets(&f.uri).await;
+        let line = 801;
+
+        let mut prev = f
+            .engine
+            .prepare(
+                &f.uri,
+                Position {
+                    line,
+                    character: 11,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(prev.key.1.len() <= PREFIX_BYTES);
+        assert!(
+            prev.key.1.starts_with("value_"),
+            "line-aligned window start"
+        );
+        // Many keystrokes: each prompt extends the previous one byte-for-byte.
+        for n in 0..40u32 {
+            let at = Position {
+                line,
+                character: 11 + n,
+            };
+            type_char(&f, at, 2 + n as i32);
+            let next = f
+                .engine
+                .prepare(
+                    &f.uri,
+                    Position {
+                        line,
+                        character: 12 + n,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(next.prompt.prompt, format!("{}t", prev.prompt.prompt));
+            prev = next;
+        }
+    }
+
+    const PREFIX_BYTES: usize = prompt::PREFIX_TOKENS * 4;
+
+    #[tokio::test]
+    async fn stale_or_missing_snippets_refresh_in_background() {
+        let f = fixture(MAIN);
         let pos = Position {
             line: 3,
             character: 11,
         };
 
-        engine.prepare(&uri, pos).await.unwrap();
-        assert_eq!(engine.snippet_refresh_count(), 1);
-        engine.prepare(&uri, pos).await.unwrap();
-        assert_eq!(engine.snippet_refresh_count(), 1);
+        // Never refreshed: served without snippets, refreshed in background.
+        let first = f.engine.prepare(&f.uri, pos).await.unwrap();
+        assert_eq!(first.snippet_block(), "");
+        f.engine.wait_snippets_settled(&f.uri).await;
+        assert_eq!(f.engine.snippet_refresh_count(), 1);
+        let warm = f.engine.prepare(&f.uri, pos).await.unwrap();
+        assert!(warm.snippet_block().contains("def helper_value"));
 
-        engine.age_snippets(&uri, SNIPPET_TTL + Duration::from_secs(1));
-        engine.prepare(&uri, pos).await.unwrap();
-        assert_eq!(engine.snippet_refresh_count(), 2);
+        // Stale: the request is served the stale block; a burst of requests
+        // starts only one refresh.
+        f.engine
+            .age_snippets(&f.uri, SNIPPET_TTL + Duration::from_secs(1));
+        for _ in 0..5 {
+            let stale = f.engine.prepare(&f.uri, pos).await.unwrap();
+            assert_eq!(stale.snippet_block(), warm.snippet_block());
+        }
+        f.engine.wait_snippets_settled(&f.uri).await;
+        assert_eq!(f.engine.snippet_refresh_count(), 2);
+        f.engine.prepare(&f.uri, pos).await.unwrap();
+        assert_eq!(f.engine.snippet_refresh_count(), 2, "fresh again");
 
-        engine.invalidate_snippets(&uri);
-        engine.prepare(&uri, pos).await.unwrap();
-        assert_eq!(engine.snippet_refresh_count(), 3);
+        f.engine.invalidate_snippets(&f.uri);
+        let cold = f.engine.prepare(&f.uri, pos).await.unwrap();
+        assert_eq!(cold.snippet_block(), "");
+        f.engine.wait_snippets_settled(&f.uri).await;
+        assert_eq!(f.engine.snippet_refresh_count(), 3);
     }
 
     #[tokio::test]
     async fn odd_cursor_positions_never_panic() {
-        let dir = tempfile::tempdir().unwrap();
-        let root: PathBuf = dir.path().canonicalize().unwrap();
-        let (engine, _store, uri) = engine_over(&root);
+        let f = fixture(MAIN);
         for (line, character) in [(0, 0), (3, 999), (99, 0), (u32::MAX, u32::MAX)] {
-            let _ = engine.prepare(&uri, Position { line, character }).await;
+            let _ = f.engine.prepare(&f.uri, Position { line, character }).await;
         }
     }
 }

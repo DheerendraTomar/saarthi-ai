@@ -372,3 +372,75 @@ async fn rejected_suggestion_is_evicted_from_cache() {
     complete(&env, "r3", CURSOR).await;
     assert_eq!(generate_bodies(&env.mock).len(), 2);
 }
+
+#[tokio::test]
+async fn rejecting_a_typed_prefix_hit_evicts_the_cached_suggestion() {
+    let env = setup(add_script()).await;
+    assert_eq!(texts(&complete(&env, "r1", CURSOR).await), ["a + b"]);
+
+    let typed = DOC.replacen("return \n", "return a\n", 1);
+    env.store.write().unwrap().did_open(&env.uri, typed, 2);
+    let next = Position {
+        line: 1,
+        character: 12,
+    };
+    assert_eq!(texts(&complete(&env, "r2", next).await), [" + b"]);
+    env.engine.on_rejected("r2");
+
+    // Not offered again from the cache: the model is asked.
+    complete(&env, "r3", next).await;
+    assert_eq!(generate_bodies(&env.mock).len(), 2);
+}
+
+#[tokio::test]
+async fn typed_prefix_hit_on_large_file() {
+    let body: String = (0..800)
+        .map(|i| format!("value_{i} = add({i}, {i})  # padding\n"))
+        .collect();
+    let doc = format!("{body}def add(a, b):\n    return \n");
+    let env = setup_with(add_script(), &doc).await;
+    let cursor = Position {
+        line: 801,
+        character: 11,
+    };
+    assert_eq!(texts(&complete(&env, "r1", cursor).await), ["a + b"]);
+    let prompt = generate_bodies(&env.mock)[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(prompt.len() <= 2048 * 4 && prompt.starts_with("value_"));
+
+    let typed = doc.replacen("    return \n", "    return a\n", 1);
+    env.store.write().unwrap().did_open(&env.uri, typed, 2);
+    let next = Position {
+        line: 801,
+        character: 12,
+    };
+    assert_eq!(texts(&complete(&env, "r2", next).await), [" + b"]);
+    assert_eq!(generate_bodies(&env.mock).len(), 1);
+}
+
+#[tokio::test]
+async fn pausing_aborts_a_running_generation() {
+    let env = setup(Script {
+        generate: vec![vec![generate_chunk("x"); 200]],
+        chunk_delay: Duration::from_millis(20),
+        ..Script::default()
+    })
+    .await;
+
+    let engine = env.engine.clone();
+    let p = params(&env, "r1", CURSOR);
+    let request = tokio::spawn(async move { engine.request(p, CancellationToken::new()).await });
+    wait_for_generate(&env.mock).await;
+    env.engine.set_paused(true);
+
+    let result = tokio::time::timeout(WAIT, request)
+        .await
+        .expect("paused request returns promptly")
+        .unwrap()
+        .unwrap();
+    assert!(result.items.is_empty());
+    assert!(env.mock.wait_client_disconnected(WAIT).await);
+    assert_eq!(generate_bodies(&env.mock).len(), 1);
+}
