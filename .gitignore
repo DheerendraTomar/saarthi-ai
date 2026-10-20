@@ -1,0 +1,6 @@
+.superpowers/
+target/
+node_modules/
+.localpilot/
+dist/
+*.vsix
