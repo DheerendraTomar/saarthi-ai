@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use clap::{Parser, Subcommand};
-use localpilot_core::bench::{self, BenchArgs};
+use localpilot_core::bench::{self, BenchArgs, Mode};
 use localpilot_core::handlers::AppHandler;
 use localpilot_core::rpc::RpcServer;
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
@@ -50,6 +50,10 @@ enum Command {
         /// Print the report as one JSON object.
         #[arg(long)]
         json: bool,
+        /// `spread`: line ends across the file (fresh prompts, worst case);
+        /// `typing`: one character typed per request at one spot.
+        #[arg(long, value_enum, default_value_t = Mode::Spread)]
+        mode: Mode,
     },
 }
 
@@ -66,12 +70,14 @@ fn main() -> ExitCode {
             n,
             model,
             json,
+            mode,
         } => bench::main(BenchArgs {
             workspace,
             file,
             n,
             model,
             json,
+            mode,
         }),
     }
 }

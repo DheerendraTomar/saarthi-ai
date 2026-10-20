@@ -121,7 +121,8 @@ struct Flight {
 pub struct CompletionTiming {
     /// The request entered the engine.
     pub started_at: Instant,
-    /// The HTTP request to Ollama is about to be sent (end of core overhead).
+    /// The request body is serialized and the HTTP send starts (end of core
+    /// overhead).
     pub prepared_at: Option<Instant>,
     /// The first streamed chunk arrived.
     pub first_token_at: Option<Instant>,
@@ -672,10 +673,14 @@ async fn generate(
     http_cancel: &CancellationToken,
     timing: Option<&TimingSink>,
 ) -> Outcome {
-    if let Some(t) = timing {
-        *lock(&t.prepared_at) = Some(Instant::now());
-    }
-    let mut stream = ollama.generate_stream(request, http_cancel.clone()).await?;
+    let on_send = || {
+        if let Some(t) = timing {
+            *lock(&t.prepared_at) = Some(Instant::now());
+        }
+    };
+    let mut stream = ollama
+        .generate_stream_on_send(request, http_cancel.clone(), on_send)
+        .await?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if let Some(t) = timing {

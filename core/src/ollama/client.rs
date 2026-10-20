@@ -110,12 +110,25 @@ impl OllamaClient {
     /// the HTTP body is dropped immediately.
     pub async fn generate_stream(
         &self,
+        req: GenerateRequest,
+        cancel: CancellationToken,
+    ) -> Result<impl Stream<Item = Result<GenerateChunk>> + Send + Unpin + 'static> {
+        self.generate_stream_on_send(req, cancel, || {}).await
+    }
+
+    /// [`generate_stream`](Self::generate_stream) that calls `on_send` once
+    /// the request body is serialized, immediately before the HTTP send
+    /// (used by the latency bench).
+    pub async fn generate_stream_on_send(
+        &self,
         mut req: GenerateRequest,
         cancel: CancellationToken,
+        on_send: impl FnOnce(),
     ) -> Result<impl Stream<Item = Result<GenerateChunk>> + Send + Unpin + 'static> {
         req.keep_alive
             .get_or_insert_with(|| self.keep_alive.clone());
         let request = self.http.post(self.url("/api/generate")).json(&req);
+        on_send();
         let response = self.send_cancellable(request, &req.model, &cancel).await?;
         Ok(ndjson_stream(response, cancel, |c: &GenerateChunk| c.done))
     }

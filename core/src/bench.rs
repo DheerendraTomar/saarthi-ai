@@ -2,14 +2,22 @@
 //!
 //! Builds the index and engine the way `serve` does, opens one file into
 //! the overlay, warms its snippet block and the model (one request, not
-//! counted), then times `n` completions at line ends spread evenly through
-//! the file with the completion cache off. Reported per request:
+//! counted), then times `n` completions with the completion cache off:
 //!
-//! - **core overhead**: request start → HTTP request to Ollama about to be sent;
+//! - `--mode spread` (default, the worst case): at line ends spread evenly
+//!   through the file, so almost every prompt has a new prefix;
+//! - `--mode typing` (the keystroke path): a new line is opened after the
+//!   line nearest the file's middle and the following line of the file is
+//!   typed into it one character per request, so consecutive prompts share
+//!   a byte-stable prefix and Ollama can reuse its KV cache.
+//!
+//! Reported per request:
+//!
+//! - **core overhead**: request start → request body serialized, HTTP send starts;
 //! - **TTFT**: request start → first streamed chunk;
 //! - **total**: request start → result returned.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -21,7 +29,7 @@ use crate::completion::{CompletionEngine, CompletionTiming};
 use crate::index::WorkspaceIndex;
 use crate::ollama::{OllamaClient, OllamaState};
 use crate::overlay::{DocumentStore, path_to_uri};
-use crate::protocol::{CompletionRequestParams, Position};
+use crate::protocol::{CompletionRequestParams, ContentChange, Position, Range};
 use crate::settings::Settings;
 
 /// Targets from the plan's Global Constraints (milliseconds / megabytes).
@@ -40,6 +48,38 @@ pub struct BenchArgs {
     /// Completion model; the settings default if `None`.
     pub model: Option<String>,
     pub json: bool,
+    pub mode: Mode,
+}
+
+/// Where the timed requests are made (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Line ends spread evenly through the file (fresh prefixes; worst case).
+    #[default]
+    Spread,
+    /// One character typed per request at one spot (the keystroke path).
+    Typing,
+}
+
+/// One timed request: first type `insert` (text at a position), if any,
+/// then request a completion at `cursor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub insert: Option<(Position, String)>,
+    pub cursor: Position,
+}
+
+/// The edits and cursor positions of one bench run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// Edit applied once after opening the document, before snippets warm.
+    pub setup: Option<(Position, String)>,
+    /// Cursor of the (uncounted) warm-up request.
+    pub warmup: Position,
+    pub steps: Vec<Step>,
+    /// One line for the report.
+    pub description: String,
 }
 
 /// p50 / p95 / max of one metric, in milliseconds.
@@ -77,6 +117,8 @@ pub struct BenchReport {
     pub file_lines: usize,
     pub model: String,
     pub ollama_url: String,
+    pub mode: Mode,
+    pub plan: String,
     pub n: usize,
     pub index_build_ms: f64,
     pub indexed_files: usize,
@@ -136,14 +178,32 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
         .workspace
         .canonicalize()
         .map_err(|err| format!("workspace {}: {err}", args.workspace.display()))?;
+    if Path::new(&args.file).is_absolute() {
+        return Err(format!(
+            "--file must be relative to the workspace, got {}",
+            args.file
+        ));
+    }
     let path = root.join(&args.file);
     let text =
         std::fs::read_to_string(&path).map_err(|err| format!("file {}: {err}", path.display()))?;
-    let positions = pick_line_ends(&text, args.n);
-    if positions.is_empty() || args.n == 0 {
-        return Err("no cursor positions: empty file or --n 0".to_owned());
+    if args.n == 0 {
+        return Err("--n must be at least 1".to_owned());
     }
     let file_lines = line_lengths(&text).len();
+    let plan = match args.mode {
+        Mode::Spread => {
+            if file_lines < args.n {
+                eprintln!(
+                    "warning: {} has {file_lines} lines, fewer than --n {}; timing {file_lines} requests",
+                    args.file, args.n
+                );
+            }
+            spread_plan(&text, args.n)
+        }
+        Mode::Typing => typing_plan(&text, args.n)
+            .ok_or_else(|| format!("{} has no non-blank line to type", args.file))?,
+    };
 
     let mut settings = Settings::default();
     if let Some(model) = &args.model {
@@ -162,20 +222,33 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
     engine.set_cache_enabled(false);
 
     let uri = path_to_uri(&path);
+    let mut version = 1;
+    let mut type_text = |at: Position, text: &str| {
+        version += 1;
+        let change = ContentChange {
+            range: Some(Range { start: at, end: at }),
+            text: text.to_owned(),
+        };
+        store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .did_change(&uri, version, vec![change]);
+    };
     store
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .did_open(&uri, text.clone(), 1);
+    if let Some((at, text)) = &plan.setup {
+        type_text(*at, text);
+    }
+    // As on didOpen in `serve`: computed before any request (so around the
+    // top of the file) and awaited, so every timed prompt has the block.
     let started = Instant::now();
     engine.refresh_snippets(&uri).await;
     let snippet_refresh_ms = ms(started.elapsed());
 
-    // Warm-up at the end of the first line: loads the model, not counted.
-    let warm_at = Position {
-        line: 0,
-        character: line_lengths(&text)[0],
-    };
-    let (_, timing) = complete(&engine, &uri, warm_at, "bench-warmup").await;
+    // Warm-up: loads the model, not counted.
+    let (_, timing) = complete(&engine, &uri, plan.warmup, "bench-warmup").await;
     let warmup = sample(&timing);
     if let Some(status) = engine.last_status()
         && status.state != OllamaState::Ok
@@ -192,10 +265,13 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
         ));
     }
 
-    let mut samples = Vec::with_capacity(positions.len());
+    let mut samples = Vec::with_capacity(plan.steps.len());
     let mut empty_suggestions = 0;
-    for (i, &position) in positions.iter().enumerate() {
-        let (empty, timing) = complete(&engine, &uri, position, &format!("bench-{i}")).await;
+    for (i, step) in plan.steps.iter().enumerate() {
+        if let Some((at, text)) = &step.insert {
+            type_text(*at, text);
+        }
+        let (empty, timing) = complete(&engine, &uri, step.cursor, &format!("bench-{i}")).await;
         if empty {
             empty_suggestions += 1;
         }
@@ -251,6 +327,8 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
         file_lines,
         model: settings.completion_model,
         ollama_url: settings.ollama_url,
+        mode: args.mode,
+        plan: plan.description,
         n: samples.len(),
         index_build_ms,
         indexed_files,
@@ -321,10 +399,7 @@ pub fn percentile(values: &[f64], p: f64) -> Option<f64> {
 fn line_lengths(text: &str) -> Vec<u32> {
     let body = text.strip_suffix('\n').unwrap_or(text);
     body.split('\n')
-        .map(|line| {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            line.encode_utf16().count() as u32
-        })
+        .map(|line| utf16_len(line.strip_suffix('\r').unwrap_or(line)))
         .collect()
 }
 
@@ -344,6 +419,82 @@ pub fn pick_line_ends(text: &str, n: usize) -> Vec<Position> {
             }
         })
         .collect()
+}
+
+/// `--mode spread`: [`pick_line_ends`]; warm-up at the end of line 0.
+pub fn spread_plan(text: &str, n: usize) -> Plan {
+    let steps: Vec<Step> = pick_line_ends(text, n)
+        .into_iter()
+        .map(|cursor| Step {
+            insert: None,
+            cursor,
+        })
+        .collect();
+    Plan {
+        setup: None,
+        warmup: Position {
+            line: 0,
+            character: line_lengths(text)[0],
+        },
+        description: format!("{} line ends spread through the file", steps.len()),
+        steps,
+    }
+}
+
+/// `--mode typing`: opens a new line after the line nearest the middle of
+/// the file (setup: newline + the indentation of the next non-blank line),
+/// then types that next non-blank line's text one character per step,
+/// cycling if `n` is longer. The warm-up is at the start of the new line.
+/// `None` if the file has no non-blank line.
+pub fn typing_plan(text: &str, n: usize) -> Option<Plan> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let lines: Vec<&str> = body
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let start = lines.len() / 2;
+    let non_blank = |l: &&&str| !l.trim().is_empty();
+    let source = lines[start + 1..]
+        .iter()
+        .find(non_blank)
+        .or_else(|| lines[..=start].iter().rev().find(non_blank))?;
+    let indent = &source[..source.len() - source.trim_start().len()];
+    let typed: Vec<char> = source.trim().chars().collect();
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let setup_at = Position {
+        line: start as u32,
+        character: utf16_len(lines[start]),
+    };
+    let mut cursor = Position {
+        line: start as u32 + 1,
+        character: utf16_len(indent),
+    };
+    let warmup = cursor;
+    let steps = (0..n)
+        .map(|k| {
+            let c = typed[k % typed.len()];
+            let at = cursor;
+            cursor.character += c.len_utf16() as u32;
+            Step {
+                insert: Some((at, c.to_string())),
+                cursor,
+            }
+        })
+        .collect();
+    Some(Plan {
+        setup: Some((setup_at, format!("{newline}{indent}"))),
+        warmup,
+        steps,
+        description: format!(
+            "typing {:?} on a new line after line {} (1 char per request)",
+            source.trim(),
+            start + 1
+        ),
+    })
+}
+
+fn utf16_len(s: &str) -> u32 {
+    s.encode_utf16().count() as u32
 }
 
 /// Resident set size of `pid` in MB, via `ps` (macOS has no `/proc`).
@@ -375,6 +526,14 @@ pub fn render(r: &BenchReport) -> String {
     out += &format!("  workspace     {}\n", r.workspace);
     out += &format!("  file          {} ({} lines)\n", r.file, r.file_lines);
     out += &format!("  model         {} @ {}\n", r.model, r.ollama_url);
+    out += &format!(
+        "  mode          {} ({})\n",
+        match r.mode {
+            Mode::Spread => "spread",
+            Mode::Typing => "typing",
+        },
+        r.plan
+    );
     out += &format!(
         "  requests      {} (cache off; 1 warm-up not counted); streamed {}, empty suggestions {}\n",
         r.n, r.streamed, r.empty_suggestions
@@ -487,5 +646,88 @@ mod tests {
             ]
         );
         assert!(pick_line_ends("", 5).len() <= 1);
+    }
+
+    /// Applies `(position, text)` insertions the way the overlay does
+    /// (single-line positions, ASCII test text).
+    fn apply(text: &str, at: Position, insert: &str) -> String {
+        let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+        let line = &mut lines[at.line as usize];
+        line.insert_str(at.character as usize, insert);
+        lines.join("\n")
+    }
+
+    #[test]
+    fn typing_plan_types_the_next_line_one_char_per_step() {
+        let text = "a = 1\nb = 2\n\n    call(x)\nz = 0\n";
+        // 5 lines → start at line 2 (blank); next non-blank is line 3.
+        let plan = typing_plan(text, 9).unwrap();
+        let (setup_at, setup) = plan.setup.clone().unwrap();
+        assert_eq!(
+            setup_at,
+            Position {
+                line: 2,
+                character: 0
+            }
+        );
+        assert_eq!(setup, "\n    ");
+        assert_eq!(
+            plan.warmup,
+            Position {
+                line: 3,
+                character: 4
+            }
+        );
+        assert_eq!(plan.steps.len(), 9);
+
+        let mut doc = apply(text, setup_at, &setup);
+        let mut expected_cursor = plan.warmup;
+        for step in &plan.steps {
+            let (at, c) = step.insert.clone().expect("typing step inserts");
+            assert_eq!(at, expected_cursor, "types at the previous cursor");
+            doc = apply(&doc, at, &c);
+            expected_cursor.character += 1;
+            assert_eq!(step.cursor, expected_cursor, "cursor advances by one");
+        }
+        // "call(x)" is 7 chars; 9 steps cycle back to its start.
+        assert_eq!(doc.split('\n').nth(3), Some("    call(x)ca"));
+        assert!(plan.description.contains("call(x)"));
+    }
+
+    #[test]
+    fn typing_plan_uses_crlf_and_needs_a_non_blank_line() {
+        let plan = typing_plan("x\r\ny\r\n", 1).unwrap();
+        assert_eq!(plan.setup.unwrap().1, "\r\n");
+        assert!(typing_plan("\n  \n\n", 3).is_none());
+    }
+
+    #[test]
+    fn spread_plan_does_not_edit() {
+        let plan = spread_plan("ab\ncd\nef\n", 2);
+        assert!(plan.setup.is_none());
+        assert!(plan.steps.iter().all(|s| s.insert.is_none()));
+        assert_eq!(
+            plan.warmup,
+            Position {
+                line: 0,
+                character: 2
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(BenchArgs {
+            workspace: dir.path().to_owned(),
+            file: "/etc/hosts".to_owned(),
+            n: 1,
+            model: None,
+            json: false,
+            mode: Mode::Spread,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("relative"), "{err}");
     }
 }

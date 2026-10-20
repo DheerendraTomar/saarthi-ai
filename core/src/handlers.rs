@@ -228,7 +228,7 @@ impl AppHandler {
             capabilities: Capabilities {
                 completion: true,
                 chat: true,
-                bench: true,
+                bench: false,
             },
             ollama_status,
             index_status: IndexStatus::Building,
