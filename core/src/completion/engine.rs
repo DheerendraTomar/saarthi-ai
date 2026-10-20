@@ -160,8 +160,8 @@ impl CompletionEngine {
         else {
             return Ok(CompletionResult::default());
         };
-        // Chat may have started while the snippets were refreshed.
-        if self.is_paused() {
+        // Chat may have started, or the caller moved on, during a refresh.
+        if self.is_paused() || cancel.is_cancelled() {
             return Ok(CompletionResult::default());
         }
         let key = prepared.key.clone();
@@ -279,10 +279,11 @@ impl CompletionEngine {
         refresh(&self.inner, uri, &window, budget).await;
     }
 
-    /// Drops the cached snippets for `uri` (e.g. on didClose); the next
-    /// request recomputes them.
+    /// Drops the cached snippets and remembered cursor for `uri` (e.g. on
+    /// didClose); the next request recomputes the snippets.
     pub fn invalidate_snippets(&self, uri: &str) {
         lock(&self.inner.snippets_by_uri).remove(uri);
+        lock(&self.inner.cursors).remove(uri);
     }
 
     /// How many times [`related::snippets`] has run.

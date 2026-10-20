@@ -282,6 +282,28 @@ async fn skips_when_next_char_is_identifier() {
 }
 
 #[tokio::test]
+async fn skips_when_disabled_or_document_too_large() {
+    let env = setup(add_script()).await;
+    env.engine.set_settings(Settings {
+        ollama_url: env.mock.url.clone(),
+        completion_model: "coder".to_owned(),
+        completions_enabled: false,
+        ..Settings::default()
+    });
+    assert!(complete(&env, "r1", CURSOR).await.items.is_empty());
+
+    env.engine.set_settings(Settings {
+        ollama_url: env.mock.url.clone(),
+        completion_model: "coder".to_owned(),
+        ..Settings::default()
+    });
+    let huge = format!("{DOC}{}", "#".repeat(1 << 20));
+    env.store.write().unwrap().did_open(&env.uri, huge, 2);
+    assert!(complete(&env, "r2", CURSOR).await.items.is_empty());
+    assert!(generate_bodies(&env.mock).is_empty());
+}
+
+#[tokio::test]
 async fn ollama_down_returns_empty_and_sets_status() {
     let env = setup(Script {
         refuse_connections: true,
