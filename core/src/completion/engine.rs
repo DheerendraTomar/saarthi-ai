@@ -114,6 +114,28 @@ struct Flight {
     result: watch::Receiver<Option<Outcome>>,
 }
 
+/// Timestamps of one [`CompletionEngine::request_timed`] call, for the
+/// latency bench. A stamp is `None` if that point was never reached (skip,
+/// cache hit, joined generation, error before the stream).
+#[derive(Debug, Clone, Copy)]
+pub struct CompletionTiming {
+    /// The request entered the engine.
+    pub started_at: Instant,
+    /// The HTTP request to Ollama is about to be sent (end of core overhead).
+    pub prepared_at: Option<Instant>,
+    /// The first streamed chunk arrived.
+    pub first_token_at: Option<Instant>,
+    /// The request returned its result.
+    pub done_at: Instant,
+}
+
+/// Where a started generation records its HTTP-send and first-chunk times.
+#[derive(Default)]
+struct TimingSink {
+    prepared_at: Mutex<Option<Instant>>,
+    first_token_at: Mutex<Option<Instant>>,
+}
+
 /// Everything a request needs before the HTTP call (the "core overhead").
 pub(crate) struct Prepared {
     pub key: Key,
@@ -169,6 +191,35 @@ impl CompletionEngine {
         params: CompletionRequestParams,
         cancel: CancellationToken,
     ) -> Result<CompletionResult, RpcError> {
+        self.request_with(params, cancel, None).await
+    }
+
+    /// [`request`](Self::request) plus timestamps, for the latency bench.
+    /// Behaves exactly like `request`.
+    pub async fn request_timed(
+        &self,
+        params: CompletionRequestParams,
+        cancel: CancellationToken,
+    ) -> (Result<CompletionResult, RpcError>, CompletionTiming) {
+        let started_at = Instant::now();
+        let sink = Arc::new(TimingSink::default());
+        let result = self.request_with(params, cancel, Some(sink.clone())).await;
+        let done_at = Instant::now();
+        let timing = CompletionTiming {
+            started_at,
+            prepared_at: *lock(&sink.prepared_at),
+            first_token_at: *lock(&sink.first_token_at),
+            done_at,
+        };
+        (result, timing)
+    }
+
+    async fn request_with(
+        &self,
+        params: CompletionRequestParams,
+        cancel: CancellationToken,
+        timing: Option<Arc<TimingSink>>,
+    ) -> Result<CompletionResult, RpcError> {
         let inner = &self.inner;
         let settings = read(&inner.settings).clone();
         if !settings.completions_enabled || self.is_paused() {
@@ -195,7 +246,7 @@ impl CompletionEngine {
                 hit.text
             }
             None => {
-                let Some(mut waiter) = join_or_start(inner, prepared, &settings) else {
+                let Some(mut waiter) = join_or_start(inner, prepared, &settings, timing) else {
                     return Ok(CompletionResult::default());
                 };
                 let outcome = tokio::select! {
@@ -532,7 +583,14 @@ fn window_lines(window: &CursorWindow) -> String {
 /// starting one if there is none. `None` if completions are paused: checked
 /// under the `inflight` lock, so a flight started here is always seen (and
 /// cancelled) by a concurrent [`CompletionEngine::set_paused`].
-fn join_or_start(inner: &Arc<Inner>, prepared: Prepared, settings: &Settings) -> Option<Waiter> {
+/// `timing`, if given, receives the HTTP-send and first-chunk times of a
+/// generation started here (not of one joined).
+fn join_or_start(
+    inner: &Arc<Inner>,
+    prepared: Prepared,
+    settings: &Settings,
+    timing: Option<Arc<TimingSink>>,
+) -> Option<Waiter> {
     let mut inflight = lock(&inner.inflight);
     if inner.paused.load(Ordering::SeqCst) {
         return None;
@@ -579,7 +637,14 @@ fn join_or_start(inner: &Arc<Inner>, prepared: Prepared, settings: &Settings) ->
     let task_inner = inner.clone();
     let key = prepared.key.clone();
     tokio::spawn(async move {
-        let outcome = generate(&task_inner.ollama, request, trimmer, &http_cancel).await;
+        let outcome = generate(
+            &task_inner.ollama,
+            request,
+            trimmer,
+            &http_cancel,
+            timing.as_deref(),
+        )
+        .await;
         record_status(&task_inner, &outcome);
         if let Ok(text) = &outcome
             && !text.is_empty()
@@ -605,10 +670,17 @@ async fn generate(
     request: GenerateRequest,
     mut trimmer: Trimmer,
     http_cancel: &CancellationToken,
+    timing: Option<&TimingSink>,
 ) -> Outcome {
+    if let Some(t) = timing {
+        *lock(&t.prepared_at) = Some(Instant::now());
+    }
     let mut stream = ollama.generate_stream(request, http_cancel.clone()).await?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        if let Some(t) = timing {
+            lock(&t.first_token_at).get_or_insert_with(Instant::now);
+        }
         if let Some(text) = trimmer.push(&chunk.response) {
             http_cancel.cancel();
             return Ok(text);

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use clap::{Parser, Subcommand};
+use localpilot_core::bench::{self, BenchArgs};
 use localpilot_core::handlers::AppHandler;
 use localpilot_core::rpc::RpcServer;
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
@@ -32,8 +33,24 @@ enum Command {
         #[arg(long, default_value = "info")]
         log_level: String,
     },
-    /// Measure completion latency against the configured Ollama.
-    Bench,
+    /// Measure completion latency against the local Ollama.
+    Bench {
+        /// Workspace root to index.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// File to complete in, relative to the workspace.
+        #[arg(long)]
+        file: String,
+        /// Number of timed completions (after one warm-up request).
+        #[arg(long, default_value_t = 20)]
+        n: usize,
+        /// Completion model (default: the settings default).
+        #[arg(long)]
+        model: Option<String>,
+        /// Print the report as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -43,10 +60,19 @@ fn main() -> ExitCode {
             workspace,
             log_level,
         } => serve(&workspace, &log_level),
-        Command::Bench => {
-            eprintln!("not implemented");
-            ExitCode::from(2)
-        }
+        Command::Bench {
+            workspace,
+            file,
+            n,
+            model,
+            json,
+        } => bench::main(BenchArgs {
+            workspace,
+            file,
+            n,
+            model,
+            json,
+        }),
     }
 }
 

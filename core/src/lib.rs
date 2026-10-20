@@ -2,6 +2,7 @@
 //! integration tests.
 
 pub mod agent;
+pub mod bench;
 pub mod completion;
 pub mod handlers;
 pub mod index;

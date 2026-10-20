@@ -444,3 +444,27 @@ async fn pausing_aborts_a_running_generation() {
     assert!(env.mock.wait_client_disconnected(WAIT).await);
     assert_eq!(generate_bodies(&env.mock).len(), 1);
 }
+
+#[tokio::test]
+async fn request_timed_stamps_send_first_chunk_and_done_in_order() {
+    let env = setup(add_script()).await;
+    let (result, t) = tokio::time::timeout(
+        WAIT,
+        env.engine
+            .request_timed(params(&env, "t1", CURSOR), CancellationToken::new()),
+    )
+    .await
+    .expect("request finishes");
+    assert_eq!(texts(&result.expect("completion never fails")), ["a + b"]);
+    let sent = t.prepared_at.expect("HTTP send stamped");
+    let first = t.first_token_at.expect("first chunk stamped");
+    assert!(t.started_at <= sent && sent <= first && first <= t.done_at);
+
+    // A cache hit makes no HTTP call, so it has no send or chunk stamps.
+    let (_, hit) = env
+        .engine
+        .request_timed(params(&env, "t2", CURSOR), CancellationToken::new())
+        .await;
+    assert!(hit.prepared_at.is_none() && hit.first_token_at.is_none());
+    assert!(hit.started_at <= hit.done_at);
+}
