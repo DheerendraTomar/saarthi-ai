@@ -103,11 +103,7 @@ impl DocumentStore {
     /// Reads `path` from the overlay if open, else from disk. Relative paths
     /// resolve against the workspace root.
     pub fn read(&self, path: &Path) -> io::Result<String> {
-        let abs = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.workspace_root.join(path)
-        };
+        let abs = normalize_path(&self.workspace_root.join(path));
         match self.docs.get(&path_to_uri(&abs)) {
             Some(doc) => Ok(doc.text.clone()),
             None => std::fs::read_to_string(&abs),
@@ -184,9 +180,28 @@ fn offset_in(text: &str, line_starts: &[usize], pos: Position) -> usize {
 }
 
 /// Canonical spelling of a `file://` URI, so client encodings that differ only
-/// in which characters they escape map to the same document.
+/// in which characters they escape, or in `.`/`..` segments, map to the same
+/// document.
 fn normalize_uri(uri: &str) -> String {
-    path_to_uri(&uri_to_path(uri))
+    path_to_uri(&normalize_path(&uri_to_path(uri)))
+}
+
+/// Lexically normalizes `path`: drops `.` segments and resolves `..` against
+/// the preceding segment (never above the root). Does not touch the
+/// filesystem, so symlinks are not resolved.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Converts a `file://` URI to a path, percent-decoding it. Input without the
@@ -221,6 +236,7 @@ fn percent_decode(s: &str) -> Vec<u8> {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && let Some(hex) = s.get(i + 1..i + 3)
+            && hex.bytes().all(|h| h.is_ascii_hexdigit())
             && let Ok(b) = u8::from_str_radix(hex, 16)
         {
             out.push(b);
@@ -351,6 +367,44 @@ mod tests {
         assert_eq!(prefix, "a\r\n");
         assert_eq!(suffix, "b");
         assert!(s.split_at_cursor("file:///ws/missing", pos(0, 0)).is_none());
+    }
+
+    #[test]
+    fn read_normalizes_dot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "disk").unwrap();
+
+        let mut s = DocumentStore::new(dir.path().to_path_buf());
+        s.did_open(&path_to_uri(&path), "mem".into(), 1);
+        assert_eq!(s.read(Path::new("./f.txt")).unwrap(), "mem");
+        assert_eq!(s.read(Path::new("sub/../f.txt")).unwrap(), "mem");
+        assert_eq!(s.read(&dir.path().join(".").join("f.txt")).unwrap(), "mem");
+        // A URI with dot segments addresses the same document.
+        let dotted = format!("{}/./sub/../f.txt", path_to_uri(dir.path()));
+        assert_eq!(s.text(&dotted).as_deref(), Some("mem"));
+    }
+
+    #[test]
+    fn sequential_changes_apply_against_previous_result() {
+        let mut s = store();
+        s.did_open(URI, "ab".into(), 1);
+        // The second range only exists after the first change inserts a line.
+        s.did_change(
+            URI,
+            2,
+            vec![
+                change(range(0, 1, 0, 1), "\nxyz"),
+                change(range(1, 1, 1, 3), "Q"),
+            ],
+        );
+        assert_eq!(s.text(URI).as_deref(), Some("a\nxQb"));
+    }
+
+    #[test]
+    fn percent_decode_requires_hex_digits() {
+        assert_eq!(percent_decode("%+1%2F%zz%4"), b"%+1/%zz%4");
     }
 
     #[test]
