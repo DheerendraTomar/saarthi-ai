@@ -1,6 +1,7 @@
 //! `localpilot-core` library: shared types used by the sidecar binary and its
 //! integration tests.
 
+pub mod agent;
 pub mod completion;
 pub mod index;
 pub mod ollama;
