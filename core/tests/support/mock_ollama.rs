@@ -31,8 +31,9 @@ pub struct Script {
     pub models: Vec<String>,
     /// Names returned by `/api/ps`.
     pub loaded: Vec<String>,
-    /// NDJSON lines streamed for every `/api/generate` request.
-    pub generate: Vec<Value>,
+    /// One response (NDJSON lines) per `/api/generate` request, consumed in
+    /// order; the last one repeats once the list is exhausted.
+    pub generate: Vec<Vec<Value>>,
     /// One response (NDJSON lines) per `/api/chat` request, consumed in
     /// order; the last one repeats once the list is exhausted.
     pub chat: Vec<Vec<Value>>,
@@ -105,6 +106,7 @@ pub fn chat_done() -> Value {
 struct Shared {
     script: Script,
     requests: Mutex<Vec<(String, Value)>>,
+    generate_calls: AtomicUsize,
     chat_calls: AtomicUsize,
     disconnected: AtomicBool,
 }
@@ -122,6 +124,7 @@ impl MockOllama {
         let shared = Arc::new(Shared {
             script,
             requests: Mutex::new(Vec::new()),
+            generate_calls: AtomicUsize::new(0),
             chat_calls: AtomicUsize::new(0),
             disconnected: AtomicBool::new(false),
         });
@@ -231,7 +234,14 @@ fn ndjson(shared: Arc<Shared>, lines: Vec<Value>) -> Response {
     tokio::spawn(async move {
         for line in lines {
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = tx.closed() => {
+                        // Hyper dropped the body: the connection is gone.
+                        shared.disconnected.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
             }
             let mut text = serde_json::to_string(&line).unwrap();
             text.push('\n');
@@ -283,7 +293,8 @@ async fn generate(State(shared): State<Arc<Shared>>, req: Request) -> Response {
     if let Some(resp) = failure(&shared, &body) {
         return resp;
     }
-    let lines = shared.script.generate.clone();
+    let call = shared.generate_calls.fetch_add(1, Ordering::SeqCst);
+    let lines = nth_or_last(&shared.script.generate, call);
     ndjson(shared, lines)
 }
 
@@ -293,11 +304,15 @@ async fn chat(State(shared): State<Arc<Shared>>, req: Request) -> Response {
         return resp;
     }
     let call = shared.chat_calls.fetch_add(1, Ordering::SeqCst);
-    let turns = &shared.script.chat;
-    let lines = turns
-        .get(call)
-        .or_else(|| turns.last())
-        .cloned()
-        .unwrap_or_default();
+    let lines = nth_or_last(&shared.script.chat, call);
     ndjson(shared, lines)
+}
+
+/// Response `call` of a per-request script; the last one repeats.
+fn nth_or_last(responses: &[Vec<Value>], call: usize) -> Vec<Value> {
+    responses
+        .get(call)
+        .or_else(|| responses.last())
+        .cloned()
+        .unwrap_or_default()
 }

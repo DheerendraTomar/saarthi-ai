@@ -55,6 +55,10 @@ pub struct GenerateChunk {
     pub eval_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_duration: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_duration: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_duration: Option<u64>,
 }
 
 /// Body of `POST /api/chat`.

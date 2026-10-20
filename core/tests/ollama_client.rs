@@ -56,12 +56,12 @@ fn weather_tool() -> ToolSpec {
 #[tokio::test]
 async fn generate_stream_yields_chunks_in_order() {
     let mock = MockOllama::start(Script {
-        generate: vec![
+        generate: vec![vec![
             generate_chunk("return"),
             generate_chunk(" a"),
             generate_chunk(" + b"),
             generate_done(),
-        ],
+        ]],
         ..Script::default()
     })
     .await;
@@ -86,6 +86,8 @@ async fn generate_stream_yields_chunks_in_order() {
     assert_eq!(last.prompt_eval_duration, Some(6027000));
     assert_eq!(last.eval_count, Some(8));
     assert_eq!(last.eval_duration, Some(41815000));
+    assert_eq!(last.total_duration, Some(49229958));
+    assert_eq!(last.load_duration, Some(371875));
 
     let requests = mock.received_requests();
     assert_eq!(requests.len(), 1);
@@ -172,7 +174,7 @@ async fn chat_stream_parses_tool_calls() {
 #[tokio::test]
 async fn cancel_token_stops_stream_promptly() {
     let mock = MockOllama::start(Script {
-        generate: (0..50).map(|i| generate_chunk(&format!("t{i} "))).collect(),
+        generate: vec![(0..50).map(|i| generate_chunk(&format!("t{i} "))).collect()],
         chunk_delay: Duration::from_millis(50),
         ..Script::default()
     })
@@ -222,6 +224,62 @@ async fn cancel_token_stops_stream_promptly() {
         mock.wait_client_disconnected(Duration::from_secs(2)).await,
         "mock never saw the connection close"
     );
+}
+
+#[tokio::test]
+async fn cancel_drops_connection_while_stream_is_not_polled() {
+    // Chunks are 2 s apart, so nothing arrives between cancel and the
+    // deadline: only the reader's reaction to the token itself can close the
+    // connection in time.
+    let mock = MockOllama::start(Script {
+        generate: vec![(0..5).map(|i| generate_chunk(&format!("t{i} "))).collect()],
+        chunk_delay: Duration::from_secs(2),
+        ..Script::default()
+    })
+    .await;
+    let cancel = CancellationToken::new();
+    // Held but never polled: the body must still be dropped on cancel.
+    let stream = client(&mock)
+        .generate_stream(fim_request("coder"), cancel.clone())
+        .await
+        .expect("stream starts");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+
+    assert!(
+        mock.wait_client_disconnected(Duration::from_millis(500))
+            .await,
+        "connection still open after cancel while the stream was not polled"
+    );
+    drop(stream);
+}
+
+#[tokio::test]
+async fn generate_script_advances_per_request() {
+    let mock = MockOllama::start(Script {
+        generate: vec![
+            vec![generate_chunk("first"), generate_done()],
+            vec![generate_chunk("second"), generate_done()],
+        ],
+        ..Script::default()
+    })
+    .await;
+    let client = client(&mock);
+
+    let mut texts = Vec::new();
+    for _ in 0..3 {
+        let stream = client
+            .generate_stream(fim_request("coder"), CancellationToken::new())
+            .await
+            .expect("stream starts");
+        let chunks: Vec<_> = tokio::time::timeout(WAIT, stream.collect::<Vec<_>>())
+            .await
+            .expect("stream finishes");
+        texts.push(chunks[0].as_ref().expect("chunk ok").response.clone());
+    }
+    // The last response repeats once the script is exhausted.
+    assert_eq!(texts, ["first", "second", "second"]);
 }
 
 #[tokio::test]
