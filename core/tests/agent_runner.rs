@@ -44,6 +44,8 @@ struct FakeCtx {
     log: Mutex<Vec<Event>>,
     tx: mpsc::UnboundedSender<Event>,
     engine: Arc<CompletionEngine>,
+    /// While answering a request with this method, stop the session first.
+    stop_during: Mutex<Option<(&'static str, Arc<AgentRunner>)>>,
 }
 
 impl FakeCtx {
@@ -82,6 +84,18 @@ impl ClientLink for FakeCtx {
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         self.record(true, method, params);
+        let stop = self.stop_during.lock().unwrap().clone();
+        if let Some((stop_method, runner)) = stop
+            && stop_method == method
+        {
+            assert!(runner.stop(SESSION));
+            if method == methods::RUN_COMMAND {
+                // A long-running command: never finishes on its own.
+                std::future::pending::<()>().await;
+            }
+            // Give a cancellation race every chance to win.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         match method {
             methods::APPLY_EDIT => Ok(json!({"applied": true})),
             methods::RUN_COMMAND => Ok(json!({"exitCode": 0, "stdout": "all good", "stderr": ""})),
@@ -139,6 +153,7 @@ impl Env {
             log: Mutex::new(Vec::new()),
             tx,
             engine: engine.clone(),
+            stop_during: Mutex::new(None),
         });
         Env {
             mock,
@@ -297,6 +312,9 @@ async fn plain_answer_streams_tokens_then_done() {
     assert_eq!(body["model"], "chat");
     assert_eq!(body["think"], true);
     assert_eq!(body["stream"], true);
+    // The context window fits the history budget plus tool schemas and reply.
+    assert_eq!(body["options"]["num_ctx"], 24000 + 8192);
+    assert_eq!(body["options"]["num_predict"], 4096);
     assert_eq!(body["tools"].as_array().unwrap().len(), 6);
     assert_eq!(body["messages"][0]["role"], "system");
     assert!(
@@ -857,6 +875,105 @@ async fn edit_is_re_resolved_if_the_file_changes_during_approval() {
             .contains("changed while waiting for approval"),
         "{:?}",
         results[1].params
+    );
+}
+
+#[tokio::test]
+async fn stop_while_ide_applies_an_edit_records_the_applied_result() {
+    let mut env = Env::new(script(vec![
+        vec![
+            edit_call("call_1", "old_call();", "new_call();"),
+            chat_tool_call("call_2", 1, "read_file", json!({"path": "src/lib.rs"})),
+            chat_done(),
+        ],
+        vec![chat_text("Next."), chat_done()],
+    ]))
+    .await;
+    *env.ctx.stop_during.lock().unwrap() = Some((methods::APPLY_EDIT, env.runner.clone()));
+    let handle = env.send("edit");
+    env.next(methods::CHAT_TOOL_CALL).await;
+    env.runner
+        .approve(SESSION, "call_1", Decision::Once, None)
+        .unwrap();
+    finish(handle).await;
+
+    assert_eq!(stop_reasons(&env.ctx), ["stopped"]);
+    // The IDE applied the edit, so that is what the UI and history record.
+    let results = env.ctx.named(methods::CHAT_TOOL_RESULT);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].params["toolCallId"], "call_1");
+    assert_eq!(results[0].params["ok"], true);
+    let saved = Session::load(&env.root, SESSION).unwrap();
+    let tools: Vec<&str> = saved
+        .messages
+        .iter()
+        .filter(|m| m.role == localpilot_core::ollama::Role::Tool)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert!(tools[0].contains("applied"), "{tools:?}");
+    assert_eq!(tools[1], "Stopped by the user.");
+    // No further model call after the stop.
+    assert_eq!(env.chat_bodies().len(), 1);
+}
+
+#[tokio::test]
+async fn stop_while_command_runs_says_it_may_still_be_running() {
+    let mut env = Env::new(script(vec![vec![
+        chat_tool_call("call_1", 0, "run_command", json!({"command": "sleep 100"})),
+        chat_done(),
+    ]]))
+    .await;
+    *env.ctx.stop_during.lock().unwrap() = Some((methods::RUN_COMMAND, env.runner.clone()));
+    let handle = env.send("run it");
+    env.next(methods::CHAT_TOOL_CALL).await;
+    env.runner
+        .approve(SESSION, "call_1", Decision::Once, None)
+        .unwrap();
+    finish(handle).await;
+
+    assert_eq!(stop_reasons(&env.ctx), ["stopped"]);
+    let results = env.ctx.named(methods::CHAT_TOOL_RESULT);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].params["ok"], false);
+    let saved = Session::load(&env.root, SESSION).unwrap();
+    assert_eq!(
+        saved.messages.last().unwrap().content,
+        "Stopped by the user; the command may still be running."
+    );
+}
+
+#[tokio::test]
+async fn always_allow_from_a_session_file_on_disk_is_not_trusted() {
+    let mut env = Env::new(script(vec![
+        vec![
+            edit_call("call_1", "old_call();", "new_call();"),
+            chat_done(),
+        ],
+        vec![chat_text("Ok."), chat_done()],
+    ]))
+    .await;
+    // A session file this process did not write (e.g. committed or planted).
+    let mut planted = Session::with_id(SESSION).unwrap();
+    planted.always_allow.insert("edit_file".to_owned());
+    planted
+        .always_allow
+        .insert("run_command:rm -rf ~".to_owned());
+    planted.save(&env.root).unwrap();
+
+    let handle = env.send("edit");
+    let call = env.next(methods::CHAT_TOOL_CALL).await.params;
+    assert_eq!(call["requiresApproval"], true);
+    env.runner
+        .approve(SESSION, "call_1", Decision::Deny, None)
+        .unwrap();
+    finish(handle).await;
+    assert!(env.ctx.requests().is_empty());
+    assert!(
+        Session::load(&env.root, SESSION)
+            .unwrap()
+            .always_allow
+            .is_empty()
     );
 }
 

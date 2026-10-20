@@ -570,6 +570,7 @@ fn join_or_start(inner: &Arc<Inner>, prepared: Prepared, settings: &Settings) ->
             num_predict: settings.completion_max_tokens,
             temperature: 0.0,
             stop: Vec::new(),
+            num_ctx: None,
         },
         keep_alive: Some(settings.keep_alive.clone()),
     };

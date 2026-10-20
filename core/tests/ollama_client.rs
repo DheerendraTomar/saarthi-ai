@@ -30,6 +30,7 @@ fn options() -> Options {
         num_predict: 32,
         temperature: 0.0,
         stop: vec!["\n\n".to_owned()],
+        num_ctx: None,
     }
 }
 

@@ -16,6 +16,10 @@ pub struct Options {
     pub temperature: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
+    /// Context window in tokens; `None` uses the model's default (and is
+    /// not sent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
 }
 
 /// Body of `POST /api/generate` (fill-in-the-middle via `prompt` + `suffix`).

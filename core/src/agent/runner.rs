@@ -46,7 +46,13 @@ pub const MAX_TOOL_ROUNDS: usize = 25;
 pub const DENIED: &str = "User denied this action.";
 /// Tool result for calls cut short by `chat/stop`.
 const STOPPED: &str = "Stopped by the user.";
-const NUM_PREDICT: u32 = 8192;
+/// Tool result for a command the user stopped the turn during.
+const STOPPED_COMMAND: &str = "Stopped by the user; the command may still be running.";
+/// Tokens reserved beyond the history budget: ~1k of tool schemas plus a
+/// reply (with thinking) of up to [`NUM_PREDICT`].
+const REPLY_HEADROOM_TOKENS: usize = 8192;
+/// Longest reply; half the headroom, the rest covers schemas and estimate slack.
+const NUM_PREDICT: u32 = (REPLY_HEADROOM_TOKENS / 2) as u32;
 const TEMPERATURE: f32 = 0.2;
 
 /// The user's answer to an approval prompt.
@@ -257,7 +263,13 @@ impl AgentRunner {
             .await
             .unwrap_or_else(|err| Err(io::Error::other(err)));
         match loaded {
-            Ok(session) => session,
+            Ok(mut session) => {
+                // Not written by this process (it would be cached): the file
+                // could have been committed or planted, so its "always"
+                // approvals are not trusted.
+                session.always_allow.clear();
+                session
+            }
             Err(err) => {
                 if err.kind() != io::ErrorKind::NotFound {
                     tracing::warn!(%err, session = id, "cannot load session; starting a new one");
@@ -621,6 +633,16 @@ impl Turn<'_> {
                     }
                 };
                 self.finish_call(id, &call.function.name, outcome);
+                // A stop that arrived while this call ran (its result is
+                // recorded as it happened) ends the turn here.
+                if self.cancel.is_cancelled() {
+                    for (_, call) in &calls[i + 1..] {
+                        self.session
+                            .messages
+                            .push(ChatMessage::tool(&call.function.name, STOPPED));
+                    }
+                    return StopReason::Stopped;
+                }
             }
             rounds += 1;
             if rounds == MAX_TOOL_ROUNDS {
@@ -649,6 +671,10 @@ impl Turn<'_> {
                 num_predict: NUM_PREDICT,
                 temperature: TEMPERATURE,
                 stop: Vec::new(),
+                num_ctx: Some(
+                    u32::try_from(self.settings.chat_context_tokens + REPLY_HEADROOM_TOKENS)
+                        .unwrap_or(u32::MAX),
+                ),
             },
             keep_alive: Some(self.settings.keep_alive.clone()),
         };
@@ -808,7 +834,7 @@ impl Turn<'_> {
         } else {
             self.notify_call(id, call, false, action.preview());
         }
-        let mut outcome = self.execute(action).await?;
+        let mut outcome = self.execute(action).await;
         if let Some(note) = note {
             outcome.content.insert_str(0, &note);
         }
@@ -895,11 +921,12 @@ impl Turn<'_> {
         })
     }
 
-    /// Runs an approved action. `None` if the turn is stopped meanwhile.
-    async fn execute(&self, action: Action) -> Option<Outcome> {
+    /// Runs an approved action. A stop during a command ends the wait (the
+    /// result says so); edits always wait for the IDE's answer.
+    async fn execute(&self, action: Action) -> Outcome {
         let runner = self.runner;
         let root = runner.canonical_root.clone();
-        let outcome = match action {
+        match action {
             Action::Read(Tool::ReadFile {
                 path,
                 start_line,
@@ -949,16 +976,16 @@ impl Turn<'_> {
                     {
                         Ok(resolved) => resolved,
                         Err(err) => {
-                            return Some(Outcome::error(format!(
+                            return Outcome::error(format!(
                                 "the file changed while waiting for approval: {err}"
-                            )));
+                            ));
                         }
                     },
                     Err(err) => {
-                        return Some(Outcome::error(format!(
+                        return Outcome::error(format!(
                             "cannot read {}: {err}",
                             tools::display(&rel)
-                        )));
+                        ));
                     }
                 };
                 let op = EditOp::Edit {
@@ -967,7 +994,7 @@ impl Turn<'_> {
                     new_text: resolved.new_text,
                 };
                 let what = format!("edited {}", tools::display(&rel));
-                self.apply(op, what).await?
+                self.apply(op, what).await
             }
             Action::Create { rel, content, .. } => {
                 let op = EditOp::Create {
@@ -975,14 +1002,26 @@ impl Turn<'_> {
                     content,
                 };
                 let what = format!("created {}", tools::display(&rel));
-                self.apply(op, what).await?
+                self.apply(op, what).await
             }
             Action::Command { command, cwd } => {
                 let params = RunCommandParams {
                     command,
                     cwd: Some(cwd.to_string_lossy().into_owned()),
                 };
-                match self.request(methods::RUN_COMMAND, to_json(params)).await? {
+                // Raced against stop: a command can run for minutes. The
+                // client is not told to kill it, so say so.
+                let response = tokio::select! {
+                    _ = self.cancel.cancelled() => {
+                        return Outcome {
+                            ok: false,
+                            content: STOPPED_COMMAND.to_owned(),
+                            summary: "Stopped".to_owned(),
+                        };
+                    }
+                    response = self.ctx.request(methods::RUN_COMMAND, to_json(params)) => response,
+                };
+                match response {
                     Err(err) => Outcome::error(format!(
                         "the IDE could not run the command: {}",
                         err.message
@@ -996,42 +1035,33 @@ impl Turn<'_> {
                     },
                 }
             }
-        };
-        Some(outcome)
+        }
     }
 
     /// Sends one `workspace/applyEdit` op (applied and saved by the IDE).
-    async fn apply(&self, op: EditOp, what: String) -> Option<Outcome> {
+    /// Not raced against stop: the IDE answers quickly and may apply the
+    /// edit regardless, so its answer is always recorded.
+    async fn apply(&self, op: EditOp, what: String) -> Outcome {
         let params = ApplyEditParams {
             ops: vec![op],
             save: true,
         };
-        Some(
-            match self.request(methods::APPLY_EDIT, to_json(params)).await? {
-                Err(err) => {
-                    Outcome::error(format!("the IDE could not apply the edit: {}", err.message))
-                }
-                Ok(value) => match serde_json::from_value::<ApplyEditResult>(value) {
-                    Ok(ApplyEditResult { applied: true, .. }) => Outcome {
-                        ok: true,
-                        content: format!("The edit was applied and saved: {what}."),
-                        summary: what,
-                    },
-                    Ok(ApplyEditResult { error, .. }) => Outcome::error(format!(
-                        "the IDE did not apply the edit: {}",
-                        error.unwrap_or_else(|| "no reason given".into())
-                    )),
-                    Err(err) => Outcome::error(format!("invalid applyEdit response: {err}")),
+        match self.ctx.request(methods::APPLY_EDIT, to_json(params)).await {
+            Err(err) => {
+                Outcome::error(format!("the IDE could not apply the edit: {}", err.message))
+            }
+            Ok(value) => match serde_json::from_value::<ApplyEditResult>(value) {
+                Ok(ApplyEditResult { applied: true, .. }) => Outcome {
+                    ok: true,
+                    content: format!("The edit was applied and saved: {what}."),
+                    summary: what,
                 },
+                Ok(ApplyEditResult { error, .. }) => Outcome::error(format!(
+                    "the IDE did not apply the edit: {}",
+                    error.unwrap_or_else(|| "no reason given".into())
+                )),
+                Err(err) => Outcome::error(format!("invalid applyEdit response: {err}")),
             },
-        )
-    }
-
-    /// A core→client request; `None` if the turn is stopped first.
-    async fn request(&self, method: &str, params: Value) -> Option<Result<Value, RpcError>> {
-        tokio::select! {
-            _ = self.cancel.cancelled() => None,
-            result = self.ctx.request(method, params) => Some(result),
         }
     }
 }
