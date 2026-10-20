@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod completion;
+pub mod handlers;
 pub mod index;
 pub mod ollama;
 pub mod overlay;
