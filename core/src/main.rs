@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use clap::{Parser, Subcommand};
+use localpilot_core::agent::session;
 use localpilot_core::bench::{self, BenchArgs, Mode};
 use localpilot_core::handlers::AppHandler;
 use localpilot_core::rpc::RpcServer;
@@ -130,13 +131,22 @@ fn serve(workspace: &Path, log_level: &str) -> ExitCode {
     std::process::exit(code);
 }
 
-/// Logs to `<workspace>/.localpilot/core.log` (appending), never to stdout.
+/// Logs to `<workspace>/.localpilot/core.log` (appending), never to stdout,
+/// creating `.localpilot/.gitignore` with it.
 fn init_logging(workspace: &Path, log_level: &str) -> Result<(), String> {
     let filter =
         EnvFilter::try_new(log_level).map_err(|err| format!("invalid --log-level: {err}"))?;
-    let dir = workspace.join(".localpilot");
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    // The canonical root, like the index: the log lands in the same place
+    // however the workspace path is spelled.
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let dir = session::ensure_state_dir(&workspace).map_err(|err| {
+        format!(
+            "cannot create {}: {err}",
+            workspace.join(".localpilot").display()
+        )
+    })?;
     let path = dir.join("core.log");
     let file = OpenOptions::new()
         .create(true)

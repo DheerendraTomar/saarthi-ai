@@ -46,15 +46,47 @@ impl Document {
 /// Open documents keyed by normalized `file://` URI.
 #[derive(Debug)]
 pub struct DocumentStore {
-    workspace_root: PathBuf,
+    roots: Roots,
     docs: HashMap<String, Document>,
     clock: u64,
 }
 
+/// The workspace root as the client spells it (open documents are keyed by
+/// the client's URIs) and, if it differs, its canonical form, so a relative
+/// path finds a document the client opened under either spelling.
+#[derive(Debug, Clone, Default)]
+struct Roots {
+    client: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl Roots {
+    /// Normalized absolute candidates for `path`, client spelling first.
+    fn candidates(&self, path: &Path) -> impl Iterator<Item = PathBuf> {
+        let first = normalize_path(&self.client.join(path));
+        let second = self
+            .canonical
+            .as_ref()
+            .filter(|_| path.is_relative())
+            .map(|canonical| normalize_path(&canonical.join(path)));
+        std::iter::once(first).chain(second)
+    }
+}
+
 impl DocumentStore {
+    /// `workspace_root` should be spelled the way the client spells its
+    /// document URIs (symlinks unresolved). Resolves it once here, so call
+    /// this before putting the store behind a lock.
     pub fn new(workspace_root: PathBuf) -> Self {
+        let canonical = workspace_root
+            .canonicalize()
+            .ok()
+            .filter(|c| *c != workspace_root);
         Self {
-            workspace_root,
+            roots: Roots {
+                client: workspace_root,
+                canonical,
+            },
             docs: HashMap::new(),
             clock: 0,
         }
@@ -105,18 +137,19 @@ impl DocumentStore {
     /// Reads `path` from the overlay if open, else from disk. Relative paths
     /// resolve against the workspace root.
     pub fn read(&self, path: &Path) -> io::Result<String> {
-        let abs = normalize_path(&self.workspace_root.join(path));
-        match self.docs.get(&path_to_uri(&abs)) {
-            Some(doc) => Ok(doc.text.clone()),
-            None => std::fs::read_to_string(&abs),
+        for abs in self.roots.candidates(path) {
+            if let Some(doc) = self.docs.get(&path_to_uri(&abs)) {
+                return Ok(doc.text.clone());
+            }
         }
+        std::fs::read_to_string(normalize_path(&self.roots.client.join(path)))
     }
 
     /// Owned copy of every open document's text, so a caller can release the
     /// store lock before doing disk I/O (e.g. workspace search).
     pub fn overlay_snapshot(&self) -> OverlaySnapshot {
         OverlaySnapshot {
-            workspace_root: self.workspace_root.clone(),
+            roots: self.roots.clone(),
             docs: self
                 .docs
                 .iter()
@@ -223,7 +256,7 @@ pub struct CursorWindow {
 /// [`DocumentStore::read`] without needing the store (or its lock).
 #[derive(Debug, Clone, Default)]
 pub struct OverlaySnapshot {
-    workspace_root: PathBuf,
+    roots: Roots,
     docs: HashMap<PathBuf, String>,
 }
 
@@ -232,11 +265,32 @@ impl OverlaySnapshot {
     /// paths resolve against the workspace root.
     /// Open documents are borrowed, not copied.
     pub fn read(&self, path: &Path) -> io::Result<Cow<'_, str>> {
-        let abs = normalize_path(&self.workspace_root.join(path));
-        match self.docs.get(&abs) {
-            Some(text) => Ok(Cow::Borrowed(text)),
-            None => std::fs::read_to_string(&abs).map(Cow::Owned),
+        self.read_capped(path, u64::MAX)
+    }
+
+    /// Like [`read`](Self::read), but a file read from disk that is larger
+    /// than `max_bytes` is refused (`InvalidData`) after a `metadata` check,
+    /// without reading it. Open documents are already in memory and are
+    /// always returned.
+    pub fn read_capped(&self, path: &Path, max_bytes: u64) -> io::Result<Cow<'_, str>> {
+        if let Some(text) = self
+            .roots
+            .candidates(path)
+            .find_map(|abs| self.docs.get(&abs))
+        {
+            return Ok(Cow::Borrowed(text));
         }
+        let abs = normalize_path(&self.roots.client.join(path));
+        if max_bytes < u64::MAX {
+            let len = std::fs::metadata(&abs)?.len();
+            if len > max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("file is too large ({len} bytes; the limit is {max_bytes} bytes)"),
+                ));
+            }
+        }
+        std::fs::read_to_string(&abs).map(Cow::Owned)
     }
 
     /// Number of open documents captured.
@@ -299,7 +353,7 @@ fn normalize_uri(uri: &str) -> String {
 /// Lexically normalizes `path`: drops `.` segments and resolves `..` against
 /// the preceding segment (never above the root). Does not touch the
 /// filesystem, so symlinks are not resolved.
-fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -494,6 +548,29 @@ mod tests {
         // A URI with dot segments addresses the same document.
         let dotted = format!("{}/./sub/../f.txt", path_to_uri(dir.path()));
         assert_eq!(s.text(&dotted).as_deref(), Some("mem"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_reads_find_documents_under_either_root_spelling() {
+        let real = tempfile::tempdir().unwrap();
+        let real_root = real.path().canonicalize().unwrap();
+        std::fs::write(real_root.join("a.txt"), "disk a").unwrap();
+        std::fs::write(real_root.join("b.txt"), "disk b").unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link_root = links.path().join("ws");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let mut s = DocumentStore::new(link_root.clone());
+        // Opened through the symlink (as the client spells the root)...
+        s.did_open(&path_to_uri(&link_root.join("a.txt")), "mem a".into(), 1);
+        // ...or through the real path.
+        s.did_open(&path_to_uri(&real_root.join("b.txt")), "mem b".into(), 1);
+        let snapshot = s.overlay_snapshot();
+        for (rel, text) in [("a.txt", "mem a"), ("b.txt", "mem b")] {
+            assert_eq!(s.read(Path::new(rel)).unwrap(), text);
+            assert_eq!(snapshot.read(Path::new(rel)).unwrap(), text);
+        }
     }
 
     #[test]

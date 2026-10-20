@@ -757,6 +757,126 @@ async fn path_escape_in_create_file_is_rejected() {
 }
 
 #[tokio::test]
+async fn writes_under_git_or_localpilot_are_rejected_even_when_always_allowed() {
+    let mut env = Env::new(script(vec![
+        // Grants "always" for edits and creates first.
+        vec![
+            edit_call("call_1", "old_call();", "new_call();"),
+            chat_done(),
+        ],
+        vec![
+            chat_tool_call(
+                "call_2",
+                0,
+                "create_file",
+                json!({"path": "src/new.rs", "content": "x"}),
+            ),
+            chat_done(),
+        ],
+        vec![
+            chat_tool_call(
+                "call_3",
+                0,
+                "create_file",
+                json!({"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\nrm -rf ~\n"}),
+            ),
+            chat_tool_call(
+                "call_4",
+                1,
+                "edit_file",
+                json!({"path": ".git/config", "old": "[core]", "new": "[core]\n\thooksPath = x"}),
+            ),
+            chat_tool_call(
+                "call_5",
+                2,
+                "create_file",
+                json!({"path": ".localpilot/sessions/other.json", "content": "{}"}),
+            ),
+            chat_tool_call(
+                "call_6",
+                3,
+                "edit_file",
+                json!({"path": ".localpilot/.gitignore", "old": "*", "new": ""}),
+            ),
+            chat_done(),
+        ],
+        vec![chat_text("Ok."), chat_done()],
+    ]))
+    .await;
+    std::fs::create_dir_all(env.root.join(".git/hooks")).unwrap();
+    std::fs::write(env.root.join(".git/config"), "[core]\n").unwrap();
+    std::fs::create_dir_all(env.root.join(".localpilot")).unwrap();
+    std::fs::write(env.root.join(".localpilot/.gitignore"), "*\n").unwrap();
+
+    let handle = env.send("go");
+    env.next(methods::CHAT_TOOL_CALL).await;
+    env.runner
+        .approve(SESSION, "call_1", Decision::Always, None)
+        .unwrap();
+    let call = env.next(methods::CHAT_TOOL_CALL).await.params;
+    assert_eq!(call["toolCallId"], "call_2");
+    env.runner
+        .approve(SESSION, "call_2", Decision::Always, None)
+        .unwrap();
+    finish(handle).await;
+
+    // Only the two approved writes reached the IDE.
+    let uris: Vec<Value> = env
+        .ctx
+        .requests()
+        .iter()
+        .map(|r| r.params["ops"][0]["uri"].clone())
+        .collect();
+    assert_eq!(uris, [env.uri("src/lib.rs"), env.uri("src/new.rs")]);
+    let results = env.ctx.named(methods::CHAT_TOOL_RESULT);
+    assert_eq!(results.len(), 6);
+    for result in &results[2..] {
+        assert_eq!(result.params["ok"], false, "{:?}", result.params);
+        assert!(
+            result.params["summary"]
+                .as_str()
+                .unwrap()
+                .contains("may not write"),
+            "{:?}",
+            result.params
+        );
+    }
+    assert_eq!(stop_reasons(&env.ctx), ["done"]);
+}
+
+#[tokio::test]
+async fn always_carries_over_to_the_next_send_in_the_same_process() {
+    let mut env = Env::new(script(vec![
+        vec![
+            edit_call("call_1", "old_call();", "new_call();"),
+            chat_done(),
+        ],
+        vec![chat_text("Done."), chat_done()],
+        vec![edit_call("call_2", "fn a()", "fn b()"), chat_done()],
+        vec![chat_text("Done again."), chat_done()],
+    ]))
+    .await;
+    let handle = env.send("first");
+    let call = env.next(methods::CHAT_TOOL_CALL).await.params;
+    assert_eq!(call["requiresApproval"], true);
+    env.runner
+        .approve(SESSION, "call_1", Decision::Always, None)
+        .unwrap();
+    finish(handle).await;
+
+    // A new send in the same session (loaded back from disk): no prompt.
+    let handle = env.send("second");
+    let call = env.next(methods::CHAT_TOOL_CALL).await.params;
+    assert_eq!(
+        (&call["toolCallId"], &call["requiresApproval"]),
+        (&json!("call_2"), &json!(false))
+    );
+    finish(handle).await;
+    assert_eq!(env.ctx.requests().len(), 2);
+    assert_eq!(stop_reasons(&env.ctx), ["done", "done"]);
+}
+
+#[tokio::test]
 async fn stop_mid_stream_emits_stopped() {
     let mut chunks: Vec<Value> = (0..200).map(|i| chat_text(&format!("t{i} "))).collect();
     chunks.push(chat_done());

@@ -75,6 +75,20 @@ fn state_dir(root: &Path) -> PathBuf {
     root.join(".localpilot")
 }
 
+/// Creates `<root>/.localpilot` and its `.gitignore` (`*`, so nothing the
+/// core writes there — log, sessions — is ever committed), and returns the
+/// directory. Idempotent; used by the log setup and by session saves, so the
+/// `.gitignore` exists as soon as anything is written there.
+pub fn ensure_state_dir(root: &Path) -> io::Result<PathBuf> {
+    let dir = state_dir(root);
+    fs::create_dir_all(&dir)?;
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        fs::write(&gitignore, "*\n")?;
+    }
+    Ok(dir)
+}
+
 fn sessions_dir(root: &Path) -> PathBuf {
     state_dir(root).join("sessions")
 }
@@ -114,21 +128,31 @@ impl Session {
     }
 
     /// Writes `<root>/.localpilot/sessions/<id>.json` (atomically, via a temp
-    /// file), creating `<root>/.localpilot/.gitignore` (`*`) on first save.
+    /// file); see [`write_encoded`](Self::write_encoded).
     pub fn save(&self, root: &Path) -> io::Result<()> {
-        if !valid_id(&self.id) {
-            return Err(invalid_id(&self.id));
+        Self::write_encoded(root, &self.id, self.encode()?)
+    }
+
+    /// The session file's contents, so a caller can serialize while it holds
+    /// the session and write later (e.g. on the blocking pool) without
+    /// cloning it.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec_pretty(self).map_err(io::Error::other)
+    }
+
+    /// Writes `json` (from [`encode`](Self::encode)) as session `id`,
+    /// atomically via a temp file, creating `<root>/.localpilot/.gitignore`
+    /// ([`ensure_state_dir`]) if missing.
+    pub fn write_encoded(root: &Path, id: &str, json: Vec<u8>) -> io::Result<()> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
         }
+        ensure_state_dir(root)?;
         let dir = sessions_dir(root);
         fs::create_dir_all(&dir)?;
-        let gitignore = state_dir(root).join(".gitignore");
-        if !gitignore.exists() {
-            fs::write(&gitignore, "*\n")?;
-        }
-        let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        let tmp = dir.join(format!("{}.json.tmp", self.id));
+        let tmp = dir.join(format!("{id}.json.tmp"));
         fs::write(&tmp, json)?;
-        fs::rename(&tmp, dir.join(format!("{}.json", self.id)))
+        fs::rename(&tmp, dir.join(format!("{id}.json")))
     }
 
     /// Reads a saved session. `NotFound` if it was never saved.

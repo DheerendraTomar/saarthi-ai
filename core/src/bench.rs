@@ -251,7 +251,7 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
     let (_, timing) = complete(&engine, &uri, plan.warmup, "bench-warmup").await;
     let warmup = sample(&timing);
     if let Some(status) = engine.last_status()
-        && status.state != OllamaState::Ok
+        && status.ollama != OllamaState::Ok
     {
         return Err(format!(
             "Ollama at {} is not usable: {}",

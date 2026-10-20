@@ -700,15 +700,15 @@ async fn generate(
 fn record_status(inner: &Inner, outcome: &Outcome) {
     let status = match outcome {
         Ok(_) => OllamaStatus {
-            state: OllamaState::Ok,
+            ollama: OllamaState::Ok,
             detail: "completion model responded".to_owned(),
         },
         Err(err @ OllamaError::Down(_)) => OllamaStatus {
-            state: OllamaState::Down,
+            ollama: OllamaState::Down,
             detail: err.to_string(),
         },
         Err(err @ OllamaError::ModelMissing(_)) => OllamaStatus {
-            state: OllamaState::ModelMissing,
+            ollama: OllamaState::ModelMissing,
             detail: err.to_string(),
         },
         Err(_) => return,

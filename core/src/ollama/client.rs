@@ -166,7 +166,7 @@ impl OllamaClient {
     /// Health of the server and of the two configured models.
     pub async fn status(&self, completion_model: &str, chat_model: &str) -> OllamaStatus {
         let down = |err: OllamaError| OllamaStatus {
-            state: OllamaState::Down,
+            ollama: OllamaState::Down,
             detail: err.to_string(),
         };
         let version = match self.version().await {
@@ -188,12 +188,12 @@ impl OllamaClient {
             .collect();
         if missing.is_empty() {
             OllamaStatus {
-                state: OllamaState::Ok,
+                ollama: OllamaState::Ok,
                 detail: format!("Ollama {version}"),
             }
         } else {
             OllamaStatus {
-                state: OllamaState::ModelMissing,
+                ollama: OllamaState::ModelMissing,
                 detail: missing.join("; "),
             }
         }

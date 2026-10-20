@@ -464,24 +464,22 @@ pub enum OllamaState {
     ModelMissing,
 }
 
-/// Result of `ollama/status`, also embedded in [`InitializeResult`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OllamaStatus {
-    pub state: OllamaState,
-    pub detail: String,
-}
-
-/// Result of `ollama/status`.
-pub type OllamaStatusResult = OllamaStatus;
-
-/// Notification `status`.
+/// Ollama health, `{ ollama, detail }` on the wire: the `status`
+/// notification, the `ollama/status` result and
+/// [`InitializeResult::ollama_status`] all use this one shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusNotification {
     pub ollama: OllamaState,
     pub detail: String,
 }
+
+/// Ollama health as probed; the same type (and wire shape) as
+/// [`StatusNotification`].
+pub type OllamaStatus = StatusNotification;
+
+/// Result of `ollama/status`.
+pub type OllamaStatusResult = OllamaStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -662,13 +660,16 @@ mod tests {
         let r = InitializeResult {
             capabilities: Capabilities::default(),
             ollama_status: OllamaStatus {
-                state: OllamaState::ModelMissing,
+                ollama: OllamaState::ModelMissing,
                 detail: "x".into(),
             },
             index_status: IndexStatus::Building,
         };
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v["ollamaStatus"]["state"], "modelMissing");
+        assert_eq!(
+            v["ollamaStatus"],
+            json!({"ollama": "modelMissing", "detail": "x"})
+        );
         assert_eq!(v["indexStatus"], "building");
         assert_eq!(
             v["capabilities"],

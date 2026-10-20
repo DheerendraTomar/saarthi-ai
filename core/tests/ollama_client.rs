@@ -300,7 +300,7 @@ async fn connection_refused_maps_to_down() {
     assert!(matches!(started, Err(OllamaError::Down(_))));
 
     let status = client.status("coder", "chat").await;
-    assert_eq!(status.state, OllamaState::Down);
+    assert_eq!(status.ollama, OllamaState::Down);
 }
 
 #[tokio::test]
@@ -357,7 +357,7 @@ async fn status_reports_missing_model_by_name() {
     let missing = client
         .status("qwen2.5-coder:1.5b-base", "qwen3.8:27b-mlx")
         .await;
-    assert_eq!(missing.state, OllamaState::ModelMissing);
+    assert_eq!(missing.ollama, OllamaState::ModelMissing);
     assert!(
         missing.detail.contains("qwen3.8:27b-mlx"),
         "detail: {}",
@@ -367,7 +367,7 @@ async fn status_reports_missing_model_by_name() {
 
     // An untagged name means `:latest`.
     let ok = client.status("qwen2.5-coder:1.5b-base", "llama3").await;
-    assert_eq!(ok.state, OllamaState::Ok, "detail: {}", ok.detail);
+    assert_eq!(ok.ollama, OllamaState::Ok, "detail: {}", ok.detail);
 }
 
 #[tokio::test]

@@ -11,7 +11,7 @@
 //! Locking: the store/index `std` locks are only taken to copy data out
 //! (overlay snapshot, file list) and are never held across an `.await`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,7 +69,7 @@ pub struct AgentRunner {
     store: Arc<RwLock<DocumentStore>>,
     index: Arc<RwLock<WorkspaceIndex>>,
     completion: Arc<CompletionEngine>,
-    settings: RwLock<Settings>,
+    settings: Settings,
     /// Workspace root as the client spelled it: URIs sent to the client and
     /// session files use it.
     root: PathBuf,
@@ -79,8 +79,12 @@ pub struct AgentRunner {
     approvals: Mutex<HashMap<ApprovalKey, oneshot::Sender<Approval>>>,
     /// Cancellation token of the running turn, by session.
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    /// Latest state of every session touched by this process.
-    sessions: Mutex<HashMap<String, Session>>,
+    /// Non-empty "always" approvals of the sessions this process has saved,
+    /// by id.
+    /// Sessions themselves live on disk between turns (nothing else is kept
+    /// in memory), but approvals are only trusted from here: a session file
+    /// could have been committed or planted.
+    trusted_allow: Mutex<HashMap<String, HashSet<String>>>,
     /// Number of chat streams in flight; completions are paused while > 0.
     streams: Mutex<usize>,
     next_call_id: AtomicU64,
@@ -101,8 +105,9 @@ fn to_json(value: impl Serialize) -> Value {
 }
 
 impl AgentRunner {
-    /// `settings` is a snapshot; push changes with
-    /// [`set_settings`](Self::set_settings).
+    /// `settings` are fixed for the runner's lifetime (the core takes them
+    /// only at `initialize`). `root` is the workspace root as the client
+    /// spells it; it is canonicalized here for confinement.
     pub fn new(
         ollama: OllamaClient,
         store: Arc<RwLock<DocumentStore>>,
@@ -117,23 +122,15 @@ impl AgentRunner {
             store,
             index,
             completion,
-            settings: RwLock::new(settings),
+            settings,
             root,
             canonical_root,
             approvals: Mutex::new(HashMap::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
-            sessions: Mutex::new(HashMap::new()),
+            trusted_allow: Mutex::new(HashMap::new()),
             streams: Mutex::new(0),
             next_call_id: AtomicU64::new(0),
         }
-    }
-
-    /// Replaces the settings used by turns started afterwards.
-    pub fn set_settings(&self, settings: Settings) {
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings;
     }
 
     /// Runs one whole turn of `session_id`: appends the user message, loops
@@ -172,18 +169,18 @@ impl AgentRunner {
     }
 
     /// Runs one whole turn under `turn` (see [`send`](Self::send)) and emits
-    /// `chat/done`. Returns once `chat/done` was sent.
+    /// `chat/done`. Returns once `chat/done` was sent, with its stop reason.
     pub async fn send_reserved(
         &self,
         turn_reservation: TurnReservation,
         params: ChatSendParams,
         ctx: Ctx,
-    ) {
+    ) -> StopReason {
         let turn = &turn_reservation;
         let session_id = turn.session_id.clone();
         let cancel = turn.cancel.clone();
         let session = self.load_session(&session_id).await;
-        let settings = read(&self.settings).clone();
+        let settings = self.settings.clone();
         let mut turn = Turn {
             runner: self,
             ctx: ctx.clone(),
@@ -202,6 +199,7 @@ impl AgentRunner {
                 stop_reason,
             }),
         );
+        stop_reason
     }
 
     /// Answers a pending approval prompt (`chat/approve`).
@@ -263,11 +261,7 @@ impl AgentRunner {
                 "invalid session id {session_id:?}"
             )));
         }
-        let cached = lock(&self.sessions).get(session_id).cloned();
-        let messages = match cached
-            .map(Ok)
-            .unwrap_or_else(|| Session::load(&self.root, session_id))
-        {
+        let messages = match Session::load(&self.root, session_id) {
             Ok(session) => history_messages(&session.messages),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(RpcError::internal(format!("cannot read session: {err}"))),
@@ -278,30 +272,28 @@ impl AgentRunner {
         })
     }
 
+    /// Loads the session from disk. Its "always" approvals are replaced by
+    /// the ones this process granted (none for a session it never saved).
     async fn load_session(&self, id: &str) -> Session {
-        if let Some(session) = lock(&self.sessions).get(id).cloned() {
-            return session;
-        }
         let root = self.root.clone();
         let owned = id.to_owned();
         let loaded = tokio::task::spawn_blocking(move || Session::load(&root, &owned))
             .await
             .unwrap_or_else(|err| Err(io::Error::other(err)));
-        match loaded {
-            Ok(mut session) => {
-                // Not written by this process (it would be cached): the file
-                // could have been committed or planted, so its "always"
-                // approvals are not trusted.
-                session.always_allow.clear();
-                session
-            }
+        let mut session = match loaded {
+            Ok(session) => session,
             Err(err) => {
                 if err.kind() != io::ErrorKind::NotFound {
                     tracing::warn!(%err, session = id, "cannot load session; starting a new one");
                 }
                 Session::with_id(id).expect("id validated by send")
             }
-        }
+        };
+        session.always_allow = lock(&self.trusted_allow)
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        session
     }
 
     fn relative(&self, abs: &Path) -> PathBuf {
@@ -591,13 +583,28 @@ impl Turn<'_> {
         self.session.id.clone()
     }
 
+    /// Writes the session to disk (serialized here, written on the blocking
+    /// pool; the session is not cloned) and records its "always" approvals
+    /// as trusted for later turns.
     async fn save(&self) {
-        lock(&self.runner.sessions).insert(self.session.id.clone(), self.session.clone());
-        let session = self.session.clone();
+        let id = self.session.id.clone();
+        {
+            let mut trusted = lock(&self.runner.trusted_allow);
+            if self.session.always_allow.is_empty() {
+                trusted.remove(&id);
+            } else {
+                trusted.insert(id.clone(), self.session.always_allow.clone());
+            }
+        }
         let root = self.runner.root.clone();
-        let saved = tokio::task::spawn_blocking(move || session.save(&root))
-            .await
-            .unwrap_or_else(|err| Err(io::Error::other(err)));
+        let saved = match self.session.encode() {
+            Ok(json) => {
+                tokio::task::spawn_blocking(move || Session::write_encoded(&root, &id, json))
+                    .await
+                    .unwrap_or_else(|err| Err(io::Error::other(err)))
+            }
+            Err(err) => Err(err),
+        };
         if let Err(err) = saved {
             tracing::warn!(%err, session = %self.session.id, "cannot save session");
         }
@@ -908,7 +915,7 @@ impl Turn<'_> {
         let root = &self.runner.canonical_root;
         Ok(match Tool::parse(name, args)? {
             Tool::EditFile { path, old, new } => {
-                let rel = self.runner.relative(&tools::confine(root, &path)?);
+                let rel = self.runner.relative(&tools::confine_writable(root, &path)?);
                 let doc = self
                     .runner
                     .read_text(rel.clone())
@@ -925,7 +932,7 @@ impl Turn<'_> {
                 }
             }
             Tool::CreateFile { path, content } => {
-                let abs = tools::confine(root, &path)?;
+                let abs = tools::confine_writable(root, &path)?;
                 let rel = self.runner.relative(&abs);
                 if abs.exists() || self.runner.read_text(rel.clone()).await.is_ok() {
                     return Err(ToolError::Failed(format!(

@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::index::search::{self, SearchQuery};
+use crate::index::walker::MAX_FILE_BYTES;
 use crate::index::{RelPath, WorkspaceIndex};
 use crate::ollama::ToolSpec;
 use crate::overlay::OverlaySnapshot;
@@ -44,6 +45,8 @@ pub enum ToolError {
     InvalidArg(&'static str, String),
     #[error("path {0:?} is outside the workspace")]
     OutsideWorkspace(String),
+    #[error("path {0:?} is under {1}, which the agent may not write to")]
+    Protected(String, &'static str),
     #[error("{0}")]
     Failed(String),
 }
@@ -180,6 +183,34 @@ pub fn confine(root: &Path, path: &str) -> Result<PathBuf, ToolError> {
     } else {
         Err(escape())
     }
+}
+
+/// Directories the agent's write tools never touch: git internals (a write
+/// to `.git/hooks` would run code) and the core's own state (sessions, log).
+/// Matched against every path component, case-insensitively (macOS and
+/// Windows file systems usually are).
+const PROTECTED_DIRS: [&str; 2] = [".git", ".localpilot"];
+
+/// [`confine`] for `edit_file` / `create_file`: additionally rejects paths
+/// under a [`PROTECTED_DIRS`] directory. Checked on the resolved path, so a
+/// symlink into `.git` is caught too.
+pub fn confine_writable(root: &Path, path: &str) -> Result<PathBuf, ToolError> {
+    let abs = confine(root, path)?;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rel = abs.strip_prefix(&canonical_root).unwrap_or(&abs);
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if let Some(dir) = PROTECTED_DIRS
+            .iter()
+            .find(|dir| name.eq_ignore_ascii_case(dir))
+        {
+            return Err(ToolError::Protected(path.to_owned(), dir));
+        }
+    }
+    Ok(abs)
 }
 
 /// A parsed tool call.
@@ -333,6 +364,8 @@ pub(crate) fn display(path: &Path) -> String {
 
 /// `read_file`: the file's text from the overlay snapshot (or disk), lines
 /// `start_line..=end_line` (1-based, inclusive) if given, capped at 32 KiB.
+/// Files on disk over [`MAX_FILE_BYTES`] (the index's limit) are refused
+/// without being read.
 pub fn read_file(
     overlay: &OverlaySnapshot,
     root: &Path,
@@ -347,7 +380,7 @@ pub fn read_file(
         .unwrap_or(&abs)
         .to_path_buf();
     let text = overlay
-        .read(&rel)
+        .read_capped(&rel, MAX_FILE_BYTES)
         .map_err(|e| ToolError::Failed(format!("cannot read {path}: {e}")))?;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total = lines.len();
@@ -671,6 +704,65 @@ mod tests {
             read_file(&overlay, &root, "../x", None, None),
             Err(ToolError::OutsideWorkspace(_))
         ));
+    }
+
+    #[test]
+    fn read_file_refuses_files_over_the_size_cap_without_reading_them() {
+        let (_dir, root) = root();
+        // Sparse: MAX_FILE_BYTES + 1 bytes of NULs (valid UTF-8, so only the
+        // size check can refuse it).
+        let big = fs::File::create(root.join("big.bin")).unwrap();
+        big.set_len(MAX_FILE_BYTES + 1).unwrap();
+        let at_cap = fs::File::create(root.join("at_cap.txt")).unwrap();
+        at_cap.set_len(MAX_FILE_BYTES).unwrap();
+        let mut store = crate::overlay::DocumentStore::new(root.clone());
+        let overlay = store.overlay_snapshot();
+
+        let err = read_file(&overlay, &root, "big.bin", None, None).unwrap_err();
+        let ToolError::Failed(message) = err else {
+            panic!("unexpected error {err:?}");
+        };
+        assert!(message.contains("too large"), "{message}");
+        // At the cap it is read (and the output truncated as usual).
+        let out = read_file(&overlay, &root, "at_cap.txt", None, None).unwrap();
+        assert!(out.content.contains("truncated"), "{}", out.content);
+
+        // An open document is already in memory: no cap.
+        let huge = "x\n".repeat(MAX_FILE_BYTES as usize);
+        store.did_open(&crate::overlay::path_to_uri(&root.join("big.bin")), huge, 1);
+        let overlay = store.overlay_snapshot();
+        assert!(read_file(&overlay, &root, "big.bin", Some(1), Some(2)).is_ok());
+    }
+
+    #[test]
+    fn confine_writable_rejects_git_and_localpilot() {
+        let (_dir, root) = root();
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let protected =
+            |p: &str| matches!(confine_writable(&root, p), Err(ToolError::Protected(..)));
+
+        assert!(protected(".git/hooks/pre-commit"));
+        assert!(protected(".git/config"));
+        assert!(protected("./.git/new-dir/x"));
+        assert!(protected(".GIT/hooks/pre-commit"));
+        assert!(protected("vendor/sub/.git/hooks/post-checkout"));
+        assert!(protected(".localpilot/sessions/s1.json"));
+        assert!(protected(".localpilot/.gitignore"));
+        let abs = root.join(".git/hooks/pre-push");
+        assert!(protected(abs.to_str().unwrap()));
+        // A symlink into .git is resolved first.
+        std::os::unix::fs::symlink(root.join(".git"), root.join("innocent")).unwrap();
+        assert!(protected("innocent/hooks/pre-commit"));
+        // Lookalikes are fine; escapes are still escapes.
+        assert!(confine_writable(&root, ".gitignore").is_ok());
+        assert!(confine_writable(&root, "src/git/x.rs").is_ok());
+        assert!(confine_writable(&root, ".github/workflows/ci.yml").is_ok());
+        assert!(matches!(
+            confine_writable(&root, "../x"),
+            Err(ToolError::OutsideWorkspace(_))
+        ));
+        // Reading is unaffected.
+        assert!(confine(&root, ".git/config").is_ok());
     }
 
     #[test]

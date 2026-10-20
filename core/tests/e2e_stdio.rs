@@ -168,7 +168,8 @@ impl Core {
 }
 
 struct Workspace {
-    _dir: TempDir,
+    _dirs: Vec<TempDir>,
+    /// The root as the client spells it.
     root: PathBuf,
 }
 
@@ -177,7 +178,23 @@ impl Workspace {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(root.join("main.py"), DOC).unwrap();
-        Workspace { _dir: dir, root }
+        Workspace {
+            _dirs: vec![dir],
+            root,
+        }
+    }
+
+    /// A workspace the client opened through a symlink (like macOS `/tmp`
+    /// or a symlinked `~/projects`): `root` is not canonical.
+    fn via_symlink() -> Workspace {
+        let real = Workspace::new();
+        let links = tempfile::tempdir().unwrap();
+        let root = links.path().canonicalize().unwrap().join("ws-link");
+        std::os::unix::fs::symlink(&real.root, &root).unwrap();
+        assert_ne!(root.canonicalize().unwrap(), root);
+        let mut dirs = real._dirs;
+        dirs.push(links);
+        Workspace { _dirs: dirs, root }
     }
 
     fn uri(&self, rel: &str) -> String {
@@ -241,8 +258,17 @@ async fn completion_and_approved_edit_over_stdio() {
     let mut core = Core::spawn(&ws.root);
 
     let init = initialize(&mut core, &ws, &mock).await;
-    assert_eq!(init["ollamaStatus"]["state"], "ok", "{init}");
+    assert_eq!(init["ollamaStatus"]["ollama"], "ok", "{init}");
+    // Same `{ ollama, detail }` shape as the `status` notification.
+    let keys: Vec<&String> = init["ollamaStatus"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["detail", "ollama"], "{init}");
     assert_eq!(init["indexStatus"], "building");
+    // The core's state dir is git-ignored from the start (the log is in it).
+    assert_eq!(
+        std::fs::read_to_string(ws.root.join(".localpilot/.gitignore")).unwrap(),
+        "*\n"
+    );
+    assert!(ws.root.join(".localpilot/core.log").exists());
     assert_eq!(init["capabilities"]["completion"], true);
     assert_eq!(init["capabilities"]["chat"], true);
     assert_eq!(init["capabilities"]["bench"], false);
@@ -307,7 +333,7 @@ async fn ollama_down_reports_down_and_empty_completions() {
     let mut core = Core::spawn(&ws.root);
 
     let init = initialize(&mut core, &ws, &mock).await;
-    assert_eq!(init["ollamaStatus"]["state"], "down", "{init}");
+    assert_eq!(init["ollamaStatus"]["ollama"], "down", "{init}");
 
     open_main(&mut core, &ws).await;
     let completion = core
@@ -354,7 +380,9 @@ async fn protocol_errors_and_pull_progress() {
     assert_eq!(core.response(bad).await["error"]["code"], -32602);
 
     let status = core.call("ollama/status", Value::Null).await;
-    assert_eq!(status["state"], "ok", "{status}");
+    assert_eq!(status["ollama"], "ok", "{status}");
+    let keys: Vec<&String> = status.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["detail", "ollama"], "{status}");
 
     let pull = core.send("ollama/pull", json!({"model": "coder"})).await;
     let progress = core.notification("ollama/pullProgress").await;
@@ -429,13 +457,146 @@ async fn stalled_ollama_times_out_as_down() {
             json!({"workspaceRoot": ws.root, "settings": {"ollamaUrl": url}}),
         )
         .await;
-    assert_eq!(init["ollamaStatus"]["state"], "down", "{init}");
+    assert_eq!(init["ollamaStatus"]["ollama"], "down", "{init}");
     let detail = init["ollamaStatus"]["detail"].as_str().unwrap();
     assert!(detail.contains("timed out"), "{detail}");
 
     let status = core.call("ollama/status", Value::Null).await;
-    assert_eq!(status["state"], "down", "{status}");
+    assert_eq!(status["ollama"], "down", "{status}");
 
     core.shutdown().await;
     stall.abort();
+}
+
+#[tokio::test]
+async fn non_canonical_root_reads_open_buffers_and_edits_the_clients_uri() {
+    // The open buffer differs from disk; only the buffer has `add(5, 6)`.
+    let buffer = DOC.replace("add(1, 2)", "add(5, 6)");
+    let mock = MockOllama::start(Script {
+        models: vec!["coder".to_owned(), "chat".to_owned()],
+        chat: vec![
+            vec![
+                chat_tool_call("call_1", 0, "read_file", json!({"path": "main.py"})),
+                chat_done(),
+            ],
+            vec![
+                chat_tool_call(
+                    "call_2",
+                    0,
+                    "edit_file",
+                    json!({"path": "main.py", "old": "print(add(5, 6))", "new": "print(add(7, 8))"}),
+                ),
+                chat_done(),
+            ],
+            vec![chat_text("Done."), chat_done()],
+        ],
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::via_symlink();
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+    core.notification("index/ready").await;
+    core.notify(
+        "textDocument/didOpen",
+        json!({"uri": ws.uri("main.py"), "languageId": "python", "version": 1, "text": buffer}),
+    )
+    .await;
+
+    let session = core.call("chat/newSession", Value::Null).await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+    core.call(
+        "chat/send",
+        json!({"sessionId": session_id, "message": "use 7 and 8"}),
+    )
+    .await;
+
+    // read_file saw the buffer, not the disk.
+    let read = core.notification("chat/toolResult").await;
+    assert_eq!(read["params"]["ok"], true, "{read}");
+    let call = core.notification("chat/toolCall").await;
+    let call = if call["params"]["toolCallId"] == "call_1" {
+        core.notification("chat/toolCall").await
+    } else {
+        call
+    };
+    assert_eq!(call["params"]["toolCallId"], "call_2", "{call}");
+    assert_eq!(call["params"]["requiresApproval"], true, "{call}");
+    core.call(
+        "chat/approve",
+        json!({"sessionId": session_id, "toolCallId": "call_2", "decision": "once"}),
+    )
+    .await;
+
+    // The edit was resolved against the buffer and targets the URI the
+    // client used for it.
+    let edit = core.server_request("workspace/applyEdit").await;
+    let op = &edit["params"]["ops"][0];
+    assert_eq!(op["uri"], ws.uri("main.py"), "{edit}");
+    assert_eq!(op["newText"], "print(add(7, 8))", "{edit}");
+    assert_eq!(op["range"]["start"]["line"], 3, "{edit}");
+    core.reply(&edit["id"].clone(), json!({"applied": true}))
+        .await;
+    let done = core.notification("chat/done").await;
+    assert_eq!(done["params"]["stopReason"], "done", "{done}");
+
+    let bodies: Vec<Value> = mock
+        .received_requests()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/chat")
+        .map(|(_, body)| body)
+        .collect();
+    let tool_result = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(tool_result.contains("add(5, 6)"), "{tool_result}");
+    assert!(!tool_result.contains("add(1, 2)"), "{tool_result}");
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn status_recovers_after_a_failed_chat_turn() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder".to_owned(), "chat".to_owned()],
+        // The chat stream fails mid-way; the server itself is healthy.
+        chat: vec![vec![
+            json!({"error": "model runner has unexpectedly stopped"}),
+        ]],
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+    let init = initialize(&mut core, &ws, &mock).await;
+    assert_eq!(init["ollamaStatus"]["ollama"], "ok", "{init}");
+
+    let session = core.call("chat/newSession", Value::Null).await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+    core.call(
+        "chat/send",
+        json!({"sessionId": session_id, "message": "hi"}),
+    )
+    .await;
+
+    let down = core.notification("status").await;
+    assert_eq!(down["params"]["ollama"], "down", "{down}");
+    let done = core.notification("chat/done").await;
+    assert_eq!(done["params"]["stopReason"], "error", "{done}");
+    // Ollama answers the post-turn probe: the client is told it is ok again,
+    // although `ok` is also the last status the core itself reported.
+    let up = core.notification("status").await;
+    assert_eq!(
+        up["params"],
+        json!({"ollama": "ok", "detail": up["params"]["detail"]}),
+        "{up}"
+    );
+
+    core.shutdown().await;
 }

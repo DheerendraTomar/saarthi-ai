@@ -30,14 +30,13 @@ use crate::agent::{AgentRunner, TurnReservation};
 use crate::completion::CompletionEngine;
 use crate::index::{WorkspaceIndex, watcher};
 use crate::ollama::{OllamaClient, OllamaError, OllamaState, OllamaStatus, PullProgress};
-use crate::overlay::{DocumentStore, uri_to_path};
+use crate::overlay::{DocumentStore, normalize_path, uri_to_path};
 use crate::protocol::{
     Capabilities, ChatApproveParams, ChatDone, ChatHistoryParams, ChatListSessionsResult,
     ChatNewSessionResult, ChatSendParams, ChatSendResult, ChatStopParams, CompletionAcceptedParams,
     CompletionCancelParams, CompletionRejectedParams, CompletionRequestParams, DidChangeParams,
     DidCloseParams, DidOpenParams, DidSaveParams, IndexReady, IndexStatus, InitializeParams,
-    InitializeResult, OllamaPullParams, OllamaPullProgress, OllamaPullResult, StatusNotification,
-    StopReason, methods,
+    InitializeResult, OllamaPullParams, OllamaPullProgress, OllamaPullResult, StopReason, methods,
 };
 use crate::rpc::{Ctx, Handler, RpcError};
 use crate::settings::Settings;
@@ -110,24 +109,32 @@ impl AppState {
         probe(&self.ollama, &completion_model, &chat_model).await
     }
 
+    /// Probes Ollama and emits `status` even if unchanged since the last
+    /// report: for after a chat turn failed, since the runner then reports a
+    /// status of its own directly to the client, bypassing `last_status`.
+    /// Not skipped while another probe runs (that one only reports changes).
+    async fn resync_status(&self, ctx: &Ctx) {
+        let status = self.probe().await;
+        self.record_status(status, true, ctx);
+    }
+
     /// Records `status` and notifies the client if it differs from the last
     /// one reported.
     fn report_status(&self, status: OllamaStatus, ctx: &Ctx) {
+        self.record_status(status, false, ctx);
+    }
+
+    /// Records `status`; notifies the client if it changed or `always`.
+    fn record_status(&self, status: OllamaStatus, always: bool, ctx: &Ctx) {
         let changed = {
             let mut last = lock(&self.last_status);
             let changed = *last != status;
             *last = status.clone();
             changed
         };
-        if changed {
-            tracing::info!(state = ?status.state, detail = %status.detail, "ollama status changed");
-            ctx.notify(
-                methods::STATUS,
-                to_json(StatusNotification {
-                    ollama: status.state,
-                    detail: status.detail,
-                }),
-            );
+        if changed || always {
+            tracing::info!(state = ?status.ollama, detail = %status.detail, "ollama status changed");
+            ctx.notify(methods::STATUS, to_json(status));
         }
     }
 
@@ -177,15 +184,24 @@ impl AppHandler {
                 "already initialized; restart the core to change workspace or settings",
             ));
         }
-        let root = workspace_root(&params.workspace_root)?;
+        let WorkspaceRoot { client, canonical } = workspace_root(&params.workspace_root)?;
         let settings = params.settings;
-        tracing::info!(root = %root.display(), ollama = %settings.ollama_url, "initializing");
+        tracing::info!(
+            root = %client.display(),
+            canonical = %canonical.display(),
+            ollama = %settings.ollama_url,
+            "initializing"
+        );
 
         let ollama = OllamaClient::new(settings.ollama_url.clone(), settings.keep_alive.clone());
         let ollama_status = probe(&ollama, &settings.completion_model, &settings.chat_model).await;
 
-        let store = Arc::new(RwLock::new(DocumentStore::new(root.clone())));
-        let index = Arc::new(RwLock::new(WorkspaceIndex::empty(&root)));
+        // Open documents are keyed by the client's URIs, so the store and the
+        // agent (whose URIs go back to the client) use the client's spelling
+        // of the root; the index, the watcher and confinement use the
+        // canonical one.
+        let store = Arc::new(RwLock::new(DocumentStore::new(client.clone())));
+        let index = Arc::new(RwLock::new(WorkspaceIndex::empty(&canonical)));
         let completion = Arc::new(CompletionEngine::new(
             ollama.clone(),
             store.clone(),
@@ -198,7 +214,7 @@ impl AppHandler {
             index.clone(),
             completion.clone(),
             settings.clone(),
-            root.clone(),
+            client,
         ));
         let state = Arc::new(AppState {
             settings: RwLock::new(settings),
@@ -218,10 +234,10 @@ impl AppHandler {
         // it applied, and the log is replayed onto the built index before
         // the swap.
         let log = watcher::build_log();
-        let watcher = watcher::spawn_logging(&root, index.clone(), log.clone());
+        let watcher = watcher::spawn_logging(&canonical, index.clone(), log.clone());
         let status_loop = tokio::spawn(status_loop(Arc::downgrade(&state), ctx.clone()));
         lock(&state.tasks).extend([watcher, status_loop]);
-        tokio::spawn(build_index(root, index, log, ctx));
+        tokio::spawn(build_index(canonical, index, log, ctx));
 
         *write(&self.state) = Some(state);
         Ok(to_json(InitializeResult {
@@ -259,7 +275,7 @@ impl AppHandler {
                 // A completion that hit (or recovered from) an Ollama error
                 // updates the reported status, off the latency-critical path.
                 if let Some(seen) = state.completion.last_status()
-                    && seen.state != state.last_status().state
+                    && seen.ollama != state.last_status().ollama
                 {
                     let state = state.clone();
                     tokio::spawn(async move { state.refresh_status(&ctx).await });
@@ -394,19 +410,28 @@ fn refresh_snippets(state: &AppState, uri: String) {
 async fn run_turn(state: Arc<AppState>, turn: TurnReservation, params: ChatSendParams, ctx: Ctx) {
     let session_id = turn.session_id().to_owned();
     let send = state.agent.send_reserved(turn, params, ctx.clone());
-    if AssertUnwindSafe(send).catch_unwind().await.is_err() {
-        tracing::error!(session_id, "chat turn panicked");
-        ctx.notify(
-            methods::CHAT_DONE,
-            to_json(ChatDone {
-                session_id,
-                stop_reason: StopReason::Error,
-            }),
-        );
+    let stop_reason = match AssertUnwindSafe(send).catch_unwind().await {
+        Ok(stop_reason) => stop_reason,
+        Err(_) => {
+            tracing::error!(session_id, "chat turn panicked");
+            ctx.notify(
+                methods::CHAT_DONE,
+                to_json(ChatDone {
+                    session_id,
+                    stop_reason: StopReason::Error,
+                }),
+            );
+            StopReason::Error
+        }
+    };
+    if stop_reason == StopReason::Error {
+        // The runner reported a status of its own (e.g. `down` for a crashed
+        // model runner) straight to the client; re-probe and always report,
+        // so the client never stays on that status while Ollama is fine.
+        state.resync_status(&ctx).await;
+    } else {
+        state.refresh_status(&ctx).await;
     }
-    // The runner reports Ollama errors itself; re-probe so the client's
-    // status reflects the server's real state.
-    state.refresh_status(&ctx).await;
 }
 
 /// Builds the index off the async runtime, replays the watcher's changes
@@ -448,7 +473,7 @@ async fn probe(ollama: &OllamaClient, completion_model: &str, chat_model: &str) 
     match tokio::time::timeout(STATUS_TIMEOUT, ollama.status(completion_model, chat_model)).await {
         Ok(status) => status,
         Err(_) => OllamaStatus {
-            state: OllamaState::Down,
+            ollama: OllamaState::Down,
             detail: format!(
                 "Ollama did not answer within {} s (timed out)",
                 STATUS_TIMEOUT.as_secs()
@@ -510,8 +535,17 @@ fn ollama_error(err: OllamaError) -> RpcError {
     }
 }
 
-/// Canonical workspace root from `initialize` (a path or `file://` URI).
-fn workspace_root(raw: &str) -> Result<PathBuf, RpcError> {
+/// The workspace root from `initialize` (a path or `file://` URI), spelled
+/// two ways.
+struct WorkspaceRoot {
+    /// As the client spelled it (lexically normalized, symlinks kept): the
+    /// client's document URIs and the URIs sent back to it use this form.
+    client: PathBuf,
+    /// Symlinks resolved: for confinement, the index and the watcher.
+    canonical: PathBuf,
+}
+
+fn workspace_root(raw: &str) -> Result<WorkspaceRoot, RpcError> {
     let path = uri_to_path(raw);
     let canonical = path.canonicalize().map_err(|err| {
         RpcError::invalid_params(format!(
@@ -525,7 +559,12 @@ fn workspace_root(raw: &str) -> Result<PathBuf, RpcError> {
             canonical.display()
         )));
     }
-    Ok(canonical)
+    let client = if path.is_absolute() {
+        normalize_path(&path)
+    } else {
+        canonical.clone()
+    };
+    Ok(WorkspaceRoot { client, canonical })
 }
 
 /// Deserializes request params; absent/null params count as `{}`, so methods

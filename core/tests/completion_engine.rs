@@ -153,7 +153,7 @@ async fn returns_streamed_completion_and_caches() {
     assert_eq!(body["options"]["temperature"], 0.0);
     assert!(body["options"].get("stop").is_none(), "stop = []");
     assert_eq!(
-        env.engine.last_status().map(|s| s.state),
+        env.engine.last_status().map(|s| s.ollama),
         Some(OllamaState::Ok)
     );
 }
@@ -315,7 +315,7 @@ async fn ollama_down_returns_empty_and_sets_status() {
     let result = complete(&env, "r1", CURSOR).await;
     assert!(result.items.is_empty());
     assert_eq!(
-        env.engine.last_status().map(|s| s.state),
+        env.engine.last_status().map(|s| s.ollama),
         Some(OllamaState::Down)
     );
 }
@@ -330,7 +330,7 @@ async fn missing_model_returns_empty_and_sets_status() {
 
     assert!(complete(&env, "r1", CURSOR).await.items.is_empty());
     assert_eq!(
-        env.engine.last_status().map(|s| s.state),
+        env.engine.last_status().map(|s| s.ollama),
         Some(OllamaState::ModelMissing)
     );
 }
