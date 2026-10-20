@@ -172,6 +172,26 @@ Core → client notifications:
   size limit set by the builder).
 - `status { ollama: "ok" | "down" | "modelMissing", detail }`
 
+Additions made during implementation (core; wire types in
+`core/src/protocol.rs`):
+
+- `textDocument/didSave { uri }` (client → core notification): refreshes the
+  file's related-code snippets.
+- `index/ready { files, buildMs }` (core → client notification): the
+  background index build finished.
+- `initialize` → `{ capabilities, ollamaStatus, indexStatus }`, with
+  `indexStatus: "building" | "ready"`. `initialize` responds before the index
+  is built (`"building"`); notifications received before `initialize` has been
+  handled are dropped.
+- `chat/send` returns `{}` immediately; the turn's end is signalled only by
+  `chat/done`. A `chat/send` while a turn is running in that session fails
+  with `-32602`.
+- `-32603` (internal error) is also returned when a core → client request
+  times out or the connection closes before the client answers.
+- `bench/run` is not served over RPC (`capabilities.bench: false`); `bench` is
+  a CLI subcommand.
+- `ollama/pull` progress notifications are `ollama/pullProgress`.
+
 Settings (in both IDEs, forwarded in `initialize`):
 `ollamaUrl`, `completionModel`, `chatModel`, `completionsEnabled`,
 `completionDebounceMs`, `completionMaxTokens`, `chatThinking` (off | on),

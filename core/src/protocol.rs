@@ -121,11 +121,13 @@ pub struct Capabilities {
 }
 
 impl Default for Capabilities {
+    /// What this build serves: `bench/run` is not served over RPC (the
+    /// benchmark is the `bench` subcommand), so `bench` is `false`.
     fn default() -> Self {
         Self {
             completion: true,
             chat: true,
-            bench: true,
+            bench: false,
         }
     }
 }
@@ -668,7 +670,10 @@ mod tests {
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["ollamaStatus"]["state"], "modelMissing");
         assert_eq!(v["indexStatus"], "building");
-        assert!(v["capabilities"].is_object());
+        assert_eq!(
+            v["capabilities"],
+            json!({"completion": true, "chat": true, "bench": false})
+        );
     }
 
     #[test]

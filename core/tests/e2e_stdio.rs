@@ -245,6 +245,7 @@ async fn completion_and_approved_edit_over_stdio() {
     assert_eq!(init["indexStatus"], "building");
     assert_eq!(init["capabilities"]["completion"], true);
     assert_eq!(init["capabilities"]["chat"], true);
+    assert_eq!(init["capabilities"]["bench"], false);
     let ready = core.notification("index/ready").await;
     assert_eq!(ready["params"]["files"], 1, "{ready}");
 

@@ -225,11 +225,7 @@ impl AppHandler {
 
         *write(&self.state) = Some(state);
         Ok(to_json(InitializeResult {
-            capabilities: Capabilities {
-                completion: true,
-                chat: true,
-                bench: false,
-            },
+            capabilities: Capabilities::default(),
             ollama_status,
             index_status: IndexStatus::Building,
         }))

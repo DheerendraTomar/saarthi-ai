@@ -1,0 +1,70 @@
+name: core
+
+on:
+  push:
+    paths:
+      - "core/**"
+      - "scripts/build-core.sh"
+      - ".github/workflows/core.yml"
+  pull_request:
+    paths:
+      - "core/**"
+      - "scripts/build-core.sh"
+      - ".github/workflows/core.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test (macOS arm64)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+
+  release:
+    name: release ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    # v1: only the arm64 macOS build must pass.
+    continue-on-error: ${{ matrix.target != 'aarch64-apple-darwin' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/build-core.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: localpilot-core-${{ matrix.target }}
+          path: dist/core/${{ matrix.target }}/
+          if-no-files-found: error
