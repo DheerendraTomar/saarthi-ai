@@ -68,7 +68,7 @@ struct Inner {
     ollama: OllamaClient,
     store: Arc<RwLock<DocumentStore>>,
     index: Arc<RwLock<WorkspaceIndex>>,
-    settings: RwLock<Settings>,
+    settings: Settings,
     paused: AtomicBool,
     cache_enabled: AtomicBool,
     cache: Mutex<CompletionCache>,
@@ -154,8 +154,8 @@ impl Prepared {
 }
 
 impl CompletionEngine {
-    /// `settings` is a snapshot; push later changes with
-    /// [`set_settings`](Self::set_settings).
+    /// `settings` are fixed for the engine's lifetime (the core takes them
+    /// only at `initialize`).
     pub fn new(
         ollama: OllamaClient,
         store: Arc<RwLock<DocumentStore>>,
@@ -167,7 +167,7 @@ impl CompletionEngine {
                 ollama,
                 store,
                 index,
-                settings: RwLock::new(settings),
+                settings,
                 paused: AtomicBool::new(false),
                 cache_enabled: AtomicBool::new(true),
                 cache: Mutex::new(CompletionCache::new(cache::DEFAULT_CAPACITY)),
@@ -222,7 +222,7 @@ impl CompletionEngine {
         timing: Option<Arc<TimingSink>>,
     ) -> Result<CompletionResult, RpcError> {
         let inner = &self.inner;
-        let settings = read(&inner.settings).clone();
+        let settings = inner.settings.clone();
         if !settings.completions_enabled || self.is_paused() {
             return Ok(CompletionResult::default());
         }
@@ -306,15 +306,6 @@ impl CompletionEngine {
         self.inner.cache_enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Replaces the settings snapshot used by later requests.
-    pub fn set_settings(&self, settings: Settings) {
-        *self
-            .inner
-            .settings
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = settings;
-    }
-
     /// Ollama health as last observed by a completion: `Ok` after a
     /// successful generation, `Down` / `ModelMissing` after those errors;
     /// `None` before the first model call.
@@ -353,7 +344,7 @@ impl CompletionEngine {
         let Some(window) = window else {
             return;
         };
-        let budget = prompt::snippet_budget(&read(&self.inner.settings));
+        let budget = prompt::snippet_budget(&self.inner.settings);
         let mark = start_refresh(&self.inner, uri);
         refresh(mark, window_lines(&window), budget).await;
     }
@@ -372,7 +363,7 @@ impl CompletionEngine {
 
     #[cfg(test)]
     pub(crate) async fn prepare(&self, uri: &str, position: Position) -> Option<Prepared> {
-        let settings = read(&self.inner.settings).clone();
+        let settings = self.inner.settings.clone();
         self.prepare_with(uri, position, &settings).await
     }
 

@@ -40,6 +40,12 @@ async fn setup(script: Script) -> Env {
 }
 
 async fn setup_with(script: Script, text: &str) -> Env {
+    setup_full(script, text, |_| {}).await
+}
+
+/// Settings are fixed at construction (the core takes them only at
+/// `initialize`); `tweak` adjusts them.
+async fn setup_full(script: Script, text: &str, tweak: impl FnOnce(&mut Settings)) -> Env {
     let mock = MockOllama::start(script).await;
     let dir = tempfile::tempdir().unwrap();
     let root: PathBuf = dir.path().canonicalize().unwrap();
@@ -50,11 +56,12 @@ async fn setup_with(script: Script, text: &str) -> Env {
     store.did_open(&uri, text.to_owned(), 1);
     let store = Arc::new(RwLock::new(store));
     let index = Arc::new(RwLock::new(WorkspaceIndex::build(&root)));
-    let settings = Settings {
+    let mut settings = Settings {
         ollama_url: mock.url.clone(),
         completion_model: "coder".to_owned(),
         ..Settings::default()
     };
+    tweak(&mut settings);
     let ollama = OllamaClient::new(mock.url.clone(), settings.keep_alive.clone());
     let engine = Arc::new(CompletionEngine::new(
         ollama,
@@ -283,20 +290,11 @@ async fn skips_when_next_char_is_identifier() {
 
 #[tokio::test]
 async fn skips_when_disabled_or_document_too_large() {
-    let env = setup(add_script()).await;
-    env.engine.set_settings(Settings {
-        ollama_url: env.mock.url.clone(),
-        completion_model: "coder".to_owned(),
-        completions_enabled: false,
-        ..Settings::default()
-    });
-    assert!(complete(&env, "r1", CURSOR).await.items.is_empty());
+    let disabled = setup_full(add_script(), DOC, |s| s.completions_enabled = false).await;
+    assert!(complete(&disabled, "r1", CURSOR).await.items.is_empty());
+    assert!(generate_bodies(&disabled.mock).is_empty());
 
-    env.engine.set_settings(Settings {
-        ollama_url: env.mock.url.clone(),
-        completion_model: "coder".to_owned(),
-        ..Settings::default()
-    });
+    let env = setup(add_script()).await;
     let huge = format!("{DOC}{}", "#".repeat(1 << 20));
     env.store.write().unwrap().did_open(&env.uri, huge, 2);
     assert!(complete(&env, "r2", CURSOR).await.items.is_empty());

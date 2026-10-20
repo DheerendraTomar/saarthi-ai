@@ -71,11 +71,32 @@ Additions beyond the spec:
   background workspace index build finishes.
 - **`InitializeResult.indexStatus`** (`"building" | "ready"`): `initialize`
   returns `{ capabilities, ollamaStatus, indexStatus }`.
+- **One Ollama status shape everywhere: `{ ollama, detail }`**, with
+  `ollama` one of `"ok" | "down" | "modelMissing"`. It is
+  `InitializeResult.ollamaStatus`, the `ollama/status` result and the params
+  of the `status` notification.
 
 Behaviour to rely on:
 
 - **`initialize` responds before the index is built**, with
   `indexStatus: "building"`; wait for `index/ready` if you need the index.
+  On a small workspace **`index/ready` can arrive before the `initialize`
+  response**: treat `index/ready` as final whenever it arrives, and do not let
+  a later `indexStatus: "building"` overwrite it.
+- **Settings are taken only at `initialize`.** There is no way to change them
+  on a running core (a second `initialize` is refused): to apply changed
+  settings, restart the core.
+- `status` is sent when the Ollama status changes, and also after a failed
+  chat turn (even if unchanged), so a transient chat error never leaves the
+  client showing `down` while Ollama is healthy.
+- Workspace paths: the core keeps the root the way the client spells it
+  (symlinks unresolved), so `workspace/applyEdit` URIs match the client's
+  document URIs; confinement and the index use the resolved root.
+- The agent's `edit_file` / `create_file` never write under `.git/` or
+  `.localpilot/` (any path component, case-insensitive), whatever the user's
+  approvals. `read_file` refuses files over 1 MB on disk (the index limit).
+- The core's state lives in `<workspace>/.localpilot/` (`core.log`,
+  `sessions/`); it creates `.localpilot/.gitignore` (`*`) together with the log.
 - **Notifications that arrive before `initialize` has been handled are dropped**
   (logged), so send `didOpen` etc. after the `initialize` response. Requests
   other than `initialize` / `shutdown` before then fail with `-32600`; a second
@@ -126,10 +147,21 @@ From [`2026-10-21-core-bench.md`](../docs/superpowers/notes/2026-10-21-core-benc
 | Core overhead p95 < 5 ms | PASS 0.10 ms | PASS 0.05 ms | PASS 0.07 ms | PASS 0.11 ms |
 | Idle RSS of `serve` ≤ 30 MB | PASS 14.0 MB (model-independent) | | | |
 
-TTFT is model-bound; core overhead is ~50× under target. The default
-completion model stays `qwen2.5-coder:1.5b-base` (it meets both TTFT targets on
-the keystroke path); `qwen2.5-coder:0.5b-base` meets every target and is an
-option for more headroom.
+TTFT is model-bound; core overhead is ~50× under target.
+
+**What the user waits for is the bench's `total` column, not TTFT**: the client
+receives one final completion (no streaming to the editor), so ghost text
+appears after the whole generation. Typing-mode **total p50 is 640 ms with
+1.5b and 337 ms with 0.5b** (TTFT p50 220.52 ms / 81.12 ms). The default
+completion model (`qwen2.5-coder:1.5b-base`, chosen on TTFT) is being
+re-evaluated on that basis; `qwen2.5-coder:0.5b-base` meets every target with
+headroom.
+
+### Known limits
+
+- **Index memory**: RSS of `serve` with a built index is ≈ 154 MB at 11k files
+  (measured); extrapolated ≈ 600 MB at 50k files. The follow-up is interning
+  identifiers in the symbol index.
 
 ## Tests and bench
 
