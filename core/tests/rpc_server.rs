@@ -1,27 +1,43 @@
 //! Integration tests for the JSON-RPC stdio server, driven over an in-memory
 //! duplex pipe with the test acting as the IDE client.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use localpilot_core::protocol::methods;
 use localpilot_core::rpc::{Ctx, Handler, Message, RpcError, RpcServer};
 use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
 };
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(5);
 
-struct TestHandler;
+/// Test handler. `outcomes` reports what `late_edit`'s `ctx.request` returned,
+/// since after EOF the client can no longer see the response.
+struct TestHandler {
+    value: Mutex<Value>,
+    outcomes: mpsc::UnboundedSender<Result<Value, RpcError>>,
+}
 
 #[async_trait]
 impl Handler for TestHandler {
     async fn request(&self, method: &str, params: Value, ctx: Ctx) -> Result<Value, RpcError> {
         match method {
+            "get" => Ok(self.value.lock().unwrap().clone()),
+            "panic" => panic!("request handler panicked on purpose"),
+            "late_edit" => {
+                // By the time this wakes up the client has hung up.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let outcome = ctx.request(methods::APPLY_EDIT, params).await;
+                self.outcomes.send(outcome.clone()).unwrap();
+                outcome
+            }
             "echo" => Ok(params),
             "slow" => {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -33,7 +49,16 @@ impl Handler for TestHandler {
         }
     }
 
-    async fn notify(&self, _method: &str, _params: Value, _ctx: Ctx) {}
+    async fn notify(&self, method: &str, params: Value, _ctx: Ctx) {
+        match method {
+            "set" => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                *self.value.lock().unwrap() = params;
+            }
+            "panic" => panic!("notify handler panicked on purpose"),
+            _ => {}
+        }
+    }
 }
 
 struct Client {
@@ -62,21 +87,29 @@ impl Client {
     }
 }
 
+type Outcomes = mpsc::UnboundedReceiver<Result<Value, RpcError>>;
+
 fn start() -> (Client, JoinHandle<anyhow::Result<()>>) {
+    let (client, task, _outcomes) = start_with_outcomes();
+    (client, task)
+}
+
+fn start_with_outcomes() -> (Client, JoinHandle<anyhow::Result<()>>, Outcomes) {
+    let (outcomes_tx, outcomes) = mpsc::unbounded_channel();
+    let handler = TestHandler {
+        value: Mutex::new(Value::Null),
+        outcomes: outcomes_tx,
+    };
     let (client_end, server_end) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server_end);
-    let server = RpcServer::new(
-        BufReader::new(server_read),
-        server_write,
-        Arc::new(TestHandler),
-    );
+    let server = RpcServer::new(BufReader::new(server_read), server_write, Arc::new(handler));
     let task = tokio::spawn(server.run());
     let (client_read, client_write) = tokio::io::split(client_end);
     let client = Client {
         lines: BufReader::new(client_read).lines(),
         writer: client_write,
     };
-    (client, task)
+    (client, task, outcomes)
 }
 
 fn request(id: i64, method: &str, params: Value) -> Message {
@@ -192,4 +225,77 @@ async fn eof_ends_run() {
         .await
         .expect("run did not return on EOF");
     outcome.unwrap().unwrap();
+}
+
+fn notification(method: &str, params: Value) -> Message {
+    Message::Notification {
+        method: method.to_string(),
+        params,
+    }
+}
+
+#[tokio::test]
+async fn request_sees_effects_of_earlier_notifications() {
+    let (mut client, _task) = start();
+    // `set` sleeps before storing, so a request that overtakes it sees null.
+    client.send(notification("set", json!(42))).await;
+    client.send(request(1, "get", Value::Null)).await;
+    let (id, result, _) = expect_response(client.recv().await);
+    assert_eq!(id, json!(1));
+    assert_eq!(result, Some(json!(42)));
+}
+
+#[tokio::test]
+async fn panicking_request_still_gets_internal_error_response() {
+    let (mut client, _task) = start();
+    client.send(request(9, "panic", Value::Null)).await;
+    let (id, result, error) = expect_response(client.recv().await);
+    assert_eq!(id, json!(9));
+    assert!(result.is_none());
+    assert_eq!(
+        error.expect("error expected").code,
+        RpcError::INTERNAL_ERROR
+    );
+}
+
+#[tokio::test]
+async fn panicking_notification_does_not_stop_later_notifications() {
+    let (mut client, _task) = start();
+    client.send(notification("panic", Value::Null)).await;
+    client.send(notification("set", json!("after panic"))).await;
+    client.send(request(1, "get", Value::Null)).await;
+    let (_, result, _) = expect_response(client.recv().await);
+    assert_eq!(result, Some(json!("after panic")));
+}
+
+#[tokio::test]
+async fn client_request_after_eof_fails_fast() {
+    let (mut client, task, mut outcomes) = start_with_outcomes();
+    client.send(request(1, "late_edit", json!({}))).await;
+    drop(client);
+    let outcome = timeout(WAIT, outcomes.recv())
+        .await
+        .expect("ctx.request after EOF must not hang")
+        .unwrap();
+    assert_eq!(outcome.unwrap_err().code, RpcError::INTERNAL_ERROR);
+    timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn eof_drains_in_flight_requests_before_run_returns() {
+    let (mut client, task) = start();
+    client.send(request(1, "slow", Value::Null)).await;
+    client.writer.shutdown().await.unwrap();
+    timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+    // run() has returned, so the response must already be written.
+    let line = client
+        .lines
+        .next_line()
+        .now_or_never()
+        .expect("response must be flushed before run() returns")
+        .unwrap()
+        .expect("stream closed without the response");
+    let (id, result, _) = expect_response(Message::decode(&line).unwrap());
+    assert_eq!(id, json!(1));
+    assert_eq!(result, Some(json!("slow")));
 }
