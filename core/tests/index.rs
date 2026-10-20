@@ -249,6 +249,36 @@ fn search_literal_and_regex_with_glob_and_limit() {
 }
 
 #[test]
+fn search_anchors_match_line_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "lib.rs", "//! doc\nuse std::io;\nfn foo\n");
+    write(root, "win.rs", "// x\r\nuse std::fs;\r\nlet foo\r\n");
+    let index = WorkspaceIndex::build(root);
+    let files = index.files();
+    let overlay = DocumentStore::new(root.to_path_buf()).overlay_snapshot();
+
+    // `^` anchors to each line, not just the file's first line.
+    let res = search::search(&files, &overlay, query("^use ", true, None, 10)).unwrap();
+    let got: Vec<_> = res
+        .matches
+        .iter()
+        .map(|m| (m.path.clone(), m.line))
+        .collect();
+    assert_eq!(got, vec![(rel("lib.rs"), 2), (rel("win.rs"), 2)]);
+
+    // `$` anchors to line ends, including in files that end with a newline
+    // and files with CRLF line endings.
+    let res = search::search(&files, &overlay, query("foo$", true, None, 10)).unwrap();
+    let got: Vec<_> = res
+        .matches
+        .iter()
+        .map(|m| (m.path.clone(), m.line))
+        .collect();
+    assert_eq!(got, vec![(rel("lib.rs"), 3), (rel("win.rs"), 3)]);
+}
+
+#[test]
 fn search_sees_overlay_content() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

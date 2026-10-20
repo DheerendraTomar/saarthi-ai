@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use globset::{Glob, GlobMatcher};
-use regex::Regex;
+use regex::RegexBuilder;
 
 use super::{RelPath, WorkspaceIndex};
 use crate::overlay::OverlaySnapshot;
@@ -68,7 +68,13 @@ pub fn search(
     } else {
         regex::escape(&q.query)
     };
-    let re = Regex::new(&pattern).map_err(|e| SearchError::InvalidRegex(e.to_string()))?;
+    // Multi-line (+ CRLF-aware) so `^`/`$` anchor to lines in both the
+    // whole-file quick reject and the per-line check.
+    let re = RegexBuilder::new(&pattern)
+        .multi_line(true)
+        .crlf(true)
+        .build()
+        .map_err(|e| SearchError::InvalidRegex(e.to_string()))?;
     let glob = compile_glob(q.glob.as_deref())?;
 
     let mut result = SearchResult::default();
