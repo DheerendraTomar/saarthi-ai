@@ -338,6 +338,56 @@ async fn watcher_picks_up_new_file() {
     handle.abort();
 }
 
+/// Changes the watcher applies while a background build runs are replayed
+/// onto the built index before it replaces the current one.
+#[tokio::test]
+async fn install_build_replays_changes_made_during_the_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write(&root, "existing.rs", "fn existing() {}\n");
+    write(&root, "edited.rs", "fn old_name() {}\n");
+    // What a build walker read before the changes below: stale once they land.
+    let stale = WorkspaceIndex::build(&root);
+
+    let index = Arc::new(RwLock::new(WorkspaceIndex::empty(&root)));
+    let log = watcher::build_log();
+    let handle = watcher::spawn_logging(&root, index.clone(), log.clone());
+
+    write(&root, "src/fresh.rs", "fn fresh_symbol() {}\n");
+    write(&root, "edited.rs", "fn new_name() {}\n");
+    fs::remove_file(root.join("existing.rs")).unwrap();
+    // Wait until the watcher has applied them to the (pre-build) index.
+    let applied = wait_for(&index, Duration::from_secs(5), |idx| {
+        idx.files().contains(&rel("src/fresh.rs"))
+            && idx
+                .symbols(Path::new("edited.rs"))
+                .identifiers
+                .contains("new_name")
+    })
+    .await;
+    assert!(applied, "files: {:?}", index.read().unwrap().files());
+
+    watcher::install_build(&index, stale, &log);
+    {
+        let idx = index.read().unwrap();
+        let files = idx.files();
+        assert!(files.contains(&rel("src/fresh.rs")), "{files:?}");
+        assert!(!files.contains(&rel("existing.rs")), "ghost: {files:?}");
+        let edited = &idx.symbols(Path::new("edited.rs")).identifiers;
+        assert!(edited.contains("new_name") && !edited.contains("old_name"));
+    }
+    assert!(log.lock().unwrap().is_none(), "the log ends with the build");
+
+    // Afterwards, changes go straight to the installed index.
+    write(&root, "later.rs", "fn later() {}\n");
+    let later = wait_for(&index, Duration::from_secs(5), |idx| {
+        idx.files().contains(&rel("later.rs"))
+    })
+    .await;
+    assert!(later, "files: {:?}", index.read().unwrap().files());
+    handle.abort();
+}
+
 /// Rewrites `rels` under `root` every 20 ms until `stop` is set.
 fn churn(
     root: PathBuf,

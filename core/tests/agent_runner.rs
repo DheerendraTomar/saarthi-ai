@@ -1124,3 +1124,33 @@ async fn second_send_continues_the_saved_session() {
     assert_eq!(history.messages.len(), 4);
     assert_eq!(history.messages[0].role, "user");
 }
+
+#[tokio::test]
+async fn reserve_marks_the_session_running_until_dropped() {
+    let env = Env::new(script(vec![vec![chat_text("Hi."), chat_done()]])).await;
+    assert!(
+        env.runner
+            .reserve("bad id/..", CancellationToken::new())
+            .is_err()
+    );
+
+    let turn = env
+        .runner
+        .reserve(SESSION, CancellationToken::new())
+        .unwrap();
+    assert_eq!(turn.session_id(), SESSION);
+    assert!(env.runner.is_running(SESSION));
+    // A second reservation (or a plain send) fails while the first is held.
+    assert!(
+        env.runner
+            .reserve(SESSION, CancellationToken::new())
+            .is_err()
+    );
+    drop(turn);
+    assert!(!env.runner.is_running(SESSION));
+    assert!(
+        env.runner
+            .reserve(SESSION, CancellationToken::new())
+            .is_ok()
+    );
+}

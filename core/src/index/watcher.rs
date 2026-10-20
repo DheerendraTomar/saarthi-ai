@@ -24,6 +24,44 @@ use super::{IndexFilter, WorkspaceIndex};
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 pub const MAX_WAIT: Duration = Duration::from_secs(2);
 
+/// Paths the watcher applied while a background build runs. `Some` while the
+/// build runs; [`install_build`] replays them onto the built index and sets it
+/// to `None`, after which batches go straight to the installed index.
+pub type BuildLog = Arc<Mutex<Option<HashSet<PathBuf>>>>;
+
+/// A log for a build that is about to start.
+pub fn build_log() -> BuildLog {
+    Arc::new(Mutex::new(Some(HashSet::new())))
+}
+
+/// Swaps `built` into `index` without losing changes the watcher applied
+/// during the build: every path in `log` is re-read from disk and applied to
+/// `built` first. Ends the log. Does I/O for the logged paths.
+pub fn install_build(index: &RwLock<WorkspaceIndex>, mut built: WorkspaceIndex, log: &BuildLog) {
+    let filter = built.filter().clone();
+    // Replay most paths with no lock held...
+    loop {
+        let paths = match lock(log).as_mut() {
+            Some(paths) if !paths.is_empty() => std::mem::take(paths),
+            _ => break,
+        };
+        built.apply(filter.scan(paths.iter().map(PathBuf::as_path)));
+    }
+    // ...then the stragglers under the log lock, so no batch can land on the
+    // old index after its paths were replayed.
+    let mut log = lock(log);
+    if let Some(paths) = log.take() {
+        built.apply(filter.scan(paths.iter().map(PathBuf::as_path)));
+    }
+    *index.write().unwrap_or_else(|p| p.into_inner()) = built;
+}
+
+/// Ends `log` without installing anything (the build failed): the current
+/// index, kept up to date by the watcher, stays.
+pub fn abandon_build(log: &BuildLog) {
+    lock(log).take();
+}
+
 #[derive(Default)]
 struct Pending {
     paths: Mutex<HashSet<PathBuf>>,
@@ -38,6 +76,16 @@ struct Pending {
 /// Must be called within a tokio runtime; abort the handle to stop watching.
 /// If the watcher cannot be created the error is logged and the task ends.
 pub fn spawn(root: &Path, index: Arc<RwLock<WorkspaceIndex>>) -> JoinHandle<()> {
+    spawn_logging(root, index, Arc::new(Mutex::new(None)))
+}
+
+/// Like [`spawn`], but while `log` is `Some` every applied path is recorded
+/// in it first (see [`install_build`]).
+pub fn spawn_logging(
+    root: &Path,
+    index: Arc<RwLock<WorkspaceIndex>>,
+    log: BuildLog,
+) -> JoinHandle<()> {
     let filter = match index.read() {
         Ok(idx) => idx.filter().clone(),
         Err(poisoned) => poisoned.into_inner().filter().clone(),
@@ -91,6 +139,10 @@ pub fn spawn(root: &Path, index: Arc<RwLock<WorkspaceIndex>>) -> JoinHandle<()> 
             let batch = std::mem::take(&mut *lock(&pending.paths));
             if batch.is_empty() {
                 continue;
+            }
+            if let Some(logged) = lock(&log).as_mut() {
+                // Recorded before it is applied, so `install_build` replays it.
+                logged.extend(batch.iter().cloned());
             }
             let (filter, index) = (filter.clone(), index.clone());
             let applied = tokio::task::spawn_blocking(move || apply(&filter, &index, batch)).await;

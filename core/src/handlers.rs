@@ -11,12 +11,14 @@
 //! No `std` lock is held across an `.await`: every guard is taken in a
 //! statement or block that ends before the next await.
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -24,24 +26,27 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{AgentRunner, session};
+use crate::agent::{AgentRunner, TurnReservation};
 use crate::completion::CompletionEngine;
 use crate::index::{WorkspaceIndex, watcher};
-use crate::ollama::{OllamaClient, OllamaError, OllamaStatus, PullProgress};
+use crate::ollama::{OllamaClient, OllamaError, OllamaState, OllamaStatus, PullProgress};
 use crate::overlay::{DocumentStore, uri_to_path};
 use crate::protocol::{
-    Capabilities, ChatApproveParams, ChatHistoryParams, ChatListSessionsResult,
+    Capabilities, ChatApproveParams, ChatDone, ChatHistoryParams, ChatListSessionsResult,
     ChatNewSessionResult, ChatSendParams, ChatSendResult, ChatStopParams, CompletionAcceptedParams,
     CompletionCancelParams, CompletionRejectedParams, CompletionRequestParams, DidChangeParams,
     DidCloseParams, DidOpenParams, DidSaveParams, IndexReady, IndexStatus, InitializeParams,
     InitializeResult, OllamaPullParams, OllamaPullProgress, OllamaPullResult, StatusNotification,
-    methods,
+    StopReason, methods,
 };
 use crate::rpc::{Ctx, Handler, RpcError};
 use crate::settings::Settings;
 
 /// How often the idle status check re-probes Ollama.
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Upper bound on one status probe.
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// JSON-RPC "Invalid Request": used for calls made in the wrong state.
 const INVALID_REQUEST: i64 = -32600;
@@ -102,7 +107,7 @@ impl AppState {
             let s = read(&self.settings);
             (s.completion_model.clone(), s.chat_model.clone())
         };
-        self.ollama.status(&completion_model, &chat_model).await
+        probe(&self.ollama, &completion_model, &chat_model).await
     }
 
     /// Records `status` and notifies the client if it differs from the last
@@ -177,9 +182,7 @@ impl AppHandler {
         tracing::info!(root = %root.display(), ollama = %settings.ollama_url, "initializing");
 
         let ollama = OllamaClient::new(settings.ollama_url.clone(), settings.keep_alive.clone());
-        let ollama_status = ollama
-            .status(&settings.completion_model, &settings.chat_model)
-            .await;
+        let ollama_status = probe(&ollama, &settings.completion_model, &settings.chat_model).await;
 
         let store = Arc::new(RwLock::new(DocumentStore::new(root.clone())));
         let index = Arc::new(RwLock::new(WorkspaceIndex::empty(&root)));
@@ -211,11 +214,14 @@ impl AppHandler {
         });
 
         // The watcher starts before the build so no change made during the
-        // build is missed; it updates whichever index is current.
-        let watcher = watcher::spawn(&root, index.clone());
+        // build is missed: it updates the current (empty) index and logs what
+        // it applied, and the log is replayed onto the built index before
+        // the swap.
+        let log = watcher::build_log();
+        let watcher = watcher::spawn_logging(&root, index.clone(), log.clone());
         let status_loop = tokio::spawn(status_loop(Arc::downgrade(&state), ctx.clone()));
         lock(&state.tasks).extend([watcher, status_loop]);
-        tokio::spawn(build_index(root, index, ctx));
+        tokio::spawn(build_index(root, index, log, ctx));
 
         *write(&self.state) = Some(state);
         Ok(to_json(InitializeResult {
@@ -255,41 +261,23 @@ impl AppHandler {
                     .request(params, CancellationToken::new())
                     .await?;
                 // A completion that hit (or recovered from) an Ollama error
-                // updates the reported status.
+                // updates the reported status, off the latency-critical path.
                 if let Some(seen) = state.completion.last_status()
                     && seen.state != state.last_status().state
                 {
-                    state.refresh_status(&ctx).await;
+                    let state = state.clone();
+                    tokio::spawn(async move { state.refresh_status(&ctx).await });
                 }
                 Ok(to_json(result))
             }
             methods::CHAT_SEND => {
                 let params: ChatSendParams = parse(params)?;
-                let session_id = params.session_id.clone();
-                if !session::valid_id(&session_id) {
-                    return Err(RpcError::invalid_params(format!(
-                        "invalid session id {session_id:?}"
-                    )));
-                }
-                if state.agent.is_running(&session_id) {
-                    return Err(RpcError::new(
-                        INVALID_REQUEST,
-                        format!("a turn is already running in session {session_id:?}"),
-                    ));
-                }
-                let cancel = state.turns.child_token();
-                tokio::spawn(async move {
-                    let outcome = state
-                        .agent
-                        .send(&session_id, params, ctx.clone(), cancel)
-                        .await;
-                    if let Err(err) = outcome {
-                        tracing::warn!(%err, session_id, "chat turn not started");
-                    }
-                    // The runner reports Ollama errors itself; re-probe so the
-                    // client's status reflects the server's real state.
-                    state.refresh_status(&ctx).await;
-                });
+                // Reserved before answering, so a concurrent send for the same
+                // session gets an error instead of a `{}` with no turn.
+                let turn = state
+                    .agent
+                    .reserve(&params.session_id, state.turns.clone())?;
+                tokio::spawn(run_turn(state, turn, params, ctx));
                 Ok(to_json(ChatSendResult {}))
             }
             methods::CHAT_STOP => {
@@ -405,25 +393,72 @@ fn refresh_snippets(state: &AppState, uri: String) {
     tokio::spawn(async move { completion.refresh_snippets(&uri).await });
 }
 
-/// Builds the index off the async runtime, swaps it in, and emits
-/// `index/ready`.
-async fn build_index(root: PathBuf, index: Arc<RwLock<WorkspaceIndex>>, ctx: Ctx) {
-    let built = match tokio::task::spawn_blocking(move || WorkspaceIndex::build(&root)).await {
-        Ok(built) => built,
+/// Runs a reserved chat turn. The client always gets a `chat/done`: if the
+/// turn panics, one with `stopReason: "error"` is sent here.
+async fn run_turn(state: Arc<AppState>, turn: TurnReservation, params: ChatSendParams, ctx: Ctx) {
+    let session_id = turn.session_id().to_owned();
+    let send = state.agent.send_reserved(turn, params, ctx.clone());
+    if AssertUnwindSafe(send).catch_unwind().await.is_err() {
+        tracing::error!(session_id, "chat turn panicked");
+        ctx.notify(
+            methods::CHAT_DONE,
+            to_json(ChatDone {
+                session_id,
+                stop_reason: StopReason::Error,
+            }),
+        );
+    }
+    // The runner reports Ollama errors itself; re-probe so the client's
+    // status reflects the server's real state.
+    state.refresh_status(&ctx).await;
+}
+
+/// Builds the index off the async runtime, replays the watcher's changes
+/// made meanwhile, swaps it in, and emits `index/ready`. If the build fails
+/// the watcher-maintained index stays and `index/ready` is still sent, so the
+/// client never waits on "building" forever.
+async fn build_index(
+    root: PathBuf,
+    index: Arc<RwLock<WorkspaceIndex>>,
+    log: watcher::BuildLog,
+    ctx: Ctx,
+) {
+    let (target, build_log) = (index.clone(), log.clone());
+    let built = tokio::task::spawn_blocking(move || {
+        let built = WorkspaceIndex::build(&root);
+        let build_ms = built.stats().build_ms;
+        watcher::install_build(&target, built, &build_log);
+        build_ms
+    })
+    .await;
+    let build_ms = match built {
+        Ok(build_ms) => build_ms,
         Err(err) => {
-            tracing::error!(%err, "workspace index build failed");
-            return;
+            tracing::error!(%err, "workspace index build failed; keeping the incremental index");
+            watcher::abandon_build(&log);
+            0
         }
     };
-    let stats = built.stats();
-    *write(&index) = built;
+    let files = read(&index).stats().files;
     ctx.notify(
         methods::INDEX_READY,
-        to_json(IndexReady {
-            files: stats.files,
-            build_ms: stats.build_ms,
-        }),
+        to_json(IndexReady { files, build_ms }),
     );
+}
+
+/// [`OllamaClient::status`], bounded by [`STATUS_TIMEOUT`]: a server that
+/// accepts connections but never answers counts as down.
+async fn probe(ollama: &OllamaClient, completion_model: &str, chat_model: &str) -> OllamaStatus {
+    match tokio::time::timeout(STATUS_TIMEOUT, ollama.status(completion_model, chat_model)).await {
+        Ok(status) => status,
+        Err(_) => OllamaStatus {
+            state: OllamaState::Down,
+            detail: format!(
+                "Ollama did not answer within {} s (timed out)",
+                STATUS_TIMEOUT.as_secs()
+            ),
+        },
+    }
 }
 
 /// Re-probes Ollama every [`STATUS_INTERVAL`] while no chat turn is running

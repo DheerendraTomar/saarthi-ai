@@ -366,3 +366,75 @@ async fn protocol_errors_and_pull_progress() {
 
     core.shutdown().await;
 }
+
+#[tokio::test]
+async fn second_send_while_a_turn_runs_is_refused_with_one_done() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder".to_owned(), "chat".to_owned()],
+        chat: vec![vec![chat_text("Slow"), chat_text(" answer."), chat_done()]],
+        // Keeps the first turn running while the second send arrives.
+        chunk_delay: Duration::from_millis(150),
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+
+    let session = core.call("chat/newSession", Value::Null).await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+    let params = json!({"sessionId": session_id, "message": "hi"});
+    // Both requests are in flight together; the core handles them concurrently.
+    let first = core.send("chat/send", params.clone()).await;
+    let second = core.send("chat/send", params).await;
+    let first = core.response(first).await;
+    let second = core.response(second).await;
+    let outcomes = [&first, &second];
+    let accepted = outcomes.iter().filter(|r| r["result"] == json!({})).count();
+    let refused = outcomes.iter().filter(|r| r.get("error").is_some()).count();
+    assert_eq!((accepted, refused), (1, 1), "{first} / {second}");
+
+    let done = core.notification("chat/done").await;
+    assert_eq!(done["params"]["stopReason"], "done", "{done}");
+    // A round trip after the turn: any second chat/done would be buffered by now.
+    core.call("chat/listSessions", Value::Null).await;
+    let extra = core
+        .buffered
+        .iter()
+        .filter(|m| m["method"] == "chat/done")
+        .count();
+    assert_eq!(extra, 0, "{:?}", core.buffered);
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_ollama_times_out_as_down() {
+    // Accepts connections and never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let stall = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+
+    let init = core
+        .call(
+            "initialize",
+            json!({"workspaceRoot": ws.root, "settings": {"ollamaUrl": url}}),
+        )
+        .await;
+    assert_eq!(init["ollamaStatus"]["state"], "down", "{init}");
+    let detail = init["ollamaStatus"]["detail"].as_str().unwrap();
+    assert!(detail.contains("timed out"), "{detail}");
+
+    let status = core.call("ollama/status", Value::Null).await;
+    assert_eq!(status["state"], "down", "{status}");
+
+    core.shutdown().await;
+    stall.abort();
+}

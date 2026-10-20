@@ -78,7 +78,7 @@ pub struct AgentRunner {
     /// Approval prompts awaiting `chat/approve`, by (session, tool call id).
     approvals: Mutex<HashMap<ApprovalKey, oneshot::Sender<Approval>>>,
     /// Cancellation token of the running turn, by session.
-    running: Mutex<HashMap<String, CancellationToken>>,
+    running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Latest state of every session touched by this process.
     sessions: Mutex<HashMap<String, Session>>,
     /// Number of chat streams in flight; completions are paused while > 0.
@@ -121,7 +121,7 @@ impl AgentRunner {
             root,
             canonical_root,
             approvals: Mutex::new(HashMap::new()),
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
             sessions: Mutex::new(HashMap::new()),
             streams: Mutex::new(0),
             next_call_id: AtomicU64::new(0),
@@ -149,14 +149,40 @@ impl AgentRunner {
         ctx: Ctx,
         cancel: CancellationToken,
     ) -> Result<(), RpcError> {
+        let turn = self.reserve(session_id, cancel)?;
+        self.send_reserved(turn, params, ctx).await;
+        Ok(())
+    }
+
+    /// Marks a turn as running in `session_id` right away, so a caller can
+    /// answer "already running" synchronously and then run the turn later
+    /// with [`send_reserved`](Self::send_reserved). Dropping the reservation
+    /// unregisters it. Errors: an invalid session id or a running turn.
+    pub fn reserve(
+        &self,
+        session_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<TurnReservation, RpcError> {
         if !session::valid_id(session_id) {
             return Err(RpcError::invalid_params(format!(
                 "invalid session id {session_id:?}"
             )));
         }
-        let cancel = cancel.child_token();
-        let running = RunningGuard::register(self, session_id, cancel.clone())?;
-        let session = self.load_session(session_id).await;
+        TurnReservation::register(&self.running, session_id, cancel.child_token())
+    }
+
+    /// Runs one whole turn under `turn` (see [`send`](Self::send)) and emits
+    /// `chat/done`. Returns once `chat/done` was sent.
+    pub async fn send_reserved(
+        &self,
+        turn_reservation: TurnReservation,
+        params: ChatSendParams,
+        ctx: Ctx,
+    ) {
+        let turn = &turn_reservation;
+        let session_id = turn.session_id.clone();
+        let cancel = turn.cancel.clone();
+        let session = self.load_session(&session_id).await;
         let settings = read(&self.settings).clone();
         let mut turn = Turn {
             runner: self,
@@ -168,15 +194,14 @@ impl AgentRunner {
         let stop_reason = turn.run(params).await;
         turn.save().await;
         // Unregister first, so a client reacting to `chat/done` can send again.
-        drop(running);
+        drop(turn_reservation);
         ctx.notify(
             methods::CHAT_DONE,
             to_json(ChatDone {
-                session_id: session_id.to_owned(),
+                session_id,
                 stop_reason,
             }),
         );
-        Ok(())
     }
 
     /// Answers a pending approval prompt (`chat/approve`).
@@ -397,35 +422,42 @@ fn history_messages(messages: &[ChatMessage]) -> Vec<HistoryMessage> {
         .collect()
 }
 
-/// Marks a session's turn as running; unregisters on drop.
-struct RunningGuard<'a> {
-    runner: &'a AgentRunner,
+/// A session's turn marked as running (see [`AgentRunner::reserve`]);
+/// unregisters on drop.
+pub struct TurnReservation {
+    running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     session_id: String,
+    cancel: CancellationToken,
 }
 
-impl<'a> RunningGuard<'a> {
+impl TurnReservation {
     fn register(
-        runner: &'a AgentRunner,
+        running: &Arc<Mutex<HashMap<String, CancellationToken>>>,
         session_id: &str,
         cancel: CancellationToken,
     ) -> Result<Self, RpcError> {
-        let mut running = lock(&runner.running);
-        if running.contains_key(session_id) {
+        let mut map = lock(running);
+        if map.contains_key(session_id) {
             return Err(RpcError::invalid_params(format!(
                 "a turn is already running in session {session_id:?}"
             )));
         }
-        running.insert(session_id.to_owned(), cancel);
+        map.insert(session_id.to_owned(), cancel.clone());
         Ok(Self {
-            runner,
+            running: running.clone(),
             session_id: session_id.to_owned(),
+            cancel,
         })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
-impl Drop for RunningGuard<'_> {
+impl Drop for TurnReservation {
     fn drop(&mut self) {
-        lock(&self.runner.running).remove(&self.session_id);
+        lock(&self.running).remove(&self.session_id);
     }
 }
 
