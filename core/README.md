@@ -105,9 +105,9 @@ Verified on Ollama 0.40.6, Apple M4 Pro 48 GB
   `/api/generate` + `suffix`, no raw template) and `qwen3.8:27b-mlx` (chat,
   native `tool_calls`).
 - **`OLLAMA_MAX_LOADED_MODELS` does not need to be set**: with defaults
-  (unset) both models stay resident on 48 GB. Set it to `2` or more if your
-  Ollama evicts one model when the other loads.
-- Every request sends `keep_alive` (setting `keepAlive`, default `30m`) so the
+  (unset) both models stayed resident on the 48 GB test machine; other values
+  are untested.
+- Every generate/chat request sends `keep_alive` (setting `keepAlive`, default `30m`) so the
   models stay loaded.
 - Chat thinking defaults off (`chatThinking: "off"` → `think:false`); thinking
   roughly doubles latency even on trivial prompts.
