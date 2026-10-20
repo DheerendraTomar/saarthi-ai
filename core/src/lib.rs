@@ -2,5 +2,6 @@
 //! integration tests.
 
 pub mod protocol;
+pub mod rpc;
 pub mod settings;
 pub mod tokens;
