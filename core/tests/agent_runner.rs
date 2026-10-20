@@ -815,6 +815,52 @@ async fn edited_args_run_and_always_keys_the_edited_command() {
 }
 
 #[tokio::test]
+async fn edit_is_re_resolved_if_the_file_changes_during_approval() {
+    let mut env = Env::new(script(vec![
+        vec![
+            edit_call("call_1", "old_call();", "new_call();"),
+            chat_done(),
+        ],
+        vec![edit_call("call_2", "fn a()", "fn b()"), chat_done()],
+        vec![chat_text("Done."), chat_done()],
+    ]))
+    .await;
+    let handle = env.send("edit");
+
+    env.next(methods::CHAT_TOOL_CALL).await;
+    // The user inserts a line above while the prompt is open.
+    std::fs::write(env.root.join("src/lib.rs"), format!("// header\n{LIB}")).unwrap();
+    env.runner
+        .approve(SESSION, "call_1", Decision::Once, None)
+        .unwrap();
+    env.next(methods::CHAT_TOOL_CALL).await;
+    // ...and then removes the text the second edit targets.
+    std::fs::write(env.root.join("src/lib.rs"), "fn c() {}\n").unwrap();
+    env.runner
+        .approve(SESSION, "call_2", Decision::Once, None)
+        .unwrap();
+    finish(handle).await;
+
+    let requests = env.ctx.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].params["ops"][0]["range"],
+        json!({"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 15}})
+    );
+    let results = env.ctx.named(methods::CHAT_TOOL_RESULT);
+    assert_eq!(results[0].params["ok"], true);
+    assert_eq!(results[1].params["ok"], false);
+    assert!(
+        results[1].params["summary"]
+            .as_str()
+            .unwrap()
+            .contains("changed while waiting for approval"),
+        "{:?}",
+        results[1].params
+    );
+}
+
+#[tokio::test]
 async fn stop_while_awaiting_approval_emits_stopped() {
     let mut env = Env::new(script(vec![vec![
         edit_call("call_1", "old_call();", "new_call();"),
@@ -828,6 +874,14 @@ async fn stop_while_awaiting_approval_emits_stopped() {
 
     assert_eq!(stop_reasons(&env.ctx), ["stopped"]);
     assert!(env.ctx.requests().is_empty());
+    let results = env.ctx.named(methods::CHAT_TOOL_RESULT);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].params["ok"], false);
+    let saved = Session::load(&env.root, SESSION).unwrap();
+    assert_eq!(
+        saved.messages.last().unwrap().content,
+        "Stopped by the user."
+    );
     assert!(
         env.runner
             .approve(SESSION, "call_1", Decision::Once, None)

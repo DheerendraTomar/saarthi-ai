@@ -604,9 +604,15 @@ impl Turn<'_> {
                 let outcome = match self.handle(id, call).await {
                     Some(outcome) => outcome,
                     None => {
-                        // Answer this and the remaining calls so the history
-                        // stays well-formed.
-                        for (_, call) in &calls[i..] {
+                        // Answer this call (the client saw it) and the
+                        // remaining ones so the history stays well-formed.
+                        let stopped = Outcome {
+                            ok: false,
+                            content: STOPPED.to_owned(),
+                            summary: "Stopped".to_owned(),
+                        };
+                        self.finish_call(id, &call.function.name, stopped);
+                        for (_, call) in &calls[i + 1..] {
                             self.session
                                 .messages
                                 .push(ChatMessage::tool(&call.function.name, STOPPED));
