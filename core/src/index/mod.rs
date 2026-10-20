@@ -6,6 +6,7 @@
 //! [`IndexFilter::scan`] reads and parses files with no lock held, then
 //! [`WorkspaceIndex::apply`] swaps the results in.
 
+pub mod related;
 pub mod search;
 pub mod symbols;
 pub mod walker;
