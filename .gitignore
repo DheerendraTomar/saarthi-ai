@@ -4,3 +4,6 @@ node_modules/
 .localpilot/
 dist/
 *.vsix
+vscode/out/
+vscode/bin/
+chat-ui/dist/

@@ -1,0 +1,7 @@
+{
+  "name": "localpilot",
+  "private": true,
+  "workspaces": [
+    "chat-ui"
+  ]
+}
