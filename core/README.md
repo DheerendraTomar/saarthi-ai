@@ -99,9 +99,13 @@ Additions beyond the spec:
   `accepted` / `rejected`. Each served suggestion is appended once to
   **`<workspace>/.localpilot/completions.jsonl`** when its outcome arrives
   — except a typed-prefix cache hit (the rest of a suggestion already
-  served, after the user typed into it): that is not a new suggestion, gets
-  no record, and an outcome for it is ignored; the original suggestion's
-  record carries the outcome of the whole typing run:
+  served, after the user typed into it): that is not a new suggestion and
+  gets no record; its `requestId` becomes an alias of the original
+  suggestion (restarting its 60 s timeout), so an outcome reported under it
+  resolves the original record (with the typed text prepended to a
+  `partial` / `accepted` `acceptedText`) and outcomes after that are
+  ignored; the original suggestion's record carries the outcome of the whole
+  typing run:
   `{ ts, requestId, lang, ext?, promptHash, contextTail, suggestion, lines,
   outcome, acceptedText?, ttftMs, totalMs, model?, maxLines?, numPredict? }`
   - `ts` Unix ms when served; `lang` lower-case (`"python"`, …, `"other"`);
@@ -166,7 +170,8 @@ Additions beyond the spec:
     `completionMaxTokens`), ignoring an exact completion-cache hit (a
     typed-prefix hit — the user typing through a suggestion already shown —
     is still served as usual); its log record carries those limits. Learning explores the configured length 10% of
-    the time. A learning reset restarts the count.
+    the time (not at all when the learned limits equal the configured ones).
+    A learning reset restarts the count.
   - **Style examples:** up to 3 of the most recent `accepted` suggestions of
     the same language with ≥ 2 lines, newest first, each as
     `<comment> Example\n<contextTail><suggestion>\n\n` with the language's

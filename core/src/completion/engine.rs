@@ -25,7 +25,11 @@
 //! already served, whose own record carries the outcome) is kept as a
 //! pending [`Record`] until `completion/outcome` (or
 //! `completion/accepted|rejected`) names it, then appended with that
-//! outcome. A pending record with no outcome after [`OUTCOME_TIMEOUT`] (or
+//! outcome. A typed-prefix hit's request id becomes an alias of the
+//! original pending record (and restarts its timeout): an outcome reported
+//! under the alias resolves the original, with the text typed into the
+//! suggestion put back in front of a `partial` / `accepted` `acceptedText`.
+//! A pending record with no outcome after [`OUTCOME_TIMEOUT`] (or
 //! pushed out by [`PENDING_MEMORY`] newer ones) is appended as `rejected`;
 //! expiry is checked lazily whenever a suggestion is served or an outcome
 //! arrives. Log I/O happens after every engine lock is released.
@@ -43,7 +47,8 @@
 //! [`adaptive::EXPLORE_EVERY`]-th served multi-line suggestion of a language
 //! is therefore generated with the configured limits (ignoring an exact
 //! cache hit; a typed-prefix hit is still served), and its record carries
-//! those limits.
+//! those limits. Nothing is explored when the learned limits are the
+//! configured ones.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -88,6 +93,9 @@ pub const OUTCOME_TIMEOUT: Duration = Duration::from_secs(60);
 /// At most this many suggestions await an outcome; older ones are logged
 /// `rejected`.
 pub const PENDING_MEMORY: usize = 64;
+/// At most this many typed-prefix request ids alias one pending
+/// suggestion; older ones are forgotten.
+pub const ALIAS_MEMORY: usize = 256;
 
 /// `(uri, prefix, suffix)` exactly as sent to the model.
 type Key = (String, String, String);
@@ -131,7 +139,13 @@ struct Inner {
 
 /// A logged-to-be suggestion; `record.outcome` is filled in on outcome.
 struct Pending {
+    /// When served, or when a typed-prefix hit on it was last served.
     served_at: Instant,
+    /// The cache key it was served under (what a typed-prefix hit matches).
+    key: Key,
+    /// Typed-prefix hits served from it, oldest first: `(request id, text
+    /// typed into the suggestion before that hit)`.
+    aliases: VecDeque<(String, String)>,
     record: Record,
 }
 
@@ -371,11 +385,13 @@ impl CompletionEngine {
             return Ok(CompletionResult::default());
         }
         // Kept for a typed-prefix hit too, so rejecting it evicts the entry.
-        remember_served(inner, &params.request_id, served_key);
+        remember_served(inner, &params.request_id, served_key.clone());
         // The rest of a suggestion already served is not a new suggestion:
         // the original's record carries the outcome, so no record (and no
-        // exploration count) here.
+        // exploration count) here; its id only aliases the original.
         if typed_prefix_hit {
+            let typed = key.1.strip_prefix(&served_key.1).unwrap_or_default();
+            self.add_alias(&served_key, &params.request_id, typed);
             return Ok(served(text, params.position));
         }
         if adapted {
@@ -404,7 +420,7 @@ impl CompletionEngine {
                 max_lines: Some(max_lines),
                 num_predict: Some(num_predict),
             };
-            self.add_pending(record);
+            self.add_pending(record, served_key);
         }
         Ok(served(text, params.position))
     }
@@ -459,6 +475,8 @@ impl CompletionEngine {
 
     /// `completion/outcome`: logs the pending suggestion of `request_id`
     /// with `outcome` (no-op if it is unknown, already logged or expired).
+    /// For a typed-prefix hit's id that is the original suggestion's record,
+    /// with the text typed before that hit prepended to `accepted_text`.
     /// A rejected suggestion is also dropped from the cache so it is not
     /// offered again.
     pub fn on_outcome(&self, request_id: &str, outcome: LogOutcome, accepted_text: Option<String>) {
@@ -472,12 +490,10 @@ impl CompletionEngine {
         {
             let mut pending = lock(&self.inner.pending);
             // The named one first, so a late answer is not expired away.
-            let named = pending
-                .iter()
-                .position(|p| p.record.request_id == request_id)
-                .and_then(|at| pending.remove(at));
+            let named = take_named(&mut pending, request_id);
             expire(&mut pending, Instant::now(), &mut done);
-            if let Some(mut p) = named {
+            if let Some((mut p, typed)) = named {
+                let accepted_text = accepted_text.map(|text| typed + &text);
                 p.record.outcome = outcome;
                 p.record.accepted_text = kept_text(outcome, accepted_text, &p.record.suggestion);
                 done.push(p.record);
@@ -574,8 +590,9 @@ impl CompletionEngine {
         }
     }
 
-    /// Queues `record` until its outcome arrives, logging expired ones.
-    fn add_pending(&self, record: Record) {
+    /// Queues `record` (served under `key`) until its outcome arrives,
+    /// logging expired ones.
+    fn add_pending(&self, record: Record, key: Key) {
         let mut done = Vec::new();
         {
             let mut pending = lock(&self.inner.pending);
@@ -588,8 +605,38 @@ impl CompletionEngine {
             }
             pending.push_back(Pending {
                 served_at: now,
+                key,
+                aliases: VecDeque::new(),
                 record,
             });
+        }
+        self.write_log(done);
+    }
+
+    /// A typed-prefix hit `request_id` was served from the suggestion
+    /// cached under `key` after `typed` was typed into it: makes the id an
+    /// alias of the newest pending record served under `key` and restarts
+    /// that record's timeout (the user is still typing through it).
+    fn add_alias(&self, key: &Key, request_id: &str, typed: &str) {
+        let mut done = Vec::new();
+        {
+            let mut pending = lock(&self.inner.pending);
+            let now = Instant::now();
+            // Refreshed before expiry runs, so the hit keeps it alive.
+            if let Some(mut p) = pending
+                .iter()
+                .rposition(|p| &p.key == key)
+                .and_then(|at| pending.remove(at))
+            {
+                p.served_at = now;
+                if p.aliases.len() == ALIAS_MEMORY {
+                    p.aliases.pop_front();
+                }
+                p.aliases
+                    .push_back((request_id.to_owned(), typed.to_owned()));
+                pending.push_back(p);
+            }
+            expire(&mut pending, now, &mut done);
         }
         self.write_log(done);
     }
@@ -766,7 +813,8 @@ impl CompletionEngine {
         );
         let mode = stop::mode_for(&window.prefix, &prompt.suffix);
         let adapted = mode == StopMode::MultiLine && learned.is_some();
-        let explore = adapted && {
+        // Nothing to explore when what was learned is the configured limits.
+        let explore = adapted && learned != Some(configured(settings).as_learned()) && {
             let served = lock(&inner.explore_counts)
                 .get(lang.as_str())
                 .copied()
@@ -1193,6 +1241,24 @@ fn expire(pending: &mut VecDeque<Pending>, now: Instant, done: &mut Vec<Record>)
             done.push(p.record); // already `Rejected`
         }
     }
+}
+
+/// Removes the pending record named `request_id`, directly (typed text
+/// `""`) or through an alias (the text typed before that hit).
+fn take_named(pending: &mut VecDeque<Pending>, request_id: &str) -> Option<(Pending, String)> {
+    let (at, typed) = pending
+        .iter()
+        .position(|p| p.record.request_id == request_id)
+        .map(|at| (at, String::new()))
+        .or_else(|| {
+            pending.iter().enumerate().find_map(|(at, p)| {
+                p.aliases
+                    .iter()
+                    .find(|(id, _)| id == request_id)
+                    .map(|(_, typed)| (at, typed.clone()))
+            })
+        })?;
+    pending.remove(at).map(|p| (p, typed))
 }
 
 fn take_served(inner: &Inner, request_id: &str) -> Option<Key> {
@@ -1911,6 +1977,179 @@ mod tests {
         f.engine.reset_learning();
         let p = f.engine.prepare(&f.uri, multi).await.unwrap();
         assert_eq!((limits(&p), p.explore), (configured, false));
+    }
+
+    /// Serves `request_id` from a primed cache entry holding `text`.
+    async fn serve_cached_text(f: &Fixture, request_id: &str, at: Position, text: &str) {
+        let p = f.engine.prepare(&f.uri, at).await.unwrap();
+        lock(&f.engine.inner.cache).put(&p.key.0, &p.key.1, &p.key.2, text);
+        assert_eq!(serve(f, request_id, at).await, text);
+    }
+
+    /// Requests `request_id` at `at` and returns the served text.
+    async fn serve(f: &Fixture, request_id: &str, at: Position) -> String {
+        let params = CompletionRequestParams {
+            uri: f.uri.clone(),
+            position: at,
+            request_id: request_id.to_owned(),
+        };
+        let served = f
+            .engine
+            .request(params, CancellationToken::new())
+            .await
+            .unwrap();
+        served.items.into_iter().map(|i| i.text).collect()
+    }
+
+    /// The user types "t" at [`AT`] (into a suggestion starting with "t").
+    const TYPED_AT: Position = Position {
+        line: 3,
+        character: 12,
+    };
+
+    #[tokio::test]
+    async fn typed_prefix_hit_outcome_resolves_original_record() {
+        for outcome in [
+            LogOutcome::Accepted,
+            LogOutcome::Rejected,
+            LogOutcome::TypedThrough,
+        ] {
+            let f = fixture(MAIN);
+            let log = workspace_log(&f);
+            serve_cached_text(&f, "r1", AT, "t) + 1").await;
+            type_char(&f, AT, 2);
+            assert_eq!(serve(&f, "t1", TYPED_AT).await, ") + 1");
+
+            // The host reports under the typed-prefix id: r1 carries it.
+            f.engine.on_outcome("t1", outcome, Some(") + 1".to_owned()));
+            assert_eq!(logged(&log).await, [("r1".to_owned(), outcome)]);
+            let record = &log.records()[0];
+            assert_eq!(record.suggestion, "t) + 1");
+            let kept = (outcome == LogOutcome::Accepted).then(|| "t) + 1".to_owned());
+            assert_eq!(record.accepted_text, kept, "{outcome:?}");
+
+            // r1 is resolved: later outcomes under either id are no-ops.
+            f.engine.on_outcome("t1", LogOutcome::Accepted, None);
+            f.engine.on_outcome("r1", LogOutcome::Accepted, None);
+            f.engine.flush_pending().await;
+            assert_eq!(logged(&log).await.len(), 1, "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn alias_partial_prepends_typed_prefix() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        serve_cached_text(&f, "r1", AT, "t) + 1").await;
+        type_char(&f, AT, 2);
+        assert_eq!(serve(&f, "t1", TYPED_AT).await, ") + 1");
+        f.engine
+            .on_outcome("t1", LogOutcome::Partial, Some(")".to_owned()));
+        assert_eq!(logged(&log).await, [("r1".to_owned(), LogOutcome::Partial)]);
+        assert_eq!(log.records()[0].accepted_text.as_deref(), Some("t)"));
+    }
+
+    #[tokio::test]
+    async fn alias_refreshes_expiry() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        serve_cached_text(&f, "r1", AT, "t) + 1").await;
+        f.engine
+            .age_pending(OUTCOME_TIMEOUT - Duration::from_secs(1));
+        type_char(&f, AT, 2);
+        assert_eq!(serve(&f, "t1", TYPED_AT).await, ") + 1");
+        f.engine.age_pending(Duration::from_secs(2));
+        // 61 s after r1 was served but 2 s after the hit: still pending.
+        f.engine.on_outcome("unknown", LogOutcome::Accepted, None);
+        assert!(logged(&log).await.is_empty());
+
+        f.engine.on_outcome("t1", LogOutcome::Accepted, None);
+        assert_eq!(
+            logged(&log).await,
+            [("r1".to_owned(), LogOutcome::Accepted)]
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_hit_revives_a_record_past_its_timeout() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        serve_cached_text(&f, "r1", AT, "t) + 1").await;
+        f.engine
+            .age_pending(OUTCOME_TIMEOUT + Duration::from_secs(1));
+        type_char(&f, AT, 2);
+        assert_eq!(serve(&f, "t1", TYPED_AT).await, ") + 1");
+        f.engine.on_outcome("t1", LogOutcome::Accepted, None);
+        assert_eq!(
+            logged(&log).await,
+            [("r1".to_owned(), LogOutcome::Accepted)]
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_cleared_when_original_resolves() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        serve_cached_text(&f, "r1", AT, "t) + 1").await;
+        type_char(&f, AT, 2);
+        assert_eq!(serve(&f, "t1", TYPED_AT).await, ") + 1");
+        f.engine.on_outcome("r1", LogOutcome::TypedThrough, None);
+
+        // t1 no longer resolves anything, not even a newer suggestion.
+        serve_cached_text(&f, "r2", TYPED_AT, "t + 2").await;
+        f.engine.on_outcome("t1", LogOutcome::Accepted, None);
+        assert_eq!(
+            logged(&log).await,
+            [("r1".to_owned(), LogOutcome::TypedThrough)]
+        );
+
+        // Expiry clears them too: a late outcome for t2 is a no-op.
+        type_char(&f, TYPED_AT, 3);
+        let typed_twice = Position {
+            line: 3,
+            character: 13,
+        };
+        assert_eq!(serve(&f, "t2", typed_twice).await, " + 2");
+        assert_eq!(lock(&f.engine.inner.pending)[0].aliases.len(), 1);
+        f.engine.age_pending(OUTCOME_TIMEOUT);
+        f.engine.on_outcome("unknown", LogOutcome::Accepted, None);
+        assert!(lock(&f.engine.inner.pending).is_empty());
+        f.engine.on_outcome("t2", LogOutcome::Accepted, None);
+        f.engine.flush_pending().await;
+        assert_eq!(
+            logged(&log).await,
+            [
+                ("r1".to_owned(), LogOutcome::TypedThrough),
+                ("r2".to_owned(), LogOutcome::Rejected)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_exploration_when_learned_equals_configured() {
+        let f = fixture("x = foo()\nresult = \n");
+        let log = workspace_log(&f);
+        seed_learning(&log).await;
+        f.engine.refresh_snippets(&f.uri).await;
+        let configured = configured(&Settings::default()).as_learned();
+        for slot in lock(&f.engine.inner.snippets_by_uri).values_mut() {
+            if let Some(entry) = slot.entry.as_mut() {
+                entry.learned = Some(configured);
+            }
+        }
+        let multi = Position {
+            line: 1,
+            character: 9,
+        };
+        for i in 0..adaptive::EXPLORE_EVERY + 1 {
+            let p = f.engine.prepare(&f.uri, multi).await.unwrap();
+            assert!(!p.explore, "request {i}");
+            assert_eq!(
+                (p.max_lines, p.num_predict),
+                (configured.max_lines, configured.num_predict)
+            );
+            serve_cached(&f, &format!("m{i}"), multi).await;
+        }
     }
 
     #[tokio::test]

@@ -675,18 +675,21 @@ async fn typed_prefix_hit_creates_no_new_log_record() {
     }
     assert_eq!(generate_bodies(&env.mock).len(), 1);
 
-    // Outcomes for the typed-prefix hits are ignored; the original record
-    // carries the outcome of the whole typing run.
+    // The original record carries the outcome of the whole typing run,
+    // reported under the latest typed-prefix id (as JupyterLab does), with
+    // the typed text put back; later outcomes for the run are ignored.
+    env.engine
+        .on_outcome("t1", Outcome::Accepted, Some("+ b".to_owned()));
     env.engine
         .on_outcome("t0", Outcome::Partial, Some(" ".to_owned()));
-    env.engine.on_outcome("t1", Outcome::Accepted, None);
-    env.engine.on_outcome("r1", Outcome::Accepted, None);
+    env.engine.on_outcome("r1", Outcome::Rejected, None);
     env.engine.flush_pending().await;
     let records = log.records();
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].request_id, "r1");
     assert_eq!(records[0].suggestion, "a + b");
     assert_eq!(records[0].outcome, Outcome::Accepted);
+    assert_eq!(records[0].accepted_text.as_deref(), Some("a + b"));
     let stats = env.engine.stats().await;
     assert_eq!(stats.languages["python"].served, 1);
 }
