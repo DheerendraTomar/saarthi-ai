@@ -1,0 +1,39 @@
+name: jetbrains
+
+on:
+  push:
+    paths:
+      - "jetbrains/**"
+      - "vscode/test/fakeCore.mjs"
+      - "scripts/package-jetbrains.sh"
+      - ".github/workflows/jetbrains.yml"
+  pull_request:
+    paths:
+      - "jetbrains/**"
+      - "vscode/test/fakeCore.mjs"
+      - "scripts/package-jetbrains.sh"
+      - ".github/workflows/jetbrains.yml"
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: test, verifyPlugin (macOS arm64)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: jetbrains
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      # CoreProcessTest drives vscode/test/fakeCore.mjs (Node built-ins only, no npm ci needed).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: gradle/actions/setup-gradle@v4
+      - name: package script syntax
+        run: bash -n ../scripts/package-jetbrains.sh
+      - name: test + verifyPlugin
+        run: ./gradlew test verifyPlugin

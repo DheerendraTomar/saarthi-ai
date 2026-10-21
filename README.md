@@ -17,6 +17,7 @@ but wires these controls in its next update.
 | [`core/`](core/README.md) | `localpilot-core`, the Rust sidecar: document overlay, workspace index, completion engine, agent chat. Speaks JSON-RPC over stdio. |
 | [`vscode/`](vscode/README.md) | The VS Code extension (bundles the core). |
 | [`jupyterlab/`](jupyterlab/README.md) | The JupyterLab 4.5 extension, `localpilot-jupyter`: a server extension that runs the core and a labextension (bundles the core). |
+| [`jetbrains/`](jetbrains/README.md) | The JetBrains plugin for PyCharm 2026.2 (build 262+): ghost text in files and notebook cells, chat tool window (bundles the core). |
 | `chat-ui/` | The chat webview, shared by IDE clients. |
 | `rpc-client/` | TypeScript JSON-RPC client for the core. |
 
@@ -50,3 +51,16 @@ jupyter lab
 With Ollama running and the models pulled (above), ghost text appears in notebook
 cells and files, and `Alt Shift L` opens the chat. Settings, the manual smoke
 checklist and troubleshooting are in [`jupyterlab/README.md`](jupyterlab/README.md).
+
+## Quick start (PyCharm 2026.2, macOS arm64)
+
+```sh
+npm ci
+bash scripts/package-jetbrains.sh        # needs JDK 25 → dist/localpilot-jetbrains-0.1.0.zip
+```
+
+In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** →
+`dist/localpilot-jetbrains-0.1.0.zip`, then restart. With Ollama running and the
+models pulled (above), ghost text appears in files and notebook cells, and
+`Cmd+Shift+L` opens the chat tool window. Settings, the manual smoke checklist and
+known limitations are in [`jetbrains/README.md`](jetbrains/README.md).

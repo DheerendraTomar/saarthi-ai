@@ -68,3 +68,20 @@ intellijPlatform {
         }
     }
 }
+
+tasks.prepareSandbox {
+    // The release core ships loose in the plugin, at lib/bin/<triple>/localpilot-core[.exe], where
+    // resolveBinaryPath() looks for it (LocalPilotCore.pluginRoot() = the parent of the jar's lib/). Source: what
+    // scripts/build-core.sh wrote to ../dist/core/<triple>/. buildPlugin zips this sandbox directory, so runIde and the
+    // zip both get it; with no dist/core (CI, tests) nothing is copied and the coreBinaryPath setting is needed instead.
+    from(layout.projectDirectory.dir("../dist/core")) {
+        include("*/localpilot-core", "*/localpilot-core.exe")
+        filePermissions { unix("rwxr-xr-x") }
+        into(pluginName.map { "$it/lib/bin" })
+    }
+}
+
+tasks.buildPlugin {
+    // Keep the core's executable bit in the zip (LocalPilotCore also restores it at start-up if an installer drops it).
+    filesMatching("**/lib/bin/*/localpilot-core") { permissions { unix("rwxr-xr-x") } }
+}
