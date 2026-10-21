@@ -18,6 +18,74 @@
     "onStartupFinished"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localpilot",
+          "title": "LocalPilot",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localpilot": [
+        {
+          "type": "webview",
+          "id": "localpilot.chat",
+          "name": "Chat",
+          "when": "workspaceFolderCount > 0"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "localpilot.openChat",
+        "title": "Open Chat",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.newSession",
+        "title": "New Chat Session",
+        "category": "LocalPilot",
+        "icon": "$(add)"
+      },
+      {
+        "command": "localpilot.startOllama",
+        "title": "Start Ollama",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.pullModel",
+        "title": "Pull Model",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.toggleCompletions",
+        "title": "Toggle Inline Completions",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.restartCore",
+        "title": "Restart Core",
+        "category": "LocalPilot"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "localpilot.newSession",
+          "when": "view == localpilot.chat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "localpilot.openChat",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      }
+    ],
     "configuration": {
       "title": "LocalPilot",
       "properties": {

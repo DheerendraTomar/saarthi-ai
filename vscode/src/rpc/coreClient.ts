@@ -17,6 +17,7 @@ export interface CoreExit {
   signal: NodeJS.Signals | null;
 }
 
+/** `binaryPath` and `logLevel` are read on every launch, so a caller may change them before `restart()`. */
 export interface CoreClientOptions {
   /** Path of the `localpilot-core` binary, or a full command (e.g. node + fakeCore.mjs). */
   binaryPath: string | CoreCommand;
