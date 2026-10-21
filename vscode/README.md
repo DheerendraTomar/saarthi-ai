@@ -73,8 +73,8 @@ last edit). A restart ends a chat reply that is still streaming.
   panel) list the models installed in Ollama with size, family and capability hints.
   Completion models without fill-in-the-middle and chat models without tool calling
   are marked (selectable, with a warning). Picking writes `localpilot.chatModel` /
-  `localpilot.completionModel` where that value is defined (folder, workspace or
-  user settings), which restarts the core. If Ollama is down the picker says so,
+  `localpilot.completionModel` where that value is defined (workspace or user
+  settings), which restarts the core. If Ollama is down the picker says so,
   offers **Start Ollama** / **Retry**, and shows the last known list if there is one.
 - **Settings panel** (gear in the chat header): completion model, max tokens,
   debounce, context budget and adaptive on/off, plus the completion stats and
@@ -94,13 +94,26 @@ per-language bookkeeping in the core:
   (language, a prompt hash, at most 200 characters before the cursor, the
   suggestion, the outcome and timings — nothing else from your files; rotated past
   10 000 lines). Outcomes reported by VS Code:
-  - **accepted** — `Tab` accepted the whole suggestion;
-  - **partial** — part of it was taken with *Accept Next Word / Line*
-    (`Cmd+→` …), or you typed at least one whole word of it; the taken text is logged;
-  - **typedThrough** — you typed the whole suggestion yourself, key by key;
-  - **rejected** — it was dismissed or you typed something else.
-  A suggestion that is only partly taken is reported once nothing more of it
-  arrives for 2 s.
+  - **accepted** — the whole suggestion was taken: `Tab`, or stepping through all of
+    it with *Accept Next Word / Line* (`Cmd+→` …);
+  - **partial** — only part of it was taken with *Accept Next Word / Line*; the
+    taken text is logged;
+  - **typedThrough** — you typed the whole suggestion yourself, key by key
+    (auto-closed brackets and quotes are fine);
+  - **rejected** — it was dismissed, you typed something else, or you typed only
+    part of it by hand.
+  A suggestion that is partly taken is reported once nothing more of it arrives
+  for 2 s.
+- **Known biases** of these heuristics (VS Code tells extensions nothing about
+  partial accepts, so LocalPilot infers them from edits):
+  - any single edit that inserts ≥ 2 characters (with a letter or digit) matching the ghost text counts as
+    *Accept Next Word / Line* — including an IntelliSense accept or a paste that
+    happens to match it;
+  - taking part of a suggestion and pressing `Tab` more than 2 s later is logged
+    as **partial**, not accepted;
+  - after each key or partial accept VS Code asks again, and the core may serve
+    the rest as a new suggestion; each served suggestion gets its own outcome, so
+    one typing run can log several.
 - From the last 50 outcomes per language the core picks how many lines and tokens
   to generate (bounded to 1–8 lines and 16–2× `completionMaxTokens` tokens), and adds
   up to 3 recently accepted multi-line suggestions as style examples to the prompt.

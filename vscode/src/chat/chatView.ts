@@ -173,10 +173,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     try {
       await this.client.request("chat/deleteSession", { sessionId });
     } catch (e) {
-      const message =
-        (e as { code?: unknown }).code === INVALID_PARAMS
-          ? "That chat session's reply is still running. Wait for it or press Stop, then delete it."
-          : `Could not delete the chat session: ${errorMessage(e)}`;
+      // The core answers -32602 both for a running turn ("turn running …") and for an invalid id.
+      const running = (e as { code?: unknown }).code === INVALID_PARAMS && /turn running/i.test(errorMessage(e));
+      const message = running
+        ? "That chat session's reply is still running. Wait for it or press Stop, then delete it."
+        : `Could not delete the chat session: ${errorMessage(e)}`;
       if (!isCrash(e)) this.postError(message);
       return message;
     }
@@ -320,7 +321,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
           return;
         case "session/clearAll":
-          await this.inOrder("sessions", () => this.clearSessions());
+          // clearSessions already told the UI about a failure.
+          await this.inOrder("sessions", () => this.clearSessions().catch(() => undefined));
           return;
         case "completion/stats":
           return await this.inOrder("completion", () => this.postStats());
@@ -417,8 +419,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return run;
   }
 
-  /** `models/list`: core `ollama/models` + the configured choices; `ollama: "down"` with `error` when that fails. */
-  private async postModels(): Promise<void> {
+  /**
+   * `models/list`: core `ollama/models` + the configured choices; `ollama: "down"` with `error` when that fails.
+   * Also called after a palette model pick, so an open chat view shows the new choice.
+   */
+  async postModels(): Promise<void> {
+    if (!this.view) return;
     let msg: Msg;
     try {
       const models = await this.models.fetch();

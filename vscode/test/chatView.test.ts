@@ -580,6 +580,7 @@ describe("ChatViewProvider v2 relays", () => {
       if (method === "chat/deleteSession") {
         const id = (params as { sessionId: string }).sessionId;
         if (id === "busy") throw Object.assign(new Error("turn running in session busy"), { code: -32602 });
+        if (id === "../x") throw Object.assign(new Error("invalid session id ../x"), { code: -32602 });
         sessions = sessions.filter((s) => s.sessionId !== id);
         return {};
       }
@@ -604,6 +605,12 @@ describe("ChatViewProvider v2 relays", () => {
     await waitFor(() => ui.posted.some((m) => m.type === "ui/error"), 5000, "error");
     expect(ui.posted).toHaveLength(1);
     expect(String(ui.posted[0].message)).toMatch(/still running/);
+
+    // An invalid id (also -32602) is not reported as "still running".
+    ui.posted.length = 0;
+    ui.send({ type: "session/delete", sessionId: "../x" });
+    await waitFor(() => ui.posted.some((m) => m.type === "ui/error"), 5000, "invalid id error");
+    expect(ui.posted).toEqual([{ type: "ui/error", message: "Could not delete the chat session: invalid session id ../x" }]);
 
     // Deleting the last one: next is null.
     ui.posted.length = 0;
@@ -655,6 +662,17 @@ describe("ChatViewProvider v2 relays", () => {
       { type: "chat/turnState", sessionId: "s1", running: false },
       { type: "chat/turnState", sessionId: "s2", running: true },
     ]);
+  });
+
+  it("clear_all_failure_is_reported_once", async () => {
+    const { ui } = v2Setup((method, params) => {
+      if (method === "chat/clearSessions") throw new Error("disk full");
+      return defaultResponder(method, params);
+    });
+    ui.send({ type: "session/clearAll" });
+    await waitFor(() => ui.posted.some((m) => m.type === "ui/error"), 5000, "error");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ui.posted.filter((m) => m.type === "ui/error")).toEqual([{ type: "ui/error", message: "Could not clear the chat sessions: disk full" }]);
   });
 
   it("stats_relayed_to_webview", async () => {

@@ -34,7 +34,7 @@ function answerPicks(...choices: Array<string | undefined>): void {
 }
 
 function makeDeps(client: FakeChatClient) {
-  const calls = { deleted: [] as string[], cleared: 0, startOllama: 0 };
+  const calls = { deleted: [] as string[], cleared: 0, startOllama: 0, pulls: 0, refreshed: 0 };
   const deps = {
     client,
     models: new ModelCatalog(client),
@@ -46,8 +46,10 @@ function makeDeps(client: FakeChatClient) {
         calls.cleared += 1;
         return { deleted: ["s1", "s2"], skipped: [] };
       },
+      postModels: async () => void (calls.refreshed += 1),
     },
     startOllama: () => void (calls.startOllama += 1),
+    pullModel: () => void (calls.pulls += 1),
   } as unknown as CommandDeps;
   return { deps, calls };
 }
@@ -60,7 +62,7 @@ beforeEach(() => {
 describe("model pickers", () => {
   it("select_model_quick_pick_writes_setting", async () => {
     const client = new FakeChatClient((m) => (m === "ollama/models" ? { models: MODELS } : {}));
-    const { deps } = makeDeps(client);
+    const { deps, calls } = makeDeps(client);
     configValues["localpilot.completionModel"] = "qwen2.5-coder:1.5b-base";
 
     // Completion picker: every installed model, sizes + FIM hint, the current one marked.
@@ -74,6 +76,7 @@ describe("model pickers", () => {
     ]);
     // Written to the scope that defines it (none yet → user settings) + a warning for a non-FIM model.
     expect(registry.configUpdates).toEqual([{ key: "localpilot.completionModel", value: "llama3.2:3b", target: 1 }]);
+    expect(calls.refreshed).toBe(1); // an open chat view gets a fresh models/list
     expect(registry.messages.filter((m) => m.level === "warn").map((m) => m.message)).toEqual([
       expect.stringMatching(/llama3\.2:3b does not support fill-in-the-middle/),
     ]);
@@ -134,6 +137,18 @@ describe("model pickers", () => {
     expect(picks[3].options?.placeHolder).toBe("Ollama down — last known list (cannot reach Ollama at http://localhost:11434)");
     expect(picks[3].items.map((i) => i.label)).toEqual(["$(play) Start Ollama", "$(refresh) Retry", "qwen2.5-coder:1.5b-base", "llama3.2:3b"]);
     expect(registry.configUpdates).toEqual([{ key: "localpilot.chatModel", value: "llama3.2:3b", target: 1 }]);
+  });
+});
+
+describe("model picker with nothing installed", () => {
+  it("offers_pull_model_when_ollama_has_no_models", async () => {
+    const client = new FakeChatClient((m) => (m === "ollama/models" ? { models: [] } : {}));
+    const { deps, calls } = makeDeps(client);
+    answerPicks("Pull model");
+    await selectModel(deps, "completion");
+    expect(picks[0].options?.placeHolder).toBe("No models are installed in Ollama. Pull one first.");
+    expect(picks[0].items.map((i) => i.label)).toEqual(["$(cloud-download) Pull model"]);
+    expect(calls.pulls).toBe(1);
   });
 });
 

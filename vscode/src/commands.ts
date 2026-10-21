@@ -34,6 +34,8 @@ export interface CommandDeps {
     /** Deletes through the chat view so the webview drops it too; resolves to an error message when refused. */
     deleteSession(sessionId: string): Promise<string | undefined | void>;
     clearSessions(): Promise<ClearResult>;
+    /** Pushes a fresh `models/list` to an open chat view (after a palette pick). */
+    postModels?(): Promise<void>;
   };
   /** Shared `ollama/models` cache (the chat view fills it too). */
   models: ModelCatalog;
@@ -149,7 +151,10 @@ type Action = vscode.QuickPickItem & { run?: () => unknown; model?: string };
  * reached the picker says so and offers Start Ollama / Retry, above the last
  * known list if there is one.
  */
-export async function selectModel(deps: Pick<CommandDeps, "models" | "settings" | "client" | "onStatus"> & { startOllama?: () => void }, kind: ModelKind): Promise<void> {
+export async function selectModel(
+  deps: Pick<CommandDeps, "models" | "settings" | "client" | "onStatus"> & Partial<Pick<CommandDeps, "chatView">> & { startOllama?: () => void; pullModel?: () => unknown },
+  kind: ModelKind,
+): Promise<void> {
   for (;;) {
     let models: ModelInfo[];
     let error: string | undefined;
@@ -168,8 +173,17 @@ export async function selectModel(deps: Pick<CommandDeps, "models" | "settings" 
       );
     }
     for (const m of models) items.push(modelItem(m, kind, m.name === current));
+    if (error === undefined && models.length === 0) {
+      items.push({
+        label: "$(cloud-download) Pull model",
+        description: "Ollama has no models installed",
+        run: () => (deps.pullModel ?? (() => pullModel(deps as CommandDeps)))(),
+      });
+    }
     const placeHolder =
-      error === undefined
+      error === undefined && models.length === 0
+        ? "No models are installed in Ollama. Pull one first."
+        : error === undefined
         ? `${kind === "chat" ? "Chat" : "Completion"} model (current: ${current})`
         : models.length > 0
           ? `Ollama down — last known list (${error})`
@@ -183,6 +197,7 @@ export async function selectModel(deps: Pick<CommandDeps, "models" | "settings" 
     const name = picked.model;
     if (!name || name === current) return;
     await updateSetting(MODEL_SETTING[kind], name);
+    void deps.chatView?.postModels?.().catch(() => {});
     const info = models.find((m) => m.name === name);
     if (kind === "completion" && info && !info.supportsInsert) {
       void vscode.window.showWarningMessage(`LocalPilot: ${name} does not support fill-in-the-middle; inline completions will be poor. A "-base" coder model works best.`);

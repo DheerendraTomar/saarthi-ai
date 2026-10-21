@@ -236,53 +236,90 @@ describe("InlineProvider", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("typed_through_reports_typedThrough", async () => {
+  /** A provider whose core always suggests `next(position)`; `type`/`edit` drive document changes. */
+  function harness(initial: string, next: (character: number) => string) {
     const client = new FakeClient();
-    const full = "foo(1)";
     client.respond = async (_m, params) => {
       const { position } = params as { position: { line: number; character: number } };
-      return { items: [{ text: full.slice(position.character - 4), range: { start: position, end: position } }] };
+      return { items: [{ text: next(position.character), range: { start: position, end: position } }] };
     };
     const provider = new InlineProvider(client, settings());
-    const fdoc = fakeDoc(`${ROOT}/a.ts`, "x = ");
+    const fdoc = fakeDoc(`${ROOT}/a.ts`, initial);
     const ask = async (character: number) => {
       const p = provider.provideInlineCompletionItems(asDoc(fdoc), pos(0, character), ctx, tokenSource().token);
       await vi.advanceTimersByTimeAsync(120);
-      return p;
+      await p;
+      return String((client.of("completion/request").at(-1) as { requestId: string }).requestId);
     };
+    /** Inserts `text` at `character` of line 0 in one edit (replacing `replace` characters). */
+    const edit = (character: number, text: string, replace = 0) => {
+      const newText = fdoc.text.slice(0, character) + text + fdoc.text.slice(character + replace);
+      provider.onDidChangeTextDocument(changeEvent(fdoc, newText, range(0, character, 0, character + replace), text) as never);
+    };
+    const outcomes = () => client.of("completion/outcome") as Array<{ requestId: string; outcome: string; acceptedText?: string }>;
+    const rejected = () => (client.of("completion/rejected") as Array<{ requestId: string }>).map((r) => r.requestId);
+    return { client, provider, fdoc, ask, edit, outcomes, rejected };
+  }
 
-    // The user types the suggestion one key at a time; VS Code asks again after each key.
-    await ask(4);
-    let text = "x = ";
-    for (const ch of full) {
-      provider.onDidChangeTextDocument(changeEvent(fdoc, (text += ch), range(0, text.length - 1, 0, text.length - 1), ch) as never);
-      await ask(text.length);
+  it("typed_through_reports_typedThrough", async () => {
+    const full = "foo(1)";
+    const h = harness("x = ", (c) => full.slice(c - 4));
+    // Typed by hand, VS Code asking again after each key: f, o, o, then "(" auto-closes to "()",
+    // "1" goes inside, and ")" types over the auto-closed one.
+    const first = await h.ask(4);
+    for (const [at, text, replace] of [
+      [4, "f", 0],
+      [5, "o", 0],
+      [6, "o", 0],
+      [7, "()", 0],
+      [8, "1", 0],
+      [9, ")", 1],
+    ] as Array<[number, string, number]>) {
+      h.edit(at, text, replace);
+      await h.ask(at + 1);
     }
     await vi.advanceTimersByTimeAsync(2000);
-    const outcomes = client.of("completion/outcome") as Array<{ requestId: string; outcome: string }>;
-    expect(outcomes.find((o) => o.requestId === "1")).toEqual({ requestId: "1", outcome: "typedThrough" });
-    expect(client.of("completion/rejected")).not.toContainEqual({ requestId: "1" });
-    expect(client.of("completion/accepted")).toEqual([]);
+    expect(h.outcomes().find((o) => o.requestId === first)).toEqual({ requestId: first, outcome: "typedThrough" });
+    expect(h.rejected()).not.toContain(first);
+    expect(h.client.of("completion/accepted")).toEqual([]);
+    expect(h.outcomes().map((o) => o.outcome)).not.toContain("partial");
 
-    // Typing only part of a word, then something else: rejected (no word was gained).
-    const before = (client.of("completion/rejected") as unknown[]).length;
-    fdoc.text = "y = ";
-    await ask(4); // #8 shown: "foo(1)"
-    provider.onDidChangeTextDocument(changeEvent(fdoc, "y = f", range(0, 4, 0, 4), "f") as never);
-    provider.onDidChangeTextDocument(changeEvent(fdoc, "y = fx", range(0, 5, 0, 5), "x") as never);
-    expect((client.of("completion/rejected") as unknown[]).slice(before)).toContainEqual({ requestId: "8" });
-    expect((client.of("completion/outcome") as Array<{ requestId: string }>).filter((o) => o.requestId === "8")).toEqual([]);
+    // A suggestion ending in a newline: its text then Enter (auto-indented) is still typed through.
+    const g = harness("z = ", () => "go()\n");
+    const id = await g.ask(4);
+    for (const [i, ch] of [..."go"].entries()) g.edit(4 + i, ch);
+    g.edit(6, "()");
+    g.edit(8, ")", 1);
+    g.edit(8, "\n    ");
+    expect(g.outcomes()).toContainEqual({ requestId: id, outcome: "typedThrough" });
+  });
 
-    // A suggestion ending in a newline: typing its text and then Enter (auto-indented) is still typed through.
-    client.respond = async (_m, params) => {
-      const { position } = params as { position: { line: number; character: number } };
-      return { items: [{ text: "go()\n", range: { start: position, end: position } }] };
-    };
-    fdoc.text = "z = ";
-    await ask(4); // #9
-    let typed = "z = ";
-    for (const ch of "go()") provider.onDidChangeTextDocument(changeEvent(fdoc, (typed += ch), range(0, typed.length - 1, 0, typed.length - 1), ch) as never);
-    provider.onDidChangeTextDocument(changeEvent(fdoc, typed + "\n    ", range(0, typed.length, 0, typed.length), "\n    ") as never);
-    expect(client.of("completion/outcome")).toContainEqual({ requestId: "9", outcome: "typedThrough" });
+  it("hand_typed_word_then_divergence_reports_rejected", async () => {
+    const h = harness("x = ", () => "value + 1");
+    const id = await h.ask(4);
+    for (const [i, ch] of [..."value "].entries()) h.edit(4 + i, ch);
+    h.edit(10, "-"); // not "+": diverged after a whole word typed by hand
+    expect(h.rejected()).toEqual([id]);
+    expect(h.outcomes()).toEqual([]);
+
+    // Part of a word, then something else: rejected too.
+    const g = harness("y = ", () => "foo(1)");
+    const id2 = await g.ask(4);
+    g.edit(4, "f");
+    g.edit(5, "x");
+    expect(g.rejected()).toEqual([id2]);
+  });
+
+  it("stepping_through_whole_suggestion_reports_accepted", async () => {
+    const h = harness("x = ", () => "compute(a, b)");
+    const id = await h.ask(4);
+    // accept-next-word three times covers the whole suggestion; no item command runs.
+    h.edit(4, "compute");
+    h.edit(11, "(a,");
+    h.edit(14, " b)");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.outcomes()).toEqual([{ requestId: id, outcome: "accepted", acceptedText: "compute(a, b)" }]);
+    expect(h.rejected()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

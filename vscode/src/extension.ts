@@ -130,6 +130,7 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
       newSession: () => chatView.newSession(),
       deleteSession: (id) => chatView.deleteSession(id),
       clearSessions: () => chatView.clearSessions(),
+      postModels: () => chatView.postModels(),
     },
     models,
     reportAccepted: (id) => inline.reportAccepted(id),

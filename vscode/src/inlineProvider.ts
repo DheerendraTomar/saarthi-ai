@@ -79,7 +79,7 @@ interface Tracked {
   gained: string;
   /** What was there when shown (progress means gaining more). */
   baseline: number;
-  /** Some gain arrived as one multi-character edit with a word in it: VS Code's accept-next-word/line (or Tab, which also runs the command). */
+  /** Some gain arrived as a chunk (one edit of ≥ 2 characters): accept-next-word/line, Tab, or a matching IntelliSense accept. */
   chunked: boolean;
   timer?: ReturnType<typeof setTimeout>;
 }
@@ -96,16 +96,24 @@ function offsetAt(text: string, line: number, character: number): number {
   return Math.min(offset + character, eol < 0 ? text.length : eol);
 }
 
-const WORD = /\w/;
-
-/** `gained` holds at least one whole word of `suggestion` (it does not stop mid-word). */
-function hasWholeWord(gained: string, suggestion: string): boolean {
-  if (!WORD.test(gained)) return false;
-  const last = gained[gained.length - 1];
-  const next = suggestion[gained.length];
-  if (next === undefined || !WORD.test(last) || !WORD.test(next)) return true;
-  // Stops mid-word: count only the words before the one being typed.
-  return WORD.test(gained.replace(/\w+$/, ""));
+/**
+ * The part of `middle` that is a prefix of `suggestion`, allowing trailing
+ * auto-closed brackets/quotes the suggestion still has later (typing `foo(`
+ * gives `foo()` while the suggestion is `foo(1)`); undefined once it diverged.
+ */
+function matchedPrefix(middle: string, suggestion: string): string | undefined {
+  if (suggestion.startsWith(middle)) return middle;
+  const closers = /[)\]}"'`]+$/.exec(middle);
+  if (!closers) return undefined;
+  const prefix = middle.slice(0, closers.index);
+  if (!suggestion.startsWith(prefix)) return undefined;
+  let rest = suggestion.slice(prefix.length);
+  for (const c of closers[0]) {
+    const i = rest.indexOf(c);
+    if (i < 0) return undefined;
+    rest = rest.slice(i + 1);
+  }
+  return prefix;
 }
 
 /**
@@ -116,13 +124,17 @@ function hasWholeWord(gained: string, suggestion: string): boolean {
  *
  * Shown items are also watched through document changes
  * (`onDidChangeTextDocument`), since VS Code runs no command for a partial
- * accept: once the text between the item's surroundings stops being a prefix
- * of the suggestion, or {@link OUTCOME_IDLE_MS} pass without progress, the
- * outcome goes out as `completion/outcome`:
- * - `typedThrough`: the whole suggestion (up to trailing whitespace) arrived one key at a time;
- * - `partial` (with `acceptedText`): part of it arrived through accept-next-word/line
- *   (a multi-character edit with a word in it), or at least one whole word of it was typed;
- * - otherwise `completion/rejected`.
+ * accept. A "chunk" is one edit inserting ≥ 2 characters (with a letter or
+ * digit) that extends the suggestion: accept-next-word/line, Tab — and, a
+ * known bias, an IntelliSense accept that matches the ghost text. Once the
+ * text between the item's surroundings stops matching the suggestion, or
+ * {@link OUTCOME_IDLE_MS} pass without progress, the outcome goes out:
+ * - whole suggestion (up to trailing whitespace) with a chunk → `completion/outcome accepted`
+ *   (stepped through with accept-next-word/line; Tab reports `completion/accepted` first);
+ * - whole suggestion, key by key → `completion/outcome typedThrough`;
+ * - part of it with a chunk → `completion/outcome partial` with `acceptedText`;
+ * - otherwise (untouched, or only typed by hand) → `completion/rejected`.
+ * The core serves one item per request; the first item is the one watched.
  */
 export class InlineProvider implements vscode.InlineCompletionItemProvider {
   private readonly debouncer: Debouncer;
@@ -213,20 +225,19 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
     if (this.tracked.size === 0) return;
     const uri = e.document.uri.toString();
     let text: string | undefined;
+    const inserted = e.contentChanges.length === 1 ? e.contentChanges[0].text : "";
     for (const t of [...this.tracked.values()]) {
       if (t.uri !== uri) continue;
       text ??= e.document.getText();
       const fits = text.length >= t.before.length + t.after.length && text.startsWith(t.before) && text.endsWith(t.after);
       const middle = fits ? text.slice(t.before.length, text.length - t.after.length) : undefined;
-      if (middle === undefined || !t.suggestion.startsWith(middle)) {
+      const prefix = middle === undefined ? undefined : matchedPrefix(middle, t.suggestion);
+      if (prefix === undefined) {
         this.finish(t);
         continue;
       }
-      if (middle.length > t.gained.length && middle.startsWith(t.gained)) {
-        const added = middle.slice(t.gained.length);
-        if (added.length > 1 && WORD.test(added)) t.chunked = true;
-      }
-      t.gained = middle;
+      if (prefix.length >= t.gained.length + 2 && /\w/.test(inserted) && inserted.length >= 2) t.chunked = true;
+      t.gained = prefix;
       this.armTimer(t);
     }
   }
@@ -278,9 +289,11 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
     const progressed = gained.length > t.baseline;
     // Trailing whitespace/newlines are not required (Enter auto-indents differently).
     const whole = gained.trimEnd() === suggestion.trimEnd();
-    if (progressed && whole && !t.chunked) {
+    if (progressed && whole && t.chunked) {
+      this.client.notify("completion/outcome", { requestId, outcome: "accepted", acceptedText: suggestion });
+    } else if (progressed && whole) {
       this.client.notify("completion/outcome", { requestId, outcome: "typedThrough" });
-    } else if (progressed && (t.chunked || hasWholeWord(gained, suggestion))) {
+    } else if (progressed && t.chunked) {
       this.client.notify("completion/outcome", { requestId, outcome: "partial", acceptedText: gained });
     } else {
       this.client.notify("completion/rejected", { requestId });
