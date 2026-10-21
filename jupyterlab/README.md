@@ -10,6 +10,11 @@ halves:
 - a **JupyterLab extension**: ghost-text completions in notebook cells and files, a
   chat sidebar (the same chat UI as VS Code), commands and a status-bar item.
 
+The chat panel's v2 controls (model pickers, Settings panel with completion stats,
+session Delete / Clear all) are not wired in JupyterLab yet — they show "Loading…"
+or do nothing; coming in the next update. Change models and settings in the
+Settings Editor meanwhile.
+
 ## Install
 
 LocalPilot is not on PyPI; build the wheel from this repo and install it into the
@@ -23,10 +28,10 @@ script needs).
 ```sh
 pip install "jupyterlab>=4.5,<5"           # provides jlpm
 npm ci                                     # once, from the repo root
-bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.1.0-py3-none-any.whl
-pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.1.0-py3-none-any.whl
+bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.1.1-py3-none-any.whl
+pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.1.1-py3-none-any.whl
 jupyter server extension list              # → localpilot_jupyter enabled, OK
-jupyter labextension list                  # → localpilot-jupyter v0.1.0 enabled OK
+jupyter labextension list                  # → localpilot-jupyter v0.1.1 enabled OK
 ```
 
 `--no-deps` keeps pip from reinstalling (or upgrading) JupyterLab and the rest of
