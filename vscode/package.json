@@ -2,7 +2,7 @@
   "name": "localpilot",
   "displayName": "LocalPilot",
   "description": "Copilot-style inline completions and agent chat, running entirely on your machine via Ollama.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "localpilot",
   "private": true,
   "license": "MIT",
@@ -68,6 +68,36 @@
         "command": "localpilot.restartCore",
         "title": "Restart Core",
         "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.selectChatModel",
+        "title": "Select Chat Model",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.selectCompletionModel",
+        "title": "Select Completion Model",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.deleteSession",
+        "title": "Delete Chat Session",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.clearSessions",
+        "title": "Clear All Chat Sessions",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.resetLearning",
+        "title": "Reset Completion Learning",
+        "category": "LocalPilot"
+      },
+      {
+        "command": "localpilot.showCompletionStats",
+        "title": "Show Completion Stats",
+        "category": "LocalPilot"
       }
     ],
     "menus": {
@@ -94,6 +124,30 @@
         },
         {
           "command": "localpilot.restartCore",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.selectChatModel",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.selectCompletionModel",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.deleteSession",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.clearSessions",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.resetLearning",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.showCompletionStats",
           "when": "workspaceFolderCount > 0"
         }
       ],
@@ -193,6 +247,11 @@
           ],
           "default": "info",
           "description": "Core log level (logs go to <workspace>/.localpilot/core.log)."
+        },
+        "localpilot.adaptiveCompletions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Adapt inline completion length and add style examples from your past accepts/rejects (logged locally in <workspace>/.localpilot/completions.jsonl). Off: the configured limits, no examples; outcomes are still logged."
         }
       }
     }

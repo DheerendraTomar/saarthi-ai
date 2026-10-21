@@ -15,6 +15,7 @@
 //   FAKE_INDEX_FIRST=1                send `index/ready` before the `initialize` response (a race the
 //                                     README tells clients to handle)
 //   FAKE_PULL_FAIL=1                  `ollama/pull` streams progress, then fails with RPC error -32000
+//                                     (FAKE_OLLAMA=down also makes `ollama/models` fail with -32000)
 //
 // Behaviour:
 //   initialize          → { capabilities, ollamaStatus: { ollama, detail }, indexStatus: "building" },
@@ -36,9 +37,16 @@
 //   ollama/status       → the current status
 //   ollama/pull         → 3 `ollama/pullProgress` notifications then {} (status becomes ok, `status` sent);
 //                          with FAKE_PULL_FAIL=1 → error -32000 after the progress
+//   ollama/models       → { models: [2 fake models, one without supportsInsert] }; Ollama down → -32000
+//   chat/deleteSession  → {} (drops the session); -32602 "turn running …" while its turn runs
+//   chat/clearSessions  → { deleted: n, skipped: [running session ids] } (running sessions are kept)
+//   completion/stats    → { languages: { typescript: { served, accepted, … } }, logPath, adaptive }
+//                          (counts the completion/accepted|rejected|outcome notifications received)
+//   completion/resetLearning → {} (zeroes those counts)
 //   shutdown            → {} then exit 0
 //   requests before initialize → -32600; unknown methods → -32601
-//   notifications (textDocument/*, completion/cancel, …) are accepted silently; stdin EOF → exit 0
+//   notifications (textDocument/*, completion/cancel, completion/outcome, …) are accepted silently
+//   (completion outcomes are counted for completion/stats); stdin EOF → exit 0
 // Every received method is logged to stderr as `fake-core: <method>`.
 
 import { createInterface } from "node:readline";
@@ -76,6 +84,19 @@ let sessionCounter = 0;
 let toolCallCounter = 0;
 let clock = 1_700_000_000_000;
 const sessions = new Map([["fake-session", { title: "Earlier chat", updatedAtMs: clock, messages: [] }]]);
+const FAKE_MODELS = [
+  { name: "qwen2.5-coder:0.5b-base", sizeBytes: 397_000_000, family: "qwen2", supportsInsert: true, supportsTools: false },
+  { name: "qwen3.8:27b-mlx", sizeBytes: 17_000_000_000, family: "qwen3", supportsInsert: false, supportsTools: true },
+];
+const emptyCounts = () => ({ served: 0, accepted: 0, partial: 0, rejected: 0, typedThrough: 0 });
+let outcomeCounts = emptyCounts();
+const OUTCOME_OF = { "completion/accepted": "accepted", "completion/rejected": "rejected" };
+function countOutcome(method, params) {
+  const outcome = method === "completion/outcome" ? params?.outcome : OUTCOME_OF[method];
+  if (!(outcome in outcomeCounts) || outcome === "served") return;
+  outcomeCounts[outcome] += 1;
+  outcomeCounts.served += 1;
+}
 const touchSession = (sessionId, title) => {
   let s = sessions.get(sessionId);
   if (!s) sessions.set(sessionId, (s = { title: title ?? "New chat", updatedAtMs: 0, messages: [] }));
@@ -231,6 +252,39 @@ async function handleRequest(msg) {
       }
       return;
     }
+    case "ollama/models":
+      if (ollamaStatus.ollama === "down") return fail(id, -32000, DETAILS.down);
+      return respond(id, { models: FAKE_MODELS });
+    case "chat/deleteSession": {
+      const sessionId = params?.sessionId;
+      if (typeof sessionId !== "string" || !sessionId) return fail(id, -32602, "invalid session id");
+      if (running.has(sessionId)) return fail(id, -32602, `turn running in session ${sessionId}`);
+      sessions.delete(sessionId);
+      return respond(id, {});
+    }
+    case "chat/clearSessions": {
+      let deleted = 0;
+      for (const sessionId of [...sessions.keys()]) {
+        if (running.has(sessionId)) continue;
+        sessions.delete(sessionId);
+        deleted += 1;
+      }
+      return respond(id, { deleted, skipped: [...running] });
+    }
+    case "completion/stats": {
+      const c = outcomeCounts;
+      const acceptRate = c.served ? (c.accepted + c.partial) / c.served : 0;
+      return respond(id, {
+        languages: c.served
+          ? { typescript: { ...c, acceptRate, learnedMaxLines: 8, learnedNumPredict: 32, examples: 0 } }
+          : {},
+        logPath: join(workspace, ".localpilot", "completions.jsonl"),
+        adaptive: true,
+      });
+    }
+    case "completion/resetLearning":
+      outcomeCounts = emptyCounts();
+      return respond(id, {});
     case "shutdown":
       respond(id, {});
       if (!IGNORE_SHUTDOWN) process.exit(0);
@@ -252,6 +306,7 @@ rl.on("line", (line) => {
   if (typeof msg.method === "string") {
     log(msg.method);
     if (msg.id !== undefined && msg.id !== null) void handleRequest(msg);
+    else countOutcome(msg.method, msg.params);
     return;
   }
   // A response to one of our core→client requests.

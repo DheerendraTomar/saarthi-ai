@@ -11,7 +11,7 @@ import { pullModel, type CommandDeps } from "../src/commands";
 import { DEFAULT_SETTINGS } from "../src/settings";
 import { StatusBar } from "../src/statusBar";
 import { fakeWebviewView, FakeChatClient, waitFor } from "./helpers/webview";
-import { configValues, editorEvents, registry, resetMock, Uri, workspace, workspaceConfigKeys, type MockStatusBarItem } from "./mocks/vscode";
+import { configValues, editorEvents, registry, resetMock, Uri, window, workspace, workspaceConfigKeys, type MockStatusBarItem } from "./mocks/vscode";
 
 const extensionPath = dirname(dirname(fileURLToPath(import.meta.url)));
 let dir: string;
@@ -65,6 +65,12 @@ describe("activate", () => {
         "localpilot.startOllama",
         "localpilot.statusMenu",
         "localpilot.toggleCompletions",
+        "localpilot.selectChatModel",
+        "localpilot.selectCompletionModel",
+        "localpilot.deleteSession",
+        "localpilot.clearSessions",
+        "localpilot.resetLearning",
+        "localpilot.showCompletionStats",
       ].sort(),
     );
     expect(registry.inlineProviders.map((p) => p.selector)).toEqual([{ pattern: "**" }]);
@@ -110,6 +116,31 @@ describe("activate", () => {
     expect(registry.configUpdates).toEqual([{ key: "localpilot.completionsEnabled", value: false, target: 1 }]);
     api.statusBar.setStatus({ ollama: "ok", detail: "" });
     expect(item().text).toBe("$(debug-pause) completions paused");
+  });
+
+  it("v2_messages_reach_the_fake_core_end_to_end", async () => {
+    const api = start();
+    await api.ready;
+    const ui = fakeWebviewView();
+    api.chatView.resolveWebviewView(ui.view);
+    ui.send({ type: "models/list" });
+    ui.send({ type: "completion/stats" });
+    await waitFor(() => ui.posted.some((m) => m.type === "models/list") && ui.posted.some((m) => m.type === "completion/stats"), 5000, "v2 replies");
+    const list = ui.posted.find((m) => m.type === "models/list") as { models: Array<{ name: string }>; ollama: string };
+    expect(list.models.map((m) => m.name)).toEqual(["qwen2.5-coder:0.5b-base", "qwen3.8:27b-mlx"]);
+    expect(list.ollama).toBe("ok");
+    expect(ui.posted.find((m) => m.type === "completion/stats")).toMatchObject({ stats: { adaptive: true, languages: {} } });
+
+    // The palette picker uses the same core call; the status menu offers it.
+    let offered: string[] = [];
+    window.showQuickPick = (async (items: Array<{ label: string }>) => {
+      offered = (await items).map((i) => i.label);
+      return undefined;
+    }) as typeof window.showQuickPick;
+    await registry.commands.get("localpilot.statusMenu")!();
+    expect(offered).toEqual(expect.arrayContaining(["$(comment) Chat model", "$(symbol-snippet) Completion model", "$(graph) Completion stats"]));
+    await registry.commands.get("localpilot.selectCompletionModel")!();
+    expect(offered).toEqual(["$(check) qwen2.5-coder:0.5b-base", "qwen3.8:27b-mlx"]);
   });
 
   it("settings_change_restarts_core_debounced", async () => {

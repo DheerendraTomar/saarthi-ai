@@ -210,6 +210,8 @@ export const registry = {
   clipboard: "",
   configUpdates: [] as Array<{ key: string; value: unknown; target: unknown }>,
   progress: [] as Array<{ message?: string; increment?: number }>,
+  /** Answers for the next `showWarningMessage` calls (a button label, or undefined = dismissed), consumed in order. */
+  warningAnswers: [] as unknown[],
 };
 
 function disposable(fn: () => void = () => {}) {
@@ -323,7 +325,7 @@ export const window = {
   },
   async showWarningMessage(message: string): Promise<unknown> {
     registry.messages.push({ level: "warn", message });
-    return undefined;
+    return registry.warningAnswers.shift();
   },
   async showErrorMessage(message: string): Promise<unknown> {
     registry.messages.push({ level: "error", message });
@@ -379,6 +381,7 @@ export function resetMock(): void {
   registry.clipboard = "";
   registry.configUpdates.length = 0;
   registry.progress.length = 0;
+  registry.warningAnswers.length = 0;
   workspaceFns.applyEdit = defaultApplyEdit;
   workspaceFns.openTextDocument = defaultOpenTextDocument;
   window.activeTextEditor = undefined;

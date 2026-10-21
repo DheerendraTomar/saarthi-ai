@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { syncUri } from "../documentSync";
+import { isModelKind, MODEL_SETTING, ModelCatalog } from "../models";
 import type { CoreClient } from "../rpc/coreClient";
+import { readSettings, updateSetting, type Settings } from "../settings";
 
 export const CHAT_VIEW_TYPE = "localpilot.chat";
 
@@ -31,6 +33,18 @@ export interface ChatViewDeps {
   pullModel: (model: string) => Promise<void>;
   /** Called when the first chat turn starts (true) and when the last one ends (false). */
   onChatActiveChanged?: (active: boolean) => void;
+  /** Shared `ollama/models` cache (the palette pickers use the same one); one of our own by default. */
+  models?: ModelCatalog;
+}
+
+/** The settings the chat UI's settings panel edits with `settings/set` (the completion model goes through `model/select`). */
+const PANEL_NUMBERS = ["completionMaxTokens", "completionDebounceMs", "completionContextTokens"] as const;
+const PANEL_BOOLEANS = ["adaptiveCompletions"] as const;
+
+/** What `chat/deleteSession` / `chat/clearSessions` did, for the palette commands. */
+export interface ClearResult {
+  deleted: string[];
+  skipped: string[];
 }
 
 type Msg = Record<string, unknown> & { type: string };
@@ -80,6 +94,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private readonly pendingCalls = new Map<string, Map<string, Record<string, unknown>>>();
   private lastActiveFile = "";
+  private readonly models: ModelCatalog;
+  /** Per-topic chains: messages of one topic are handled in order (e.g. resetLearning before the stats that follow it). */
+  private readonly chains = new Map<string, Promise<unknown>>();
   private readonly subscriptions: vscode.Disposable[] = [];
   private viewSubscriptions: vscode.Disposable[] = [];
 
@@ -87,6 +104,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     private readonly client: ChatClient,
     private readonly deps: ChatViewDeps,
   ) {
+    this.models = deps.models ?? new ModelCatalog(client);
     for (const method of RELAYED) {
       this.subscriptions.push(client.onNotification(method, (params) => this.onCoreNotification(method, params)));
     }
@@ -142,6 +160,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     } catch (e) {
       this.postError(`Could not start a new session: ${errorMessage(e)}`);
     }
+  }
+
+  /**
+   * Core `chat/deleteSession`. On success the UI gets `session/deleted { sessionId, next }`
+   * (next = the most recent remaining session) and then the refreshed `session/list`;
+   * if the core refuses (the session's turn is running) it gets a `ui/error` saying so.
+   * Returns that error message, or undefined on success.
+   */
+  async deleteSession(sessionId: string): Promise<string | undefined> {
+    try {
+      await this.client.request("chat/deleteSession", { sessionId });
+    } catch (e) {
+      const message =
+        (e as { code?: unknown }).code === INVALID_PARAMS
+          ? "That chat session's reply is still running. Wait for it or press Stop, then delete it."
+          : `Could not delete the chat session: ${errorMessage(e)}`;
+      if (!isCrash(e)) this.postError(message);
+      return message;
+    }
+    this.forgetSession(sessionId);
+    const remaining = await this.fetchSessions().catch(() => this.sessions.filter((s) => s.sessionId !== sessionId));
+    const next = remaining.find((s) => s.sessionId !== sessionId)?.sessionId ?? null;
+    if (this.current === sessionId) this.current = next;
+    this.post({ type: "session/deleted", sessionId, next });
+    this.sessions = remaining;
+    this.post({ type: "session/list", sessions: remaining, current: this.current });
+    return undefined;
+  }
+
+  /**
+   * Core `chat/clearSessions`: one `session/deleted` per deleted session (next = the most
+   * recent survivor, i.e. a session whose turn is running, or null), a notice for the kept
+   * ones, then the refreshed `session/list`.
+   */
+  async clearSessions(): Promise<ClearResult> {
+    const before = await this.fetchSessions().catch(() => this.sessions);
+    let skipped: string[];
+    try {
+      ({ skipped } = await this.client.request<{ deleted: number; skipped: string[] }>("chat/clearSessions", {}));
+    } catch (e) {
+      if (!isCrash(e)) this.postError(`Could not clear the chat sessions: ${errorMessage(e)}`);
+      throw e;
+    }
+    skipped = Array.isArray(skipped) ? skipped : [];
+    const after = await this.fetchSessions().catch(() => before.filter((s) => skipped.includes(s.sessionId)));
+    const survivors = new Set(after.map((s) => s.sessionId));
+    const deleted = before.map((s) => s.sessionId).filter((id) => !survivors.has(id));
+    const next = after[0]?.sessionId ?? null;
+    for (const id of deleted) {
+      this.forgetSession(id);
+      if (this.current === id) this.current = next;
+      this.post({ type: "session/deleted", sessionId: id, next });
+    }
+    if (skipped.length > 0) {
+      const n = skipped.length;
+      this.postError(`${n} session${n === 1 ? "" : "s"} with a running reply ${n === 1 ? "was" : "were"} kept.`);
+    }
+    this.sessions = after;
+    this.post({ type: "session/list", sessions: after, current: this.current });
+    return { deleted, skipped };
   }
 
   dispose(): void {
@@ -226,6 +304,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         case "ollama/pull":
           await this.deps.pullModel(typeof msg.model === "string" ? msg.model : "");
           return;
+        case "models/list":
+          return await this.postModels();
+        case "model/select":
+          return await this.inOrder("settings", () => this.selectModel(msg.kind, msg.name));
+        case "settings/get":
+          return this.postSettings();
+        case "settings/set":
+          return await this.inOrder("settings", () => this.applySettings(msg.patch));
+        case "session/delete":
+          if (typeof msg.sessionId === "string") {
+            const id = msg.sessionId;
+            await this.inOrder("sessions", () => this.deleteSession(id));
+          }
+          return;
+        case "session/clearAll":
+          await this.inOrder("sessions", () => this.clearSessions());
+          return;
+        case "completion/stats":
+          return await this.inOrder("completion", () => this.postStats());
+        case "completion/resetLearning":
+          return await this.inOrder("completion", () => this.client.request("completion/resetLearning", {}));
         default:
           return; // ui/openDiff and unknown messages: nothing to do
       }
@@ -296,7 +395,105 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     await this.postHistory(sessionId);
   }
 
+  // ------------------------------------------------------------ models, settings, stats
+
+  /** Runs `fn` after every earlier call with the same `topic` has settled. */
+  private inOrder<T>(topic: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.chains.get(topic) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const settled = run.then(
+      () => {},
+      () => {},
+    );
+    this.chains.set(topic, settled);
+    void settled.then(() => {
+      if (this.chains.get(topic) === settled) this.chains.delete(topic);
+    });
+    return run;
+  }
+
+  /** `models/list`: core `ollama/models` + the configured choices; `ollama: "down"` with `error` when that fails. */
+  private async postModels(): Promise<void> {
+    let msg: Msg;
+    try {
+      const models = await this.models.fetch();
+      // Ollama answered, so a stale "down" status no longer applies; "modelMissing" still does.
+      const ollama = this.status?.ollama === "modelMissing" ? "modelMissing" : "ok";
+      msg = { type: "models/list", models, current: this.currentModels(), ollama };
+    } catch (e) {
+      msg = { type: "models/list", models: [], current: this.currentModels(), ollama: "down", error: errorMessage(e) };
+    }
+    this.post(msg);
+  }
+
+  private currentModels(): { chat: string; completion: string } {
+    const s = readSettings();
+    return { chat: s.chatModel, completion: s.completionModel };
+  }
+
+  /** `model/select`: writes the chat/completion model setting (the core restarts), then always answers `models/list`. */
+  private async selectModel(kind: unknown, name: unknown): Promise<void> {
+    if (isModelKind(kind) && typeof name === "string" && name.trim()) {
+      try {
+        await updateSetting(MODEL_SETTING[kind], name.trim());
+      } catch (e) {
+        this.postError(`Could not save the ${kind} model: ${errorMessage(e)}`);
+      }
+    }
+    await this.postModels();
+  }
+
+  private postSettings(): void {
+    const s = readSettings();
+    this.post({
+      type: "settings/current",
+      settings: {
+        completionModel: s.completionModel,
+        completionMaxTokens: s.completionMaxTokens,
+        completionDebounceMs: s.completionDebounceMs,
+        completionContextTokens: s.completionContextTokens,
+        adaptiveCompletions: s.adaptiveCompletions,
+      },
+    });
+  }
+
+  /** `settings/set { patch }`: writes the panel's keys (others are ignored), then always answers `settings/current`. */
+  private async applySettings(patch: unknown): Promise<void> {
+    const p = (typeof patch === "object" && patch !== null ? patch : {}) as Record<string, unknown>;
+    const writes: Array<[keyof Settings, unknown]> = [];
+    for (const key of PANEL_NUMBERS) {
+      const v = p[key];
+      if (typeof v === "number" && Number.isFinite(v) && v >= 0) writes.push([key, Math.round(v)]);
+    }
+    for (const key of PANEL_BOOLEANS) if (typeof p[key] === "boolean") writes.push([key, p[key]]);
+    for (const [key, value] of writes) {
+      try {
+        await updateSetting(key, value);
+      } catch (e) {
+        this.postError(`Could not save ${key}: ${errorMessage(e)}`);
+      }
+    }
+    this.postSettings();
+  }
+
+  private async postStats(): Promise<void> {
+    const stats = await this.client.request("completion/stats", {});
+    this.post({ type: "completion/stats", stats });
+  }
+
   // ------------------------------------------------------------ helpers
+
+  private async fetchSessions(): Promise<SessionSummary[]> {
+    const { sessions } = await this.client.request<{ sessions: SessionSummary[] }>("chat/listSessions", {});
+    return sessions;
+  }
+
+  /** Drops the host's per-session bookkeeping for a deleted session. */
+  private forgetSession(sessionId: string): void {
+    this.pendingCalls.delete(sessionId);
+    for (const [id, sid] of this.toolCallSessions) if (sid === sessionId) this.toolCallSessions.delete(id);
+    if (this.endTurn(sessionId)) this.post({ type: "chat/done", sessionId, stopReason: "stopped" });
+  }
 
   private async postSessionList(): Promise<void> {
     const { sessions } = await this.client.request<{ sessions: SessionSummary[] }>("chat/listSessions", {});

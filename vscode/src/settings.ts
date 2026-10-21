@@ -25,6 +25,8 @@ export interface Settings {
   completionContextTokens: number;
   chatContextTokens: number;
   logLevel: string;
+  /** Let the core adapt completion length and add style examples from past outcomes (read by the core at `initialize`). */
+  adaptiveCompletions: boolean;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -40,6 +42,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   completionContextTokens: 3584,
   chatContextTokens: 24000,
   logLevel: "info",
+  adaptiveCompletions: true,
 });
 
 export function readSettings(): Settings {
@@ -49,6 +52,23 @@ export function readSettings(): Settings {
     out[key] = cfg.get(key, DEFAULT_SETTINGS[key]);
   }
   return out as unknown as Settings;
+}
+
+/**
+ * Writes `localpilot.<key>` to the scope its effective value comes from
+ * (workspace folder, workspace, else user settings), so a workspace override
+ * can never turn the write into a no-op.
+ */
+export async function updateSetting(key: keyof Settings, value: unknown): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("localpilot");
+  const where = cfg.inspect(key);
+  const target =
+    where?.workspaceFolderValue !== undefined
+      ? vscode.ConfigurationTarget.WorkspaceFolder
+      : where?.workspaceValue !== undefined
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+  await cfg.update(key, value, target);
 }
 
 /** Rust target triple of the bundled core for this platform, if we ship one. */

@@ -60,10 +60,56 @@ down or a model is missing; the status bar item opens a menu with them too.
 | `localpilot.allowedCommandsAlways` | `[]` | Commands approved with **Always**; the agent runs these without asking. |
 | `localpilot.coreBinaryPath` | `""` | Use this `localpilot-core` binary instead of the bundled one. |
 | `localpilot.logLevel` | `info` | Core log level (`error` … `trace`). |
+| `localpilot.adaptiveCompletions` | `true` | Adapt completion length and add style examples from your past accept/reject outcomes (see below). `false`: the configured limits and no examples; outcomes are still logged. |
 
 The core reads its settings only when it starts, so changing any setting except
 `completionsEnabled` and `completionDebounceMs` restarts it (once, 0.5 s after the
 last edit). A restart ends a chat reply that is still streaming.
+
+## Models, sessions and the settings panel
+
+- **Pick a model**: **LocalPilot: Select Chat Model** / **Select Completion Model**
+  (also in the status bar menu, and the model picker in the chat header / Settings
+  panel) list the models installed in Ollama with size, family and capability hints.
+  Completion models without fill-in-the-middle and chat models without tool calling
+  are marked (selectable, with a warning). Picking writes `localpilot.chatModel` /
+  `localpilot.completionModel` where that value is defined (folder, workspace or
+  user settings), which restarts the core. If Ollama is down the picker says so,
+  offers **Start Ollama** / **Retry**, and shows the last known list if there is one.
+- **Settings panel** (gear in the chat header): completion model, max tokens,
+  debounce, context budget and adaptive on/off, plus the completion stats and
+  **Reset learning**. Edits are saved to the scope that defines each setting.
+- **Delete chat sessions**: the session list in the chat view (or **LocalPilot:
+  Delete Chat Session**) deletes one session's file from `.localpilot/sessions/`;
+  a session whose reply is still running cannot be deleted (stop it first).
+  **LocalPilot: Clear All Chat Sessions** deletes all of them after a confirmation,
+  keeping any with a running reply.
+
+## Adaptive completions
+
+LocalPilot learns from what you do with its suggestions — no model training, just
+per-language bookkeeping in the core:
+
+- Every shown suggestion's outcome is logged to `<workspace>/.localpilot/completions.jsonl`
+  (language, a prompt hash, at most 200 characters before the cursor, the
+  suggestion, the outcome and timings — nothing else from your files; rotated past
+  10 000 lines). Outcomes reported by VS Code:
+  - **accepted** — `Tab` accepted the whole suggestion;
+  - **partial** — part of it was taken with *Accept Next Word / Line*
+    (`Cmd+→` …), or you typed at least one whole word of it; the taken text is logged;
+  - **typedThrough** — you typed the whole suggestion yourself, key by key;
+  - **rejected** — it was dismissed or you typed something else.
+  A suggestion that is only partly taken is reported once nothing more of it
+  arrives for 2 s.
+- From the last 50 outcomes per language the core picks how many lines and tokens
+  to generate (bounded to 1–8 lines and 16–2× `completionMaxTokens` tokens), and adds
+  up to 3 recently accepted multi-line suggestions as style examples to the prompt.
+- **LocalPilot: Show Completion Stats** (or the status bar menu, or the Settings
+  panel) shows per-language accept rates and the learned values.
+- **To reset**: **LocalPilot: Reset Completion Learning** (or **Reset learning** in
+  the Settings panel) forgets the learned values and examples; the log file is kept.
+  To stop adapting without resetting, set `localpilot.adaptiveCompletions` to `false`.
+  To delete the history entirely, delete `.localpilot/completions.jsonl` too.
 
 ## Manual smoke checklist
 

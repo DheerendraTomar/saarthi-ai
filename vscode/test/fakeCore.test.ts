@@ -54,10 +54,11 @@ function fake(env: Record<string, string> = {}) {
       waiters.add(check);
       check();
     });
+  const notify = (method: string, params: unknown = {}) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
   const response = (id: number) => waitFor((m) => m.id === id && !m.method);
   const call = async (method: string, params: unknown = {}) => response(send(method, params));
   const initialize = () => call("initialize", { workspaceRoot: here, settings: {} });
-  return { msgs, send, waitFor, response, call, initialize };
+  return { msgs, send, notify, waitFor, response, call, initialize };
 }
 
 const methodsOf = (msgs: Msg[]) => msgs.map((m) => m.method ?? `#${m.id}`);
@@ -178,5 +179,44 @@ describe("fakeCore", () => {
     const err = await bad.call("ollama/pull", { model: "m" });
     expect(err.error?.code).toBe(-32000);
     expect(bad.msgs.filter((m) => m.method === "ollama/pullProgress")).toHaveLength(3);
+  });
+
+  it("v2_models_session_deletion_and_stats", async () => {
+    const f = fake();
+    await f.initialize();
+    const models = (await f.call("ollama/models")).result as { models: Array<{ name: string; supportsInsert: boolean }> };
+    expect(models.models.map((m) => [m.name, m.supportsInsert])).toEqual([
+      ["qwen2.5-coder:0.5b-base", true],
+      ["qwen3.8:27b-mlx", false],
+    ]);
+
+    // A running session cannot be deleted; clearSessions keeps it and reports it.
+    const send = { sessionId: "busy", message: "hi", attachments: [] };
+    await f.call("chat/send", send);
+    await f.waitFor((m) => m.method === "chat/toolCall" && m.params?.sessionId === "busy");
+    expect((await f.call("chat/deleteSession", { sessionId: "busy" })).error?.code).toBe(-32602);
+    expect((await f.call("chat/deleteSession", { sessionId: "fake-session" })).result).toEqual({});
+    const { sessionId } = (await f.call("chat/newSession")).result as { sessionId: string };
+    expect((await f.call("chat/clearSessions")).result).toEqual({ deleted: 1, skipped: ["busy"] });
+    const list = (await f.call("chat/listSessions")).result as { sessions: Array<{ sessionId: string }> };
+    expect(list.sessions.map((s) => s.sessionId)).toEqual(["busy"]);
+    expect(sessionId).not.toBe("busy");
+
+    // Outcome notifications feed completion/stats; resetLearning zeroes them.
+    f.notify("completion/outcome", { requestId: "1", outcome: "partial", acceptedText: "x" });
+    f.notify("completion/rejected", { requestId: "2" });
+    const stats = (await f.call("completion/stats")).result as { languages: Record<string, { served: number; partial: number }>; adaptive: boolean; logPath: string };
+    expect(stats.adaptive).toBe(true);
+    expect(stats.languages.typescript).toMatchObject({ served: 2, partial: 1, rejected: 1, acceptRate: 0.5 });
+    expect(stats.logPath).toMatch(/\.localpilot\/completions\.jsonl$/);
+    expect(await f.call("completion/resetLearning")).toMatchObject({ result: {} });
+    expect(((await f.call("completion/stats")).result as { languages: object }).languages).toEqual({});
+  });
+
+  it("v2_ollama_models_fails_when_ollama_is_down", async () => {
+    const f = fake({ FAKE_OLLAMA: "down" });
+    await f.initialize();
+    const r = await f.call("ollama/models");
+    expect(r.error).toEqual({ code: -32000, message: "cannot reach Ollama at http://localhost:11434" });
   });
 });

@@ -5,7 +5,7 @@ import { ChatViewProvider, renderHtml } from "../src/chat/chatView";
 import { CoreClient } from "../src/rpc/coreClient";
 import { DEFAULT_SETTINGS } from "../src/settings";
 import { fakeWebviewView, FakeChatClient, waitFor } from "./helpers/webview";
-import { Uri, resetMock, workspace } from "./mocks/vscode";
+import { configValues, registry, resetMock, Uri, workspace, workspaceConfigKeys } from "./mocks/vscode";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = "/work/proj";
@@ -424,5 +424,245 @@ describe("ChatViewProvider", () => {
         attachments: [{ uri: "file:///work/proj/a.py", range: sel }, { uri: "file:///work/proj/nb.ipynb.cell0.py" }, { uri: "file:///work/proj/d.py" }],
       },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------- v2: models, settings, sessions, stats
+
+const MODELS = [
+  { name: "qwen2.5-coder:1.5b-base", sizeBytes: 986_000_000, family: "qwen2", supportsInsert: true, supportsTools: false },
+  { name: "qwen3.8:27b-mlx", sizeBytes: 17_000_000_000, family: "qwen3", supportsInsert: false, supportsTools: true },
+];
+const STATS = {
+  languages: {
+    python: { served: 10, accepted: 4, partial: 1, rejected: 4, typedThrough: 1, acceptRate: 0.5, learnedMaxLines: 4, learnedNumPredict: 48, examples: 2 },
+  },
+  logPath: "/work/proj/.localpilot/completions.jsonl",
+  adaptive: true,
+};
+
+/** A provider with a resolved view; returns the fake UI. */
+function v2Setup(respond: (method: string, params: unknown) => unknown) {
+  const client = new FakeChatClient(respond);
+  const provider = makeProvider(client);
+  providers.push(provider);
+  const ui = fakeWebviewView();
+  provider.resolveWebviewView(ui.view);
+  return { client, provider, ui };
+}
+
+describe("ChatViewProvider v2 relays", () => {
+  it("models_list_relays_core_models_and_reports_ollama_down", async () => {
+    let down = false;
+    const { client, provider, ui } = v2Setup((method, params) => {
+      if (method === "ollama/models") {
+        if (down) throw Object.assign(new Error("cannot reach Ollama at http://localhost:11434"), { code: -32000 });
+        return { models: MODELS };
+      }
+      return defaultResponder(method, params);
+    });
+    provider.setStatus({ ollama: "ok", detail: "Ollama is running" });
+    configValues["localpilot.chatModel"] = "qwen3.8:27b-mlx";
+    ui.posted.length = 0;
+    ui.send({ type: "models/list" });
+    await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list");
+    expect(client.of("ollama/models")).toEqual([{}]);
+    expect(ui.posted.filter((m) => m.type === "models/list")).toEqual([
+      { type: "models/list", models: MODELS, current: { chat: "qwen3.8:27b-mlx", completion: "qwen2.5-coder:0.5b-base" }, ollama: "ok" },
+    ]);
+
+    // Ollama down: empty list, "down", and the error message (the UI keeps its cached list).
+    down = true;
+    ui.posted.length = 0;
+    ui.send({ type: "models/list" });
+    await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list down");
+    expect(ui.posted.filter((m) => m.type === "models/list")).toEqual([
+      {
+        type: "models/list",
+        models: [],
+        current: { chat: "qwen3.8:27b-mlx", completion: "qwen2.5-coder:0.5b-base" },
+        ollama: "down",
+        error: "cannot reach Ollama at http://localhost:11434",
+      },
+    ]);
+  });
+
+  it("model_select_writes_setting_and_answers_models_list_even_when_the_write_fails", async () => {
+    const { ui } = v2Setup((method, params) => (method === "ollama/models" ? { models: MODELS } : defaultResponder(method, params)));
+    workspaceConfigKeys.add("localpilot.completionModel");
+    configValues["localpilot.completionModel"] = "qwen2.5-coder:0.5b-base";
+    ui.send({ type: "model/select", kind: "completion", name: "qwen2.5-coder:1.5b-base" });
+    await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list after select");
+    // Written where the value is defined (workspace), then confirmed by a fresh list.
+    expect(registry.configUpdates).toEqual([{ key: "localpilot.completionModel", value: "qwen2.5-coder:1.5b-base", target: 2 }]);
+    expect(ui.posted.find((m) => m.type === "models/list")).toMatchObject({
+      current: { chat: "qwen3.8:27b-mlx", completion: "qwen2.5-coder:1.5b-base" },
+    });
+
+    // Chat model, no prior value → global.
+    ui.posted.length = 0;
+    ui.send({ type: "model/select", kind: "chat", name: "qwen3.8:27b-mlx" });
+    await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list after chat select");
+    expect(registry.configUpdates[1]).toEqual({ key: "localpilot.chatModel", value: "qwen3.8:27b-mlx", target: 1 });
+
+    // A failing write still answers models/list (with the unchanged current) plus a ui/error.
+    const failing = workspace.getConfiguration;
+    workspace.getConfiguration = ((section?: string) => ({
+      ...failing(section),
+      update: async () => {
+        throw new Error("settings.json is read-only");
+      },
+    })) as typeof workspace.getConfiguration;
+    try {
+      ui.posted.length = 0;
+      ui.send({ type: "model/select", kind: "chat", name: "other:7b" });
+      await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list after failed select");
+      expect(ui.posted.find((m) => m.type === "ui/error")?.message).toContain("settings.json is read-only");
+      expect(ui.posted.find((m) => m.type === "models/list")).toMatchObject({ current: { chat: "qwen3.8:27b-mlx" } });
+      // Unknown kinds or empty names are ignored, but still answered.
+      ui.posted.length = 0;
+      ui.send({ type: "model/select", kind: "bogus", name: "x" });
+      await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list after bogus select");
+    } finally {
+      workspace.getConfiguration = failing;
+    }
+  });
+
+  it("settings_patch_written_to_defining_scope", async () => {
+    const { ui } = v2Setup(defaultResponder);
+    // completionMaxTokens is a workspace setting; the others are not set anywhere yet.
+    workspaceConfigKeys.add("localpilot.completionMaxTokens");
+    configValues["localpilot.completionMaxTokens"] = 48;
+
+    ui.send({ type: "settings/get" });
+    await waitFor(() => ui.posted.some((m) => m.type === "settings/current"), 5000, "settings/current");
+    expect(ui.posted.find((m) => m.type === "settings/current")).toEqual({
+      type: "settings/current",
+      settings: {
+        completionModel: "qwen2.5-coder:0.5b-base",
+        completionMaxTokens: 48,
+        completionDebounceMs: 120,
+        completionContextTokens: 3584,
+        adaptiveCompletions: true,
+      },
+    });
+
+    ui.posted.length = 0;
+    ui.send({
+      type: "settings/set",
+      // completionModel goes through model/select; unknown keys and wrong types are dropped.
+      patch: { completionMaxTokens: 64, adaptiveCompletions: false, completionModel: "x", chatModel: "y", completionDebounceMs: "fast" },
+    });
+    await waitFor(() => ui.posted.some((m) => m.type === "settings/current"), 5000, "settings/current after set");
+    expect(registry.configUpdates).toEqual([
+      { key: "localpilot.completionMaxTokens", value: 64, target: 2 },
+      { key: "localpilot.adaptiveCompletions", value: false, target: 1 },
+    ]);
+    expect(ui.posted).toEqual([
+      {
+        type: "settings/current",
+        settings: {
+          completionModel: "qwen2.5-coder:0.5b-base",
+          completionMaxTokens: 64,
+          completionDebounceMs: 120,
+          completionContextTokens: 3584,
+          adaptiveCompletions: false,
+        },
+      },
+    ]);
+  });
+
+  it("delete_session_relays_and_refreshes_list", async () => {
+    let sessions = [...SESSIONS];
+    const { client, ui } = v2Setup((method, params) => {
+      if (method === "chat/listSessions") return { sessions };
+      if (method === "chat/deleteSession") {
+        const id = (params as { sessionId: string }).sessionId;
+        if (id === "busy") throw Object.assign(new Error("turn running in session busy"), { code: -32602 });
+        sessions = sessions.filter((s) => s.sessionId !== id);
+        return {};
+      }
+      return defaultResponder(method, params);
+    });
+    ui.send({ type: "ui/ready" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/history"), 5000, "ready");
+
+    // Deleting the current session (s2): session/deleted with next = s1, then the refreshed list (current s1).
+    ui.posted.length = 0;
+    ui.send({ type: "session/delete", sessionId: "s2" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/list"), 5000, "list after delete");
+    expect(client.of("chat/deleteSession")).toEqual([{ sessionId: "s2" }]);
+    expect(ui.posted).toEqual([
+      { type: "session/deleted", sessionId: "s2", next: "s1" },
+      { type: "session/list", sessions: [SESSIONS[1]], current: "s1" },
+    ]);
+
+    // A running session is refused by the core: ui/error says why, nothing is dropped.
+    ui.posted.length = 0;
+    ui.send({ type: "session/delete", sessionId: "busy" });
+    await waitFor(() => ui.posted.some((m) => m.type === "ui/error"), 5000, "error");
+    expect(ui.posted).toHaveLength(1);
+    expect(String(ui.posted[0].message)).toMatch(/still running/);
+
+    // Deleting the last one: next is null.
+    ui.posted.length = 0;
+    ui.send({ type: "session/delete", sessionId: "s1" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/list"), 5000, "list after last delete");
+    expect(ui.posted).toEqual([
+      { type: "session/deleted", sessionId: "s1", next: null },
+      { type: "session/list", sessions: [], current: null },
+    ]);
+  });
+
+  it("clear_all_sends_one_deleted_per_session_and_reports_skipped", async () => {
+    let sessions = [{ sessionId: "s3", title: "Running", updatedAtMs: 3 }, ...SESSIONS];
+    const { client, ui } = v2Setup((method, params) => {
+      if (method === "chat/listSessions") return { sessions };
+      if (method === "chat/clearSessions") {
+        sessions = sessions.filter((s) => s.sessionId === "s3");
+        return { deleted: 2, skipped: ["s3"] };
+      }
+      return defaultResponder(method, params);
+    });
+    ui.send({ type: "chat/switchSession", sessionId: "s1" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/history"), 5000, "switch");
+    ui.posted.length = 0;
+    ui.send({ type: "session/clearAll" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/list"), 5000, "list after clear");
+    expect(client.of("chat/clearSessions")).toEqual([{}]);
+    expect(ui.posted).toEqual([
+      { type: "session/deleted", sessionId: "s2", next: "s3" },
+      { type: "session/deleted", sessionId: "s1", next: "s3" },
+      { type: "ui/error", message: "1 session with a running reply was kept." },
+      { type: "session/list", sessions: [sessions[0]], current: "s3" },
+    ]);
+  });
+
+  it("stats_relayed_to_webview", async () => {
+    let reset = false;
+    let releaseReset: () => void = () => {};
+    const { client, ui } = v2Setup(async (method, params) => {
+      if (method === "completion/stats") return reset ? { ...STATS, languages: {} } : STATS;
+      if (method === "completion/resetLearning") {
+        await new Promise<void>((r) => (releaseReset = r));
+        reset = true;
+        return {};
+      }
+      return defaultResponder(method, params);
+    });
+    ui.send({ type: "completion/stats" });
+    await waitFor(() => ui.posted.some((m) => m.type === "completion/stats"), 5000, "stats");
+    expect(ui.posted.filter((m) => m.type === "completion/stats")).toEqual([{ type: "completion/stats", stats: STATS }]);
+
+    // Reset then stats, back to back: the stats answer waits for the reset (never pre-reset numbers).
+    ui.posted.length = 0;
+    ui.send({ type: "completion/resetLearning" });
+    ui.send({ type: "completion/stats" });
+    await waitFor(() => client.of("completion/resetLearning").length === 1, 5000, "reset sent");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ui.posted.filter((m) => m.type === "completion/stats")).toEqual([]);
+    releaseReset();
+    await waitFor(() => ui.posted.some((m) => m.type === "completion/stats"), 5000, "stats after reset");
+    expect(ui.posted.filter((m) => m.type === "completion/stats")).toEqual([{ type: "completion/stats", stats: { ...STATS, languages: {} } }]);
   });
 });

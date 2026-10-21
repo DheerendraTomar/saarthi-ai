@@ -1,7 +1,9 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { configValues } from "./mocks/vscode";
+import { readFileSync } from "node:fs";
 import { DEFAULT_SETTINGS, readSettings, resolveBinaryPath } from "../src/settings";
+import { sameCoreSettings } from "../src/extension";
 import { lineSplitter } from "../src/rpc/coreClient";
 
 afterEach(() => {
@@ -53,5 +55,22 @@ describe("settings", () => {
     feed('":"é"}\n');
     feed("\n");
     expect(lines).toEqual(['{"a":1}', '{"b":2}', '{"c":"é"}', ""]);
+  });
+
+  it("package_json_declares_every_setting_with_the_same_default_and_adaptive_restarts_core", () => {
+    const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8"));
+    const props = pkg.contributes.configuration.properties as Record<string, { default: unknown }>;
+    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+      expect(props[`localpilot.${key}`]?.default, key).toEqual(value);
+    }
+    expect(DEFAULT_SETTINGS.adaptiveCompletions).toBe(true);
+    // adaptiveCompletions is read by the core at initialize: changing it restarts the core.
+    expect(sameCoreSettings(DEFAULT_SETTINGS, { ...DEFAULT_SETTINGS, adaptiveCompletions: false })).toBe(false);
+    const commands = (pkg.contributes.commands as Array<{ command: string }>).map((c) => c.command);
+    const palette = (pkg.contributes.menus.commandPalette as Array<{ command: string }>).map((c) => c.command);
+    for (const id of ["selectChatModel", "selectCompletionModel", "deleteSession", "clearSessions", "resetLearning", "showCompletionStats"]) {
+      expect(commands).toContain(`localpilot.${id}`);
+      expect(palette).toContain(`localpilot.${id}`);
+    }
   });
 });

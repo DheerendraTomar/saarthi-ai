@@ -7,6 +7,7 @@ import { runCommand, type RunCommandParams } from "./chat/runCommand";
 import { checkStatus, COMMANDS, pullModel, registerCommands, startOllama, type CommandDeps } from "./commands";
 import { DocumentSync } from "./documentSync";
 import { InlineProvider } from "./inlineProvider";
+import { ModelCatalog } from "./models";
 import { CoreClient, type CoreClientOptions } from "./rpc/coreClient";
 import { readSettings, resolveBinaryPath, type Settings } from "./settings";
 import { StatusBar } from "./statusBar";
@@ -53,6 +54,8 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
   current = { client };
   const inline = new InlineProvider(client, settings);
   const sync = new DocumentSync(client, root);
+  // One `ollama/models` cache for the chat view and the palette pickers (the last-known list while Ollama is down).
+  const models = new ModelCatalog(client);
 
   let lastCoreError: string | undefined;
   const reportCoreError = (message: string) => {
@@ -123,7 +126,12 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
   const deps: CommandDeps = {
     client,
     statusBar,
-    chatView: { newSession: () => chatView.newSession() },
+    chatView: {
+      newSession: () => chatView.newSession(),
+      deleteSession: (id) => chatView.deleteSession(id),
+      clearSessions: () => chatView.clearSessions(),
+    },
+    models,
     reportAccepted: (id) => inline.reportAccepted(id),
     settings: () => settings,
     setCompletionsEnabled: (enabled) => {
@@ -143,6 +151,7 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
     pullModel: (model) => pullModel(deps, model),
     // The core pauses completions while chat generates (spec §5(10)); show it.
     onChatActiveChanged: (active) => statusBar.setChatActive(active),
+    models,
   });
 
   // Core → client requests (the core sends them only after the user approved in the chat).
