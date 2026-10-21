@@ -163,8 +163,9 @@ Additions beyond the spec:
     so the longer buckets would stop getting samples. Every 10th served
     multi-line suggestion of a language (while learned limits apply) is
     therefore generated with the configured limits (cap 8,
-    `completionMaxTokens`), bypassing the completion cache; its log record
-    carries those limits. Learning explores the configured length 10% of
+    `completionMaxTokens`), ignoring an exact completion-cache hit (a
+    typed-prefix hit — the user typing through a suggestion already shown —
+    is still served as usual); its log record carries those limits. Learning explores the configured length 10% of
     the time. A learning reset restarts the count.
   - **Style examples:** up to 3 of the most recent `accepted` suggestions of
     the same language with ≥ 2 lines, newest first, each as

@@ -41,8 +41,9 @@
 //! **Exploration.** Learned limits only ever move towards what was accepted,
 //! so a longer bucket that lost would never be sampled again. Every
 //! [`adaptive::EXPLORE_EVERY`]-th served multi-line suggestion of a language
-//! is therefore generated with the configured limits (bypassing the
-//! completion cache), and its record carries those limits.
+//! is therefore generated with the configured limits (ignoring an exact
+//! cache hit; a typed-prefix hit is still served), and its record carries
+//! those limits.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -208,7 +209,7 @@ pub(crate) struct Prepared {
     /// counts towards exploration.
     pub adapted: bool,
     /// This request explores: the configured limits replace the learned
-    /// ones and the completion cache is not consulted.
+    /// ones and an exact completion-cache hit is ignored.
     pub explore: bool,
 }
 
@@ -327,10 +328,14 @@ impl CompletionEngine {
         });
 
         let mut served_key = key.clone();
-        // Exploring requests want a fresh generation with their own limits.
-        let cached = (self.cache_enabled() && !explore)
+        // An exploring request wants a fresh generation with its own limits,
+        // so it ignores an exact hit; a typed-prefix hit (the user is typing
+        // through a suggestion already shown) is still served as usual.
+        let cached = self
+            .cache_enabled()
             .then(|| lock(&inner.cache).lookup(&key.0, &key.1, &key.2))
-            .flatten();
+            .flatten()
+            .filter(|hit| !explore || hit.entry_prefix != key.1);
         let mut typed_prefix_hit = false;
         let mut limits = None;
         let text = match cached {

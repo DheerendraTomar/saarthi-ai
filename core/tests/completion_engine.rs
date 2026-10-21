@@ -741,15 +741,55 @@ async fn tenth_multi_line_request_is_generated_with_the_configured_limits() {
     assert_eq!(record.request_id, "r10");
     assert_eq!((record.max_lines, record.num_predict), (Some(8), Some(32)));
 
-    // 11th: back to the learned limits.
+    // Typing through a suggestion while the next request would explore:
+    // the rest is still served from the cache, with no generation and no
+    // record, and the exploration slot is not used up.
+    for i in 11..=19 {
+        complete(&env, &format!("x{i}"), CURSOR).await;
+        env.engine
+            .on_outcome(&format!("x{i}"), Outcome::Accepted, None);
+    }
+    let generated = generate_bodies(&env.mock).len();
+    env.engine.flush_pending().await;
+    let records = log.records().len();
     env.store
         .write()
         .unwrap()
-        .did_open(&env.uri, DOC.replacen("return \n", "return  \n", 1), 2);
-    let result = complete(&env, "r11", CURSOR).await;
-    env.engine.on_outcome("r11", Outcome::Rejected, None);
+        .did_open(&env.uri, DOC.replacen("return \n", "return v\n", 1), 2);
+    let typed = Position {
+        line: 1,
+        character: 12,
+    };
+    let rest = complete(&env, "typed", typed).await;
+    assert_eq!(
+        texts(&rest)[0],
+        "0 = 0\n    v1 = 1\n    v2 = 2\n    v3 = 3\n    v4 = 4\n    v5 = 5"
+    );
+    assert_eq!(generate_bodies(&env.mock).len(), generated);
+    env.engine.flush_pending().await;
+    assert_eq!(log.records().len(), records);
+    env.store
+        .write()
+        .unwrap()
+        .did_open(&env.uri, DOC.to_owned(), 3);
+
+    // The 20th served one explores.
+    complete(&env, "r20", CURSOR).await;
+    env.engine.on_outcome("r20", Outcome::Rejected, None);
     log.flush().await;
     let record = log.records().pop().unwrap();
-    assert_eq!(record.request_id, "r11", "{result:?}");
+    assert_eq!(record.request_id, "r20");
+    assert_eq!((record.max_lines, record.num_predict), (Some(8), Some(32)));
+
+    // Then back to the learned limits.
+    env.store
+        .write()
+        .unwrap()
+        .did_open(&env.uri, DOC.replacen("return \n", "return  \n", 1), 4);
+    let result = complete(&env, "r21", CURSOR).await;
+    env.engine.on_outcome("r21", Outcome::Rejected, None);
+    log.flush().await;
+    let record = log.records().pop().unwrap();
+    assert_eq!(record.request_id, "r21", "{result:?}");
     assert_eq!((record.max_lines, record.num_predict), (Some(4), Some(16)));
 }
