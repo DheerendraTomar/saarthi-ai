@@ -8,8 +8,10 @@ type Tone = 'normal' | 'warning' | 'error';
  * precedence (most important first): a running pull, a stopped core, Ollama
  * down / model missing, completions paused (by the user, or while a chat reply
  * is generating), otherwise all good. While the WebSocket (re)connects it
- * reads "LocalPilot" like VS Code's "starting". `setOnClick` sets what a
- * click does (Task 5: the LocalPilot command menu).
+ * reads "LocalPilot" like VS Code's "starting"; when the server extension is
+ * not reachable at all (`error`) it reads "LocalPilot unreachable". A click
+ * opens the LocalPilot command menu (`setOnClick`), so every tooltip names the
+ * menu entry that helps rather than promising the click does it.
  */
 export class StatusItem extends Widget {
   private status?: OllamaStatus;
@@ -50,10 +52,10 @@ export class StatusItem extends Widget {
     this.render();
   }
 
-  /** `error` explains `crashed` (the server refused initialize). */
+  /** `error` explains `crashed` (the server refused initialize) and the `error` state (unreachable). */
   setConnectionState(state: ConnectionState, error?: string): void {
     this.connection = state;
-    this.coreError = state === 'crashed' ? error ?? this.coreError : undefined;
+    this.coreError = state === 'crashed' || state === 'error' ? (error ?? this.coreError) : undefined;
     this.render();
   }
 
@@ -83,26 +85,32 @@ export class StatusItem extends Widget {
 
   private render(): void {
     let text = 'LocalPilot';
-    let tooltip = 'LocalPilot: running locally via Ollama';
+    let tooltip = 'LocalPilot: running locally via Ollama. Click for LocalPilot commands.';
     let tone: Tone = 'normal';
     if (this.pullPercent !== undefined) {
       text = `Pulling ${this.pullPercent}%`;
-      tooltip = 'LocalPilot: pulling a model';
+      tooltip = 'LocalPilot: pulling a model. Click for LocalPilot commands.';
+    } else if (this.connection === 'error') {
+      text = 'LocalPilot unreachable';
+      tooltip =
+        `${this.coreError ?? 'LocalPilot server extension not reachable'}. ` +
+        'Run `jupyter server extension list` and see the README. Click for LocalPilot commands (Restart LocalPilot Core retries).';
+      tone = 'error';
     } else if (this.connection === 'crashed' || this.connection === 'disposed') {
       text = 'LocalPilot stopped';
-      tooltip = `LocalPilot core is not running${this.coreError ? `: ${this.coreError}` : ''}. Click to restart.`;
+      tooltip = `LocalPilot core is not running${this.coreError ? `: ${this.coreError}` : ''}. Click for LocalPilot commands (Restart LocalPilot Core).`;
       tone = 'error';
     } else if (this.status?.ollama === 'down') {
       text = 'Ollama down';
-      tooltip = `LocalPilot: ${this.status.detail}. Click to start Ollama or retry.`;
+      tooltip = `LocalPilot: ${this.status.detail}. Click for LocalPilot commands (Start Ollama).`;
       tone = 'warning';
     } else if (this.status?.ollama === 'modelMissing') {
       text = 'Model missing';
-      tooltip = `LocalPilot: ${this.status.detail}. Click to pull it.`;
+      tooltip = `LocalPilot: ${this.status.detail}. Click for LocalPilot commands (Pull Model with Ollama).`;
       tone = 'warning';
     } else if (!this.completionsEnabled) {
       text = 'completions paused';
-      tooltip = 'LocalPilot inline completions are paused. Click to resume.';
+      tooltip = 'LocalPilot inline completions are paused. Click for LocalPilot commands (Resume Inline Completions).';
     } else if (this.chatActive) {
       text = 'completions paused during chat';
       tooltip = 'LocalPilot: inline completions resume when the chat reply finishes (chat and completions share the GPU).';

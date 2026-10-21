@@ -25,9 +25,27 @@ export interface InitializeResult {
  *   start); `initialize` is re-sent on the open socket with the usual backoff
  *   (any tab, or the server owner, may restart the core), and `reconnect()`
  *   retries at once (after this tab's `POST /localpilot/restart`);
+ * - `error`: the LocalPilot endpoint is not reachable at all (the server
+ *   extension is not loaded, wrong environment, no permission): 5 failed
+ *   connects before the first `ready`, a close with 1008/4403/4404, or
+ *   `markUnreachable()`. No automatic retries; `reconnect()` tries again;
  * - `disposed`.
  */
-export type ConnectionState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'crashed' | 'disposed';
+export type ConnectionState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'crashed' | 'error' | 'disposed';
+
+/** Consecutive failed connects (before the first `ready`) that mean "not reachable". */
+export const MAX_CONNECT_FAILURES = 5;
+/** Close codes that mean "never going to work as is": policy violation, forbidden, not found. */
+export const UNREACHABLE_CLOSE_CODES: ReadonlyArray<number> = [1008, 4403, 4404];
+
+/**
+ * The client is in the `error` state: the Jupyter server's LocalPilot
+ * endpoint is not reachable (the server extension is not loaded or the user
+ * lacks permission). Requests fail with it at once instead of waiting.
+ */
+export class ServerUnreachable extends Error {
+  override name = 'ServerUnreachable';
+}
 
 /**
  * "The core went away": the one error type for that, whichever way it shows.
@@ -59,6 +77,8 @@ export interface WsCoreClientOptions {
   maxBackoffMs?: number;
   /** An unanswered `initialize` counts as a dead connection after this (default 30 000 ms). */
   initializeTimeoutMs?: number;
+  /** The backoff resets only once a ready connection has stayed up this long (default 5 000 ms). */
+  stableAfterMs?: number;
   onLog?: (message: string) => void;
 }
 
@@ -218,8 +238,9 @@ const RETRY_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnectin
  * Connection: open → `initialize { settings }` → `ready`. On any close
  * (1012 when the server's core restarted, a network drop, the server going
  * away) pending requests reject with `CoreDisconnected`, `onDisconnect` fires,
- * and the client reconnects after 0.5 s, 1 s, 2 s … capped at 10 s (reset by
- * a successful `initialize`). The new core starts with an empty document
+ * and the client reconnects after 0.5 s, 1 s, 2 s … capped at 10 s (reset
+ * once a ready connection has stayed up 5 s, so a socket the server keeps
+ * closing right after `initialize` is not retried in a tight loop). The new core starts with an empty document
  * overlay, so after every re-`initialize` the client fires `onReconnect` —
  * DocumentSync (Task 3) replays `didOpen` for all its documents there.
  *
@@ -234,6 +255,9 @@ const RETRY_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnectin
  *   queue and switches to that replay too.
  * - An `initialize` unanswered for 30 s counts as a dead socket: it is closed
  *   and the client retries with backoff.
+ * - Never reachable (5 failed connects before the first `ready`, or a close
+ *   with 1008/4403/4404): `error`; waiting and new requests reject with
+ *   `ServerUnreachable` and nothing retries until `reconnect()`.
  */
 export class WsCoreClient implements IDisposable {
   readonly url: string;
@@ -243,13 +267,18 @@ export class WsCoreClient implements IDisposable {
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly initializeTimeoutMs: number;
+  private readonly stableAfterMs: number;
 
   private _state: ConnectionState = 'idle';
   private ws?: WebSocket;
   private opened = false;
   private everReady = false;
   private attempt = 0;
+  /** Sockets in a row that closed without ever opening (reset when one opens). */
+  private failures = 0;
   private timer?: ReturnType<typeof setTimeout>;
+  /** Resets the backoff once a ready connection has lasted `stableAfterMs`. */
+  private stableTimer?: ReturnType<typeof setTimeout>;
   /** A crash before the first ready: the queue was dropped, so the first ready replays. */
   private replayPending = false;
   private readonly queued = new NotificationQueue();
@@ -270,6 +299,7 @@ export class WsCoreClient implements IDisposable {
     this.initialBackoffMs = options.initialBackoffMs ?? 500;
     this.maxBackoffMs = options.maxBackoffMs ?? 10_000;
     this.initializeTimeoutMs = options.initializeTimeoutMs ?? 30_000;
+    this.stableAfterMs = options.stableAfterMs ?? 5_000;
     this.reconnectListeners = new Listeners(this.log);
     this.statusListeners = new Listeners(this.log);
     this.disconnectListeners = new Listeners(this.log);
@@ -291,7 +321,7 @@ export class WsCoreClient implements IDisposable {
     return this._initializeResult;
   }
 
-  /** Why the client is `crashed` (the server's refusal of `initialize`). */
+  /** Why the client is `crashed` (the server's refusal of `initialize`) or `error` (a `ServerUnreachable`). */
   get lastError(): Error | undefined {
     return this._lastError;
   }
@@ -306,22 +336,25 @@ export class WsCoreClient implements IDisposable {
   /**
    * Drops the current socket (if any) and connects at once with a fresh
    * backoff. Use after `POST /localpilot/restart` when the client is
-   * `crashed` (the server closes sockets itself only when a running core exits).
+   * `crashed` (the server closes sockets itself only when a running core
+   * exits), and to retry from `error`.
    */
   reconnect(): void {
     if (this._state === 'disposed') return;
     this.clearTimer();
     this.attempt = 0;
+    this.failures = 0;
     if (this.ws) this.dropSocket(this.ws, 1000, 'reconnecting');
     this.setState(this.everReady ? 'reconnecting' : 'connecting');
     this.connect();
   }
 
-  /** Resolves when the client is `ready`; rejects when `crashed`, disposed or `signal` aborts. */
+  /** Resolves when the client is `ready`; rejects when `crashed`, `error`, disposed or `signal` aborts. */
   whenReady(signal?: AbortSignal): Promise<InitializeResult> {
     if (this._state === 'ready' && this._initializeResult) return Promise.resolve(this._initializeResult);
     if (this._state === 'disposed') return Promise.reject(new Error('LocalPilot client disposed'));
     if (this._state === 'crashed') return Promise.reject(this._lastError ?? new Error('LocalPilot core is not running'));
+    if (this._state === 'error') return Promise.reject(this._lastError ?? new ServerUnreachable('LocalPilot server extension not reachable'));
     if (signal?.aborted) return Promise.reject(abortError());
     return new Promise<InitializeResult>((resolve, reject) => {
       const onAbort = () => {
@@ -347,7 +380,8 @@ export class WsCoreClient implements IDisposable {
    * Sends a request once the client is ready. Rejects with `CoreDisconnected`
    * if the core goes away before the answer (the bridge's "core exited" answer
    * or a socket close), with an `RpcError` when the core (or the server)
-   * answers with another error, and with an `AbortError` on `signal`.
+   * answers with another error, with `ServerUnreachable` in the `error`
+   * state, and with an `AbortError` on `signal`.
    */
   async request<T = unknown>(method: string, params?: unknown, signal?: AbortSignal): Promise<T> {
     if (this._state !== 'ready') await this.whenReady(signal);
@@ -410,9 +444,19 @@ export class WsCoreClient implements IDisposable {
     return this.stateListeners.add(listener);
   }
 
+  /**
+   * Enters `error` from outside (e.g. `GET /localpilot/status` answered 403 or
+   * 404: the server extension is missing or the user may not use it).
+   */
+  markUnreachable(reason: string): void {
+    if (this._state === 'disposed' || this._state === 'ready') return;
+    this.enterError(reason);
+  }
+
   dispose(): void {
     if (this._state === 'disposed') return;
     this.clearTimer();
+    this.clearStableTimer();
     const error = new CoreDisconnected(1000, 'LocalPilot client disposed');
     if (this.ws) this.dropSocket(this.ws, 1000, 'disposed');
     this.clearInitTimer();
@@ -432,8 +476,9 @@ export class WsCoreClient implements IDisposable {
     try {
       ws = new this.server.WebSocket(this.url);
     } catch (e) {
-      this.log(`cannot open ${this.url}: ${e instanceof Error ? e.message : String(e)}`);
-      this.scheduleReconnect();
+      const message = e instanceof Error ? e.message : String(e);
+      this.log(`cannot open ${this.url}: ${message}`);
+      this.connectFailed(`cannot open the LocalPilot WebSocket (${message})`);
       return;
     }
     this.ws = ws;
@@ -441,6 +486,7 @@ export class WsCoreClient implements IDisposable {
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.opened = true;
+      this.failures = 0;
       this.initialize(ws);
     };
     ws.onmessage = (ev: MessageEvent) => {
@@ -472,7 +518,7 @@ export class WsCoreClient implements IDisposable {
         const replay = this.everReady || this.replayPending;
         this.everReady = true;
         this.replayPending = false;
-        this.attempt = 0;
+        this.armStableTimer();
         this._lastError = undefined;
         this._initializeResult = result;
         this._state = 'ready';
@@ -511,8 +557,41 @@ export class WsCoreClient implements IDisposable {
     const error = this.detach(code, reason);
     if (this._state === 'disposed') return;
     if (wasOpen) this.disconnectListeners.emit(error);
+    if (UNREACHABLE_CLOSE_CODES.includes(code)) {
+      this.enterError(`the server closed the LocalPilot connection (${code}${reason ? `: ${reason}` : ''})`);
+      return;
+    }
     this.setState(this.everReady ? 'reconnecting' : 'connecting');
+    // A socket that opened reached the server; one that never did counts as a failed connect.
+    if (wasOpen) this.scheduleReconnect();
+    else this.connectFailed(`connection closed (${code}${reason ? `: ${reason}` : ''})`);
+  }
+
+  /**
+   * A socket that never opened: retry with backoff, or give up (`error`)
+   * after `MAX_CONNECT_FAILURES` in a row before the first `ready`.
+   */
+  private connectFailed(why: string): void {
+    this.failures++;
+    if (!this.everReady && this.failures >= MAX_CONNECT_FAILURES) {
+      this.enterError(`${this.failures} connection attempts failed (last: ${why})`);
+      return;
+    }
     this.scheduleReconnect();
+  }
+
+  /** The endpoint is not reachable: stop retrying and fail everything waiting. */
+  private enterError(why: string): void {
+    this.clearTimer();
+    if (this.ws) this.dropSocket(this.ws, 1000, 'unreachable');
+    const error = new ServerUnreachable(`LocalPilot server extension not reachable: ${why}`);
+    if (this._state !== 'error') this.log(error.message);
+    this._lastError = error;
+    // What was queued is dropped (it could grow without bound); the first ready replays.
+    if (!this.everReady) this.replayPending = true;
+    this.queued.drain();
+    this.setState('error');
+    this.settleWaiters((w) => w.reject(error));
   }
 
   /** Closes `ws` ourselves (its close event is then ignored). */
@@ -532,6 +611,7 @@ export class WsCoreClient implements IDisposable {
     this.ws = undefined;
     this.opened = false;
     this.clearInitTimer();
+    this.clearStableTimer();
     const error = new CoreDisconnected(code, reason);
     this.endpoint.rejectAll(error);
     return error;
@@ -565,6 +645,19 @@ export class WsCoreClient implements IDisposable {
   private clearTimer(): void {
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
+  }
+
+  private armStableTimer(): void {
+    this.clearStableTimer();
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = undefined;
+      this.attempt = 0;
+    }, this.stableAfterMs);
+  }
+
+  private clearStableTimer(): void {
+    if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
+    this.stableTimer = undefined;
   }
 
   private sendLine(line: string): void {

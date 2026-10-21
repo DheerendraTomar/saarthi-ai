@@ -1,6 +1,6 @@
 import { ServerConnection } from '@jupyterlab/services';
 import { RpcError } from '@localpilot/rpc-client';
-import { CoreDisconnected, InitializeResult, NotificationQueue, WsCoreClient } from '../src/client';
+import { CoreDisconnected, InitializeResult, NotificationQueue, ServerUnreachable, WsCoreClient } from '../src/client';
 import { DEFAULT_SETTINGS, Settings } from '../src/settings';
 import { MockWebSocket } from './mockWebSocket';
 
@@ -171,13 +171,113 @@ describe('WsCoreClient', () => {
     // The didChange sent while disconnected never went anywhere.
     expect(MockWebSocket.instances.flatMap((s) => s.messages()).some((m) => m.method === 'textDocument/didChange')).toBe(false);
 
-    // A successful initialize resets the backoff to 0.5 s.
+    // A connection that stayed up 5 s resets the backoff to 0.5 s.
+    await jest.advanceTimersByTimeAsync(5000);
     ws.serverClose(1012, 'LocalPilot core restarted');
     const before = MockWebSocket.instances.length;
     await jest.advanceTimersByTimeAsync(500);
     expect(MockWebSocket.instances).toHaveLength(before + 1);
     await connect();
     expect(order).toEqual(['reconnect', 'reconnect']);
+  });
+
+  it('keeps backing off when the server closes every connection right after initialize', async () => {
+    // e.g. a didOpen frame above Tornado's websocket_max_message_size: the
+    // server closes, the client reconnects and replays the same frame.
+    client = makeClient();
+    client.start();
+    await connect();
+    for (const delay of [500, 1000, 2000, 4000]) {
+      MockWebSocket.last.serverClose(1009, 'message too big');
+      const before = MockWebSocket.instances.length;
+      await jest.advanceTimersByTimeAsync(delay - 1);
+      expect(MockWebSocket.instances).toHaveLength(before); // not reset by the short-lived ready
+      await jest.advanceTimersByTimeAsync(1);
+      expect(MockWebSocket.instances).toHaveLength(before + 1);
+      await connect();
+      expect(client.state).toBe('ready');
+    }
+    // Nor does it ever give up: each socket did open.
+    expect(client.state).toBe('ready');
+  });
+
+  it('enters error after 5 failed connects: waiting requests fail with ServerUnreachable', async () => {
+    client = makeClient();
+    const states: string[] = [];
+    client.onStateChanged((s) => states.push(s));
+    const pending = client.request('chat/listSessions', {});
+    const outcome = pending.then(
+      () => 'resolved',
+      (e: Error) => e
+    );
+    client.start();
+    for (let i = 0; i < 5; i++) {
+      MockWebSocket.last.serverClose(1006); // never opens (no server extension: the upgrade 404s)
+      await jest.advanceTimersByTimeAsync(20_000);
+    }
+    expect(client.state).toBe('error');
+    expect(MockWebSocket.instances).toHaveLength(5); // no more retries
+    const error = await outcome;
+    expect(error).toBeInstanceOf(ServerUnreachable);
+    expect((error as Error).name).toBe('ServerUnreachable');
+    expect(client.lastError).toBeInstanceOf(ServerUnreachable);
+    await expect(client.request('ollama/status', {})).rejects.toBeInstanceOf(ServerUnreachable);
+    expect(states).toEqual(['connecting', 'error']);
+
+    // Retry: a fresh socket, and a successful connect clears the error.
+    client.reconnect();
+    expect(client.state).toBe('connecting');
+    expect(MockWebSocket.instances).toHaveLength(6);
+    await connect();
+    expect(client.state).toBe('ready');
+    expect(client.lastError).toBeUndefined();
+  });
+
+  it('a socket that opens resets the failure count', async () => {
+    client = makeClient();
+    client.start();
+    for (let i = 0; i < 4; i++) {
+      MockWebSocket.last.serverClose(1006);
+      await jest.advanceTimersByTimeAsync(20_000);
+    }
+    MockWebSocket.last.open();
+    MockWebSocket.last.serverClose(1011);
+    for (let i = 0; i < 4; i++) {
+      await jest.advanceTimersByTimeAsync(20_000);
+      MockWebSocket.last.serverClose(1006);
+    }
+    expect(client.state).toBe('connecting');
+  });
+
+  it.each([1008, 4403, 4404])('a close with %i enters error at once', async (code) => {
+    client = makeClient();
+    client.start();
+    const pending = client.request('chat/listSessions', {});
+    MockWebSocket.last.serverClose(code, 'forbidden');
+    await expect(pending).rejects.toBeInstanceOf(ServerUnreachable);
+    expect(client.state).toBe('error');
+    expect(client.lastError?.message).toContain(String(code));
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('markUnreachable enters error (status fetch 403/404), drops the queue and replays on the first ready', async () => {
+    client = makeClient();
+    const reconnects = jest.fn();
+    client.onReconnect(reconnects);
+    client.notify('textDocument/didOpen', { uri: 'file:///a.py', version: 1, text: 'x' });
+    client.start();
+    client.markUnreachable('GET /localpilot/status answered 404');
+    expect(client.state).toBe('error');
+    expect(client.lastError?.message).toContain('404');
+    expect(MockWebSocket.last.closedWith).toBeDefined();
+    client.notify('textDocument/didChange', { uri: 'file:///a.py', version: 2, contentChanges: [{ text: 'y' }] });
+    client.reconnect();
+    const ws = await connect();
+    expect(ws.messages().map((m) => m.method)).toEqual(['initialize']);
+    expect(reconnects).toHaveBeenCalledTimes(1); // DocumentSync re-opens everything instead
+    client.markUnreachable('ignored while ready');
+    expect(client.state).toBe('ready');
   });
 
   it('disconnect_mid_turn_rejects_pending_and_emits_error', async () => {

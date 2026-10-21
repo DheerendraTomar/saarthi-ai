@@ -1,5 +1,5 @@
 import { Signal } from '@lumino/signaling';
-import { CONCAT_DEBOUNCE_MS, DocumentSync, type SyncClient } from '../src/documentSync';
+import { CONCAT_DEBOUNCE_MS, DocumentSync, MAX_SYNC_CHARS, type SyncClient } from '../src/documentSync';
 
 // Minimal stand-ins for the JupyterLab 4.5 objects DocumentSync reads:
 // NotebookPanel / IDocumentWidget<FileEditor> (context + disposed), the
@@ -483,6 +483,95 @@ describe('DocumentSync', () => {
     loaded();
     await settle();
     expect(client.sent).toEqual([]);
+    sync.dispose();
+  });
+});
+
+describe('DocumentSync size limit', () => {
+  const BIG = 'x'.repeat(MAX_SYNC_CHARS + 1);
+  let warn: jest.SpyInstance;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    warn.mockRestore();
+    jest.useRealTimers();
+  });
+
+  it('never opens a file above the limit, and warns once', async () => {
+    const { client, editors, sync } = await setup([]);
+    client.takeAll();
+    const shared = new FakeShared(BIG);
+    const file = new FakeContext('big.csv', { sharedModel: shared });
+    const widget = new FakeWidget(file);
+    editors.add(widget);
+    await settle();
+    expect(client.take()).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain('file:///w/big.csv');
+    expect(sync.uriForFile(file)).toBeUndefined();
+    expect(sync.isSynced('file:///w/big.csv')).toBe(false);
+
+    // Edits, saves, reconnects and close send nothing while it stays too large.
+    shared.setSource(BIG + 'y');
+    file.save();
+    sync.replayOpen();
+    expect(client.take()).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // Shrunk below the limit: opened (with its current version) and synced from then on.
+    shared.setSource('small');
+    expect(client.takeAll()).toEqual([
+      { method: 'textDocument/didOpen', params: { uri: 'file:///w/big.csv', languageId: 'plaintext', version: 3, text: 'small' } }
+    ]);
+    expect(sync.uriForFile(file)).toBe('file:///w/big.csv');
+    file.dispose();
+    expect(client.take()).toEqual(['didClose file:///w/big.csv']);
+    sync.dispose();
+  });
+
+  it('closes a synced file when an edit grows it past the limit', async () => {
+    const { client, editors, sync } = await setup([]);
+    const shared = new FakeShared('small');
+    const file = new FakeContext('a.py', { sharedModel: shared });
+    editors.add(new FakeWidget(file));
+    await settle();
+    client.takeAll();
+    shared.setSource(BIG);
+    expect(client.take()).toEqual(['didClose file:///w/a.py']);
+    shared.setSource(BIG + '!');
+    file.save();
+    file.dispose(); // already closed: no second didClose
+    expect(client.take()).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    sync.dispose();
+  });
+
+  it('skips a cell (and the concat doc) above the limit in reconcile and on edits', async () => {
+    const small = new FakeCell('code', 'x = 1');
+    const big = new FakeCell('code', BIG);
+    const { client, model, sync } = await setup([small, big]);
+    // Only the small cell; the concatenation holds the big one too.
+    expect(client.take()).toEqual([`didOpen ${NB}.cell0.py`]);
+    expect(sync.uriForCell(big)).toBeUndefined();
+    expect(sync.cellForUri(`${NB}.cell1.py`)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(2); // the cell and the concat doc, once each
+
+    // The small cell grows too large: closed; the concat stays closed.
+    small.sharedModel.setSource(BIG);
+    jest.advanceTimersByTime(CONCAT_DEBOUNCE_MS);
+    expect(client.take()).toEqual([`didClose ${NB}.cell0.py`]);
+
+    // Both shrink: re-opened, the concat too.
+    small.sharedModel.setSource('a');
+    big.sharedModel.setSource('b');
+    jest.advanceTimersByTime(CONCAT_DEBOUNCE_MS);
+    expect(client.take()).toEqual([`didOpen ${NB}.cell0.py`, `didOpen ${NB}.cell1.py`, `didOpen ${NB}.cells.py`]);
+
+    // Structural change with a big new cell: nothing sent for it.
+    model.cells.insert(0, new FakeCell('code', BIG));
+    expect(client.take().filter((m) => m.startsWith('didOpen'))).toEqual([`didOpen ${NB}.cell1.py`, `didOpen ${NB}.cell2.py`]);
     sync.dispose();
   });
 });

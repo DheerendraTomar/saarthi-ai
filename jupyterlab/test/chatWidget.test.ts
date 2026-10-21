@@ -18,6 +18,7 @@ class FakeClient implements ChatClient {
   readonly answers = new Map<string, (params: Record<string, unknown>) => unknown>();
   private readonly handlers = new Map<string, Handler[]>();
   private readonly disconnects: Array<(e: CoreDisconnected) => void> = [];
+  private readonly reconnects: Array<() => void> = [];
 
   request = jest.fn(async <T>(method: string, params?: unknown): Promise<T> => {
     this.calls.push([method, params]);
@@ -34,6 +35,13 @@ class FakeClient implements ChatClient {
   onDisconnect(listener: (e: CoreDisconnected) => void) {
     this.disconnects.push(listener);
     return { isDisposed: false, dispose: () => undefined };
+  }
+  onReconnect(listener: () => void) {
+    this.reconnects.push(listener);
+    return { isDisposed: false, dispose: () => undefined };
+  }
+  reconnected(): void {
+    for (const l of this.reconnects) l();
   }
   notifyUi(method: string, params: unknown): void {
     for (const h of this.handlers.get(method) ?? []) h(params);
@@ -306,6 +314,42 @@ describe('ChatWidget', () => {
     posted.length = 0;
     client.disconnect();
     expect(posted).toEqual([]);
+  });
+
+  it('reconnect_refetches_sessions_and_history_and_readopts_the_running_turn', async () => {
+    const { client, deps, widget, posted, fromUi, types } = setup();
+    current = widget;
+    client.answers.set('chat/send', () => new Promise(() => undefined)); // the turn keeps running in the core
+    await fromUi({ type: 'ui/ready' });
+    await fromUi({ type: 'chat/send', message: 'edit it', attachments: [] });
+    client.disconnect(); // a network drop; the core keeps the turn
+    expect(deps.onChatActiveChanged).toHaveBeenLastCalledWith(false);
+    posted.length = 0;
+    client.calls.length = 0;
+
+    client.reconnected();
+    await fromUi({ type: 'noop' });
+    // The list first, then the current session's history (through which the bridge re-adopts it).
+    expect(client.methods()).toEqual(['chat/listSessions', 'chat/history']);
+    expect(client.calls[1]).toEqual(['chat/history', { sessionId: 's1' }]);
+    expect(types()).toEqual(['session/list', 'session/history', 'chat/turnState']);
+
+    // …and the bridge replays the call still awaiting approval: the turn runs here again.
+    const call = { sessionId: 's1', toolCallId: 't9', name: 'edit_file', args: {}, requiresApproval: true };
+    client.notifyUi('chat/toolCall', call);
+    expect(deps.onChatActiveChanged).toHaveBeenLastCalledWith(true);
+    expect(posted.at(-1)).toEqual({ type: 'chat/turnState', sessionId: 's1', running: true });
+  });
+
+  it('reconnect_resync_failure_is_silent', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    await fromUi({ type: 'ui/ready' });
+    posted.length = 0;
+    client.answers.set('chat/history', () => Promise.reject(new Error('unknown session')));
+    client.reconnected();
+    await fromUi({ type: 'noop' });
+    expect(posted.map((m) => m.type)).toEqual(['session/list']);
   });
 
   it('routes_editor_and_ollama_messages_to_the_host', async () => {

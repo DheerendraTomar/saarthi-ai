@@ -39,7 +39,7 @@ export interface ActiveFile {
   selection?: Range;
 }
 
-export type ChatClient = Pick<WsCoreClient, 'request' | 'onNotification' | 'onDisconnect' | 'isDisposed'>;
+export type ChatClient = Pick<WsCoreClient, 'request' | 'onNotification' | 'onDisconnect' | 'onReconnect' | 'isDisposed'>;
 
 export interface ChatWidgetDeps {
   /** The chat-ui single-file bundle. */
@@ -109,7 +109,10 @@ export function renderHtml(template: string, themeVars?: Record<string, string>)
  * notifications are forwarded to the UI. Messages are accepted only from this
  * iframe's window. If the core connection drops while a turn is running, the
  * UI gets `chat/done { stopReason: "error" }` and a `ui/error`, so it never
- * waits on a turn that cannot finish.
+ * waits on a turn that cannot finish. After a reconnect the session list and
+ * the current session's history are fetched again: the bridge sees this tab
+ * as a new one, so that `chat/history` re-adopts a session whose turn kept
+ * running in the core and replays its tool call still awaiting approval.
  */
 export class ChatWidget extends Widget {
   readonly iframe: HTMLIFrameElement;
@@ -165,6 +168,9 @@ export class ChatWidget extends Widget {
       client.onDisconnect(() => {
         // dispose()/reconnect() of a ready client also report a disconnect.
         if (!this.isDisposed) this.failActiveTurns('The LocalPilot core stopped during the reply.');
+      }),
+      client.onReconnect(() => {
+        if (!this.isDisposed) void this.resync();
       })
     );
   }
@@ -327,6 +333,16 @@ export class ChatWidget extends Widget {
     // The frame may have loaded before the theme's CSS did.
     this.postTheme(true);
     this.postActiveFile(true);
+  }
+
+  /** After a reconnect: the session list, then the current session's history (re-adopting it). */
+  private async resync(): Promise<void> {
+    try {
+      await this.postSessionList();
+      if (this.current) await this.postHistory(this.current);
+    } catch {
+      // A restarted core may not know the session any more; the UI keeps what it shows.
+    }
   }
 
   private async send(message: string, attachments: unknown[]): Promise<void> {

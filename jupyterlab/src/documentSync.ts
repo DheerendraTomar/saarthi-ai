@@ -9,6 +9,15 @@ export type SyncClient = Pick<WsCoreClient, 'notify' | 'onReconnect'>;
 /** Quiet period before a notebook's concatenated `.cells.<ext>` document is re-sent. */
 export const CONCAT_DEBOUNCE_MS = 200;
 
+/**
+ * Documents longer than this (UTF-16 code units, ~1 MB) are not synced: every
+ * sync message carries the whole text in one WebSocket frame, and a frame
+ * above Tornado's `websocket_max_message_size` (10 MiB) makes the server
+ * close the socket, after which the client reconnects and replays the same
+ * frame. Even fully escaped, 1 M units stay well below that.
+ */
+export const MAX_SYNC_CHARS = 1_000_000;
+
 // The slices of the JupyterLab 4.5 objects read here, structurally typed so
 // tests can use small fakes. `NotebookPanel` and `IDocumentWidget<FileEditor>`
 // satisfy them.
@@ -71,6 +80,8 @@ interface CellDoc {
   cell: SyncCell;
   uri: string;
   version: number;
+  /** The core has it open (false while it is above `MAX_SYNC_CHARS`). */
+  open: boolean;
   off: () => void;
 }
 
@@ -82,7 +93,7 @@ interface NotebookState {
   cells: Map<string, CellDoc>;
   /** `languageId` of every doc of the notebook (the kernel language, or `plaintext`). */
   languageId: string;
-  concat?: { uri: string; version: number };
+  concat?: { uri: string; version: number; open: boolean };
   timer?: ReturnType<typeof setTimeout>;
   off: Array<() => void>;
 }
@@ -93,7 +104,15 @@ interface FileState {
   uri: string;
   languageId: string;
   version: number;
+  open: boolean;
   off: Array<() => void>;
+}
+
+/** What a sync of one document does with its current text. */
+interface Synced {
+  uri: string;
+  version: number;
+  open: boolean;
 }
 
 function listen<T, A>(signal: ISignal<T, A>, fn: (sender: T, args: A) => void): () => void {
@@ -147,12 +166,16 @@ function concatText(model: SyncNotebookModel): string {
  * - After the client re-initializes (`onReconnect`, a fresh core with an empty
  *   overlay) everything is re-opened. Nothing is replayed on the first
  *   connect: notifications sent before it are queued by the client.
+ * - A document above `MAX_SYNC_CHARS` is not synced (a console warning, once
+ *   per URI): never opened, or closed when an edit grows it past the limit,
+ *   and opened again once it shrinks below it.
  */
 export class DocumentSync implements IDisposable {
   private root: string | undefined;
   private readonly notebooks = new Map<SyncContext<SyncNotebookModel>, NotebookState>();
   private readonly files = new Map<SyncContext<unknown>, FileState>();
   private readonly off: Array<() => void> = [];
+  private readonly warnedTooLarge = new Set<string>();
   private disposed = false;
 
   constructor(
@@ -216,7 +239,7 @@ export class DocumentSync implements IDisposable {
   cellForUri(virtualUri: string): { notebook: SyncNotebookPanel; cellId: string } | undefined {
     for (const st of this.notebooks.values()) {
       for (const [cellId, doc] of st.cells) {
-        if (!sameUri(doc.uri, virtualUri)) continue;
+        if (!doc.open || !sameUri(doc.uri, virtualUri)) continue;
         const notebook = st.panels[st.panels.length - 1];
         return notebook ? { notebook, cellId } : undefined;
       }
@@ -228,7 +251,7 @@ export class DocumentSync implements IDisposable {
   uriForCell(cell: Pick<SyncCell, 'id'>): string | undefined {
     for (const st of this.notebooks.values()) {
       const doc = st.cells.get(cell.id);
-      if (doc) return doc.uri;
+      if (doc) return doc.open ? doc.uri : undefined;
     }
     return undefined;
   }
@@ -236,7 +259,7 @@ export class DocumentSync implements IDisposable {
   /** Whether `uri` is a document synced to the core (a code cell or a file editor's file). */
   isSynced(uri: string): boolean {
     if (this.cellForUri(uri)) return true;
-    for (const st of this.files.values()) if (sameUri(st.uri, uri)) return true;
+    for (const st of this.files.values()) if (st.open && sameUri(st.uri, uri)) return true;
     return false;
   }
 
@@ -245,22 +268,66 @@ export class DocumentSync implements IDisposable {
    * (`IDocumentWidget.context`); undefined for untracked files and notebooks.
    */
   uriForFile(context: object): string | undefined {
-    return this.files.get(context as SyncContext<unknown>)?.uri;
+    const st = this.files.get(context as SyncContext<unknown>);
+    return st?.open ? st.uri : undefined;
   }
 
   /** Re-sends `didOpen` for every synced document (a re-initialized core has an empty overlay). */
   replayOpen(): void {
     if (this.disposed) return;
     for (const st of this.notebooks.values()) {
-      for (const doc of st.cells.values()) this.openCell(st, doc);
+      for (const doc of st.cells.values()) this.openDoc(doc, st.languageId, doc.cell.sharedModel.getSource());
       if (st.concat) {
         clearTimeout(st.timer);
         st.timer = undefined;
         st.concat.version += 1;
-        this.openConcat(st);
+        this.openDoc(st.concat, st.languageId, concatText(st.context.model));
       }
     }
-    for (const st of this.files.values()) this.openFile(st);
+    for (const st of this.files.values()) this.openDoc(st, st.languageId, st.text.getSource());
+  }
+
+  // ---------------------------------------------------------------- size gate
+
+  private tooLarge(uri: string, text: string): boolean {
+    if (text.length <= MAX_SYNC_CHARS) return false;
+    if (!this.warnedTooLarge.has(uri)) {
+      this.warnedTooLarge.add(uri);
+      console.warn(
+        `LocalPilot: not syncing ${uri} (${text.length} characters, above ${MAX_SYNC_CHARS}); ` +
+          'completions and chat will not see its unsaved text'
+      );
+    }
+    return true;
+  }
+
+  /** `didOpen` with `text`, unless it is too large (then the doc stays closed). */
+  private openDoc(doc: Synced, languageId: string, text: string): void {
+    doc.open = false;
+    if (this.tooLarge(doc.uri, text)) return;
+    this.client.notify('textDocument/didOpen', { uri: doc.uri, languageId, version: doc.version, text });
+    doc.open = true;
+  }
+
+  /** The doc's text changed (its version already bumped): `didChange`, or close / re-open across the size limit. */
+  private changeDoc(doc: Synced, languageId: string, text: string): void {
+    if (this.tooLarge(doc.uri, text)) {
+      this.closeDoc(doc);
+    } else if (!doc.open) {
+      this.openDoc(doc, languageId, text);
+    } else {
+      this.client.notify('textDocument/didChange', { uri: doc.uri, version: doc.version, contentChanges: [{ text }] });
+    }
+  }
+
+  /** `didClose` if the core has it open. */
+  private closeDoc(doc: Synced): void {
+    if (doc.open) this.client.notify('textDocument/didClose', { uri: doc.uri });
+    doc.open = false;
+  }
+
+  private saveDoc(doc: Synced): void {
+    if (doc.open) this.client.notify('textDocument/didSave', { uri: doc.uri });
   }
 
   // ---------------------------------------------------------------- notebooks
@@ -325,14 +392,14 @@ export class DocumentSync implements IDisposable {
     for (const [id, doc] of st.cells) {
       const want = desired.get(id);
       if (!relabel && want && want.uri === doc.uri && want.cell === doc.cell) continue;
-      this.client.notify('textDocument/didClose', { uri: doc.uri });
+      this.closeDoc(doc);
       doc.off();
       st.cells.delete(id);
       changed = true;
     }
     for (const [id, { cell, uri }] of desired) {
       if (st.cells.has(id)) continue;
-      const doc: CellDoc = { cell, uri, version: 1, off: () => undefined };
+      const doc: CellDoc = { cell, uri, version: 1, open: false, off: () => undefined };
       doc.off = listen(cell.sharedModel.changed, (_, change) => {
         if (change.sourceChange !== undefined) this.cellEdited(st, doc);
       });
@@ -345,11 +412,11 @@ export class DocumentSync implements IDisposable {
     if (st.concat && (relabel || st.concat.uri !== wantConcat)) {
       clearTimeout(st.timer);
       st.timer = undefined;
-      this.client.notify('textDocument/didClose', { uri: st.concat.uri });
+      this.closeDoc(st.concat);
       st.concat = undefined;
     }
     if (wantConcat && !st.concat) {
-      st.concat = { uri: wantConcat, version: 1 };
+      st.concat = { uri: wantConcat, version: 1, open: false };
       this.openConcat(st);
     } else if (changed) {
       this.scheduleConcat(st);
@@ -357,31 +424,16 @@ export class DocumentSync implements IDisposable {
   }
 
   private openCell(st: NotebookState, doc: CellDoc): void {
-    this.client.notify('textDocument/didOpen', {
-      uri: doc.uri,
-      languageId: st.languageId,
-      version: doc.version,
-      text: doc.cell.sharedModel.getSource()
-    });
+    this.openDoc(doc, st.languageId, doc.cell.sharedModel.getSource());
   }
 
   private openConcat(st: NotebookState): void {
-    if (!st.concat) return;
-    this.client.notify('textDocument/didOpen', {
-      uri: st.concat.uri,
-      languageId: st.languageId,
-      version: st.concat.version,
-      text: concatText(st.context.model)
-    });
+    if (st.concat) this.openDoc(st.concat, st.languageId, concatText(st.context.model));
   }
 
   private cellEdited(st: NotebookState, doc: CellDoc): void {
     doc.version += 1;
-    this.client.notify('textDocument/didChange', {
-      uri: doc.uri,
-      version: doc.version,
-      contentChanges: [{ text: doc.cell.sharedModel.getSource() }]
-    });
+    this.changeDoc(doc, st.languageId, doc.cell.sharedModel.getSource());
     this.scheduleConcat(st);
   }
 
@@ -392,17 +444,13 @@ export class DocumentSync implements IDisposable {
       st.timer = undefined;
       if (!st.concat) return;
       st.concat.version += 1;
-      this.client.notify('textDocument/didChange', {
-        uri: st.concat.uri,
-        version: st.concat.version,
-        contentChanges: [{ text: concatText(st.context.model) }]
-      });
+      this.changeDoc(st.concat, st.languageId, concatText(st.context.model));
     }, CONCAT_DEBOUNCE_MS);
   }
 
   private saveNotebook(st: NotebookState): void {
-    for (const doc of st.cells.values()) this.client.notify('textDocument/didSave', { uri: doc.uri });
-    if (st.concat) this.client.notify('textDocument/didSave', { uri: st.concat.uri });
+    for (const doc of st.cells.values()) this.saveDoc(doc);
+    if (st.concat) this.saveDoc(st.concat);
   }
 
   /** Sends `didClose` for every virtual doc of the notebook and forgets them (the state stays). */
@@ -410,11 +458,11 @@ export class DocumentSync implements IDisposable {
     clearTimeout(st.timer);
     st.timer = undefined;
     for (const doc of st.cells.values()) {
-      this.client.notify('textDocument/didClose', { uri: doc.uri });
+      this.closeDoc(doc);
       doc.off();
     }
     st.cells.clear();
-    if (st.concat) this.client.notify('textDocument/didClose', { uri: st.concat.uri });
+    if (st.concat) this.closeDoc(st.concat);
     st.concat = undefined;
   }
 
@@ -432,28 +480,24 @@ export class DocumentSync implements IDisposable {
     if (this.disposed || this.root === undefined || widget.isDisposed || context.isDisposed) return;
     if (this.files.has(context)) return;
     const text = widget.content.model.sharedModel;
-    const st: FileState = { context, text, uri: '', languageId: '', version: 1, off: [] };
+    const st: FileState = { context, text, uri: '', languageId: '', version: 1, open: false, off: [] };
     this.setFilePath(st);
     st.off.push(
       listen(text.changed, (_, change) => {
         if (change.sourceChange === undefined) return;
         st.version += 1;
-        this.client.notify('textDocument/didChange', {
-          uri: st.uri,
-          version: st.version,
-          contentChanges: [{ text: text.getSource() }]
-        });
+        this.changeDoc(st, st.languageId, text.getSource());
       }),
       listen(context.pathChanged, () => {
-        this.client.notify('textDocument/didClose', { uri: st.uri });
+        this.closeDoc(st);
         this.setFilePath(st);
         this.openFile(st);
       }),
       listen(context.saveState, (_, state) => {
-        if (state === 'completed') this.client.notify('textDocument/didSave', { uri: st.uri });
+        if (state === 'completed') this.saveDoc(st);
       }),
       listen(context.disposed, () => {
-        this.client.notify('textDocument/didClose', { uri: st.uri });
+        this.closeDoc(st);
         for (const off of st.off) off();
         this.files.delete(context);
       })
@@ -468,11 +512,6 @@ export class DocumentSync implements IDisposable {
   }
 
   private openFile(st: FileState): void {
-    this.client.notify('textDocument/didOpen', {
-      uri: st.uri,
-      languageId: st.languageId,
-      version: st.version,
-      text: st.text.getSource()
-    });
+    this.openDoc(st, st.languageId, st.text.getSource());
   }
 }

@@ -42,3 +42,46 @@ describe('StatusItem', () => {
     item.dispose();
   });
 });
+
+describe('StatusItem connection errors and tooltips', () => {
+  it('shows the unreachable state with its reason', () => {
+    const item = new StatusItem();
+    item.setConnectionState('error', 'LocalPilot server extension not reachable: 5 connection attempts failed');
+    expect(item.text).toBe('LocalPilot unreachable');
+    expect(item.tooltip).toContain('5 connection attempts failed');
+    expect(item.tooltip).toContain('jupyter server extension list');
+    expect(item.hasClass('jp-LocalPilotStatus-error')).toBe(true);
+    item.setConnectionState('ready');
+    expect(item.text).toBe('LocalPilot');
+    expect(item.hasClass('jp-LocalPilotStatus-error')).toBe(false);
+    item.dispose();
+  });
+
+  it('every tooltip says a click opens the command menu, never that it acts by itself', () => {
+    const item = new StatusItem();
+    const tooltips: string[] = [];
+    const seen = () => tooltips.push(item.tooltip);
+    seen();
+    item.setConnectionState('ready');
+    seen();
+    item.setChatActive(true);
+    seen();
+    item.setCompletionsEnabled(false);
+    seen();
+    item.setStatus({ ollama: 'modelMissing', detail: 'model qwen not pulled' });
+    seen();
+    item.setStatus({ ollama: 'down', detail: 'connection refused' });
+    seen();
+    item.setConnectionState('crashed', 'boom');
+    seen();
+    item.setConnectionState('error', 'unreachable');
+    seen();
+    item.setPull(10);
+    seen();
+    for (const t of tooltips) {
+      expect(t).not.toMatch(/Click to /);
+      if (t.includes('Click')) expect(t).toContain('Click for LocalPilot commands');
+    }
+    item.dispose();
+  });
+});

@@ -18,10 +18,12 @@ import { WsCoreClient } from './client';
 import { COMMANDS, checkStatus, registerCommands, startOllama, pullModel, type CommandDeps } from './commands';
 import { DocumentSync } from './documentSync';
 import { LocalPilotInlineProvider } from './inlineProvider';
+import { unreachableStatus, watchUnreachable } from './reachability';
 import { PLUGIN_ID, fetchStatus, readSettings, restartCore, watchSettings, type Settings } from './settings';
 import { StatusItem } from './status';
 
-export { CoreDisconnected, WsCoreClient, rpcUrl } from './client';
+export { CoreDisconnected, ServerUnreachable, WsCoreClient, rpcUrl } from './client';
+export { UNREACHABLE_MESSAGE, unreachableStatus, watchUnreachable } from './reachability';
 export type { ConnectionState, InitializeResult, OllamaStatus, WsCoreClientOptions } from './client';
 export * from './cellUri';
 export { applyEdit } from './chat/applyEdit';
@@ -105,6 +107,15 @@ const plugin: JupyterFrontEndPlugin<void> = {
     const status = new StatusItem();
     status.setCompletionsEnabled(settings.completionsEnabled);
     disposables.add(client.onStateChanged((state) => status.setConnectionState(state, client.lastError?.message)));
+    // Never reachable (server extension not loaded, wrong env, 403/404): say so
+    // once, with a Retry, instead of "connecting" forever.
+    disposables.add(
+      watchUnreachable(client, {
+        show: (message, retry) =>
+          Notification.error(message, { autoClose: false, actions: [{ label: 'Retry', callback: () => retry() }] }),
+        dismiss: (id) => Notification.dismiss(id)
+      })
+    );
 
     /** Restarts the core (with `s`, else the server's current settings). */
     const restart = async (s?: Settings) => {
@@ -112,8 +123,9 @@ const plugin: JupyterFrontEndPlugin<void> = {
         await restartCore(serverSettings, s);
       } finally {
         // A running core's exit closes our socket (1012) and the client
-        // reconnects by itself; a crashed one never had a socket to close.
-        if (client.state === 'crashed') client.reconnect();
+        // reconnects by itself; a crashed one never had a socket to close,
+        // and an unreachable one retries only when asked.
+        if (client.state === 'crashed' || client.state === 'error') client.reconnect();
       }
     };
 
@@ -143,7 +155,13 @@ const plugin: JupyterFrontEndPlugin<void> = {
       if (!s.rootDir) throw new Error('the server did not report rootDir');
       return s.rootDir;
     });
-    rootDir.catch((e) => console.error('LocalPilot: document sync disabled', e));
+    rootDir.catch((e) => {
+      console.error('LocalPilot: document sync disabled', e);
+      // 404: the server extension is not loaded; 403: not allowed. The socket
+      // would only ever fail too, so stop waiting for it.
+      const code = unreachableStatus(e);
+      if (code !== undefined) client.markUnreachable(`GET /localpilot/status answered ${code}`);
+    });
     const sync = new DocumentSync(client, notebookTracker, editorTracker, { rootDir });
     disposables.add(sync);
 
