@@ -23,7 +23,7 @@
 //   completion/request  → { items: [{ text: "fake()", range: <empty range at params.position> }] }
 //   chat/send           → {} then: chat/token ×2, chat/toolCall (edit_file, requiresApproval, diff
 //                          preview), waits for chat/approve; on once/always sends the client a
-//                          `workspace/applyEdit` request (id -1, -2, …) and reports its `applied`;
+//                          `workspace/applyEdit` request (id -1, -2, …; params include the sessionId) and reports its `applied`;
 //                          on deny skips the edit; then chat/toolResult and chat/done { stopReason: "done" }.
 //                          A second chat/send while that session's turn runs → -32602.
 //   chat/approve        → {}            chat/stop { sessionId } → {} (ends that session's waiting turn with
@@ -136,6 +136,7 @@ async function chatTurn(sessionId, message) {
     const res = await requestClient("workspace/applyEdit", {
       ops: [{ kind: "edit", uri, range: { start: zero, end: zero }, newText: "fake()\n" }],
       save: true,
+      sessionId,
     });
     ok = Boolean(res?.result?.applied);
     summary = ok ? "edited a.py" : `edit failed: ${res?.result?.error ?? res?.error?.message ?? "unknown"}`;

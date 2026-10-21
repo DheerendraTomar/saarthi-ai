@@ -73,6 +73,9 @@ Additions beyond the spec:
   background workspace index build finishes.
 - **`InitializeResult.indexStatus`** (`"building" | "ready"`): `initialize`
   returns `{ capabilities, ollamaStatus, indexStatus }`.
+- **`sessionId` on `workspace/applyEdit` and `workspace/runCommand`**: both
+  requests carry the `sessionId` of the chat turn that asked for them, so a
+  client serving several sessions (the JupyterLab bridge) can route them.
 - **One Ollama status shape everywhere: `{ ollama, detail }`**, with
   `ollama` one of `"ok" | "down" | "modelMissing"`. It is
   `InitializeResult.ollamaStatus`, the `ollama/status` result and the params

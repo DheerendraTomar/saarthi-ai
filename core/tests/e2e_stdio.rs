@@ -302,6 +302,7 @@ async fn completion_and_approved_edit_over_stdio() {
 
     let edit = core.server_request("workspace/applyEdit").await;
     assert_eq!(edit["params"]["ops"][0]["uri"], ws.uri("main.py"), "{edit}");
+    assert_eq!(edit["params"]["sessionId"], session_id.as_str(), "{edit}");
     assert_eq!(edit["params"]["ops"][0]["newText"], "print(add(3, 4))");
     let edit_id = edit["id"].clone();
     core.reply(&edit_id, json!({"applied": true})).await;

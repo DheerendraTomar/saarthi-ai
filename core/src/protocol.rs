@@ -409,6 +409,10 @@ pub struct ChatDone {
 pub struct ApplyEditParams {
     pub ops: Vec<EditOp>,
     pub save: bool,
+    /// The chat session whose turn asked for the edit, so a client serving
+    /// several sessions (the JupyterLab bridge) can route it to the right UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,6 +448,9 @@ pub struct RunCommandParams {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The chat session whose turn asked for the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +594,7 @@ mod tests {
                 },
             ],
             save: true,
+            session_id: Some("s1".into()),
         };
         let v = serde_json::to_value(&params).unwrap();
         assert_eq!(
@@ -598,7 +606,8 @@ mod tests {
                      "newText": "xyz"},
                     {"kind": "create", "uri": "file:///b.rs", "content": "fn main() {}"}
                 ],
-                "save": true
+                "save": true,
+                "sessionId": "s1"
             })
         );
         let back: ApplyEditParams = serde_json::from_value(v).unwrap();
@@ -767,9 +776,15 @@ mod tests {
         let v = serde_json::to_value(RunCommandParams {
             command: "ls".into(),
             cwd: None,
+            session_id: None,
         })
         .unwrap();
         assert_eq!(v, json!({"command": "ls"}));
+        let p: RunCommandParams =
+            serde_json::from_value(json!({"command": "ls", "sessionId": "s"})).unwrap();
+        assert_eq!(p.session_id.as_deref(), Some("s"));
+        let p: ApplyEditParams = serde_json::from_value(json!({"ops": [], "save": false})).unwrap();
+        assert_eq!(p.session_id, None);
         assert_eq!(serde_json::to_value(ChatSendResult {}).unwrap(), json!({}));
     }
 }

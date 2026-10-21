@@ -450,7 +450,8 @@ async fn edit_file_waits_for_approval_then_sends_apply_edit_with_diff_preview() 
                 "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 15}},
                 "newText": "new_call();"
             }],
-            "save": true
+            "save": true,
+            "sessionId": SESSION
         })
     );
     assert_eq!(
@@ -596,6 +597,15 @@ async fn always_skips_second_prompt() {
         .filter(|r| r.method == "workspace/runCommand")
         .map(|r| r.params["command"].clone())
         .collect();
+    // Every command names the session whose turn asked for it.
+    assert!(
+        env.ctx
+            .requests()
+            .iter()
+            .all(|r| r.params["sessionId"] == SESSION),
+        "{:?}",
+        env.ctx.requests()
+    );
     assert_eq!(
         commands,
         [

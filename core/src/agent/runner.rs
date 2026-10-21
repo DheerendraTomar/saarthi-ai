@@ -1047,6 +1047,7 @@ impl Turn<'_> {
                 let params = RunCommandParams {
                     command,
                     cwd: Some(cwd.to_string_lossy().into_owned()),
+                    session_id: Some(self.session_id()),
                 };
                 // Raced against stop: a command can run for minutes. The
                 // client is not told to kill it, so say so.
@@ -1084,6 +1085,7 @@ impl Turn<'_> {
         let params = ApplyEditParams {
             ops: vec![op],
             save: true,
+            session_id: Some(self.session_id()),
         };
         match self.ctx.request(methods::APPLY_EDIT, to_json(params)).await {
             Err(err) => {
