@@ -233,6 +233,14 @@ export class DocumentSync implements IDisposable {
     return undefined;
   }
 
+  /**
+   * The `file://` URI of a synced file editor's document, by its context
+   * (`IDocumentWidget.context`); undefined for untracked files and notebooks.
+   */
+  uriForFile(context: object): string | undefined {
+    return this.files.get(context as SyncContext<unknown>)?.uri;
+  }
+
   /** Re-sends `didOpen` for every synced document (a re-initialized core has an empty overlay). */
   replayOpen(): void {
     if (this.disposed) return;

@@ -1,4 +1,5 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
+import { ICompletionProviderManager } from '@jupyterlab/completer';
 import { IEditorTracker } from '@jupyterlab/fileeditor';
 import { INotebookTracker } from '@jupyterlab/notebook';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
@@ -6,6 +7,7 @@ import { IStatusBar } from '@jupyterlab/statusbar';
 import { DisposableSet } from '@lumino/disposable';
 import { WsCoreClient } from './client';
 import { DocumentSync } from './documentSync';
+import { LocalPilotInlineProvider } from './inlineProvider';
 import { PLUGIN_ID, fetchStatus, readSettings, restartCore, watchSettings, type Settings } from './settings';
 import { StatusItem } from './status';
 
@@ -14,6 +16,8 @@ export type { ConnectionState, InitializeResult, OllamaStatus, WsCoreClientOptio
 export * from './cellUri';
 export { CONCAT_DEBOUNCE_MS, DocumentSync } from './documentSync';
 export type { DocumentSyncOptions, SyncClient, SyncNotebookPanel } from './documentSync';
+export { LocalPilotInlineProvider } from './inlineProvider';
+export type { InlineClient, InlineProviderOptions, InlineSync } from './inlineProvider';
 export * from './settings';
 export { StatusItem } from './status';
 
@@ -32,13 +36,14 @@ const plugin: JupyterFrontEndPlugin<void> = {
   description: 'LocalPilot: local Ollama-backed inline completions and agent chat.',
   autoStart: true,
   requires: [ISettingRegistry],
-  optional: [IStatusBar, INotebookTracker, IEditorTracker],
+  optional: [IStatusBar, INotebookTracker, IEditorTracker, ICompletionProviderManager],
   activate: async (
     app: JupyterFrontEnd,
     registry: ISettingRegistry,
     statusBar: IStatusBar | null,
     notebookTracker: INotebookTracker | null,
-    editorTracker: IEditorTracker | null
+    editorTracker: IEditorTracker | null,
+    completionManager: ICompletionProviderManager | null
   ) => {
     const serverSettings = app.serviceManager.serverSettings;
     const pluginSettings = await registry.load(PLUGIN_ID);
@@ -89,7 +94,17 @@ const plugin: JupyterFrontEndPlugin<void> = {
       return s.rootDir;
     });
     rootDir.catch((e) => console.error('LocalPilot: document sync disabled', e));
-    disposables.add(new DocumentSync(client, notebookTracker, editorTracker, { rootDir }));
+    const sync = new DocumentSync(client, notebookTracker, editorTracker, { rootDir });
+    disposables.add(sync);
+
+    // Ghost-text completions through JupyterLab's inline completer (listed in
+    // its settings as "LocalPilot provider", enabled by default). The manager
+    // cannot unregister a provider: after deactivate it answers nothing.
+    if (completionManager) {
+      const inline = new LocalPilotInlineProvider({ client, sync, settings: () => settings });
+      completionManager.registerInlineProvider(inline);
+      disposables.add(inline);
+    }
 
     // No beforeunload disposal: it fires before the user can choose "Stay"
     // (JupyterLab prompts on unsaved work). On a real unload the browser closes

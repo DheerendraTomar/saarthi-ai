@@ -2368,6 +2368,34 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@jupyterlab/completer@npm:~4.5.0":
+  version: 4.5.11
+  resolution: "@jupyterlab/completer@npm:4.5.11"
+  dependencies:
+    "@codemirror/state": ^6.5.4
+    "@codemirror/view": ^6.39.14
+    "@jupyter/ydoc": ^3.1.0
+    "@jupyterlab/apputils": ^4.6.11
+    "@jupyterlab/codeeditor": ^4.5.11
+    "@jupyterlab/codemirror": ^4.5.11
+    "@jupyterlab/coreutils": ^6.5.11
+    "@jupyterlab/rendermime": ^4.5.11
+    "@jupyterlab/services": ^7.5.11
+    "@jupyterlab/settingregistry": ^4.5.11
+    "@jupyterlab/statedb": ^4.5.11
+    "@jupyterlab/translation": ^4.5.11
+    "@jupyterlab/ui-components": ^4.5.11
+    "@lumino/algorithm": ^2.0.4
+    "@lumino/coreutils": ^2.2.2
+    "@lumino/disposable": ^2.1.5
+    "@lumino/domutils": ^2.0.4
+    "@lumino/messaging": ^2.0.4
+    "@lumino/signaling": ^2.1.5
+    "@lumino/widgets": ^2.7.5
+  checksum: b4f71651a43e709ece3415144752ca3835298c7e37e68825bc024ec7dd24366118d05b43bda0d6b520e4aa25e07092a86de01c9434a017b951bbe66683b371c9
+  languageName: node
+  linkType: hard
+
 "@jupyterlab/coreutils@npm:~6.5.0":
   version: 6.5.11
   resolution: "@jupyterlab/coreutils@npm:6.5.11"
@@ -7463,6 +7491,7 @@ __metadata:
     "@eslint/js": 9.15.0
     "@jupyterlab/application": ~4.5.0
     "@jupyterlab/builder": ~4.5.0
+    "@jupyterlab/completer": ~4.5.0
     "@jupyterlab/coreutils": ~6.5.0
     "@jupyterlab/fileeditor": ~4.5.0
     "@jupyterlab/notebook": ~4.5.0

@@ -369,6 +369,8 @@ describe('DocumentSync', () => {
         params: { uri: 'file:///w/src/my%20mod.py', languageId: 'python', version: 1, text: 'import os' }
       }
     ]);
+    expect(sync.uriForFile(file)).toBe('file:///w/src/my%20mod.py');
+    expect(sync.uriForFile({})).toBeUndefined();
 
     file.model.sharedModel.setSource('import sys');
     a.sharedModel.setSource('a2'); // concat update pending when the core goes away
@@ -397,6 +399,7 @@ describe('DocumentSync', () => {
     expect(client.take()).toEqual(['didSave file:///w/src/my%20mod.py']);
     file.dispose();
     expect(client.take()).toEqual(['didClose file:///w/src/my%20mod.py']);
+    expect(sync.uriForFile(file)).toBeUndefined();
 
     sync.dispose();
     client.reconnected();
