@@ -19,7 +19,7 @@ On macOS arm64, with Rust, Node.js 20+ and a JDK 25 (e.g. Temurin 25):
 
 ```sh
 npm ci                                   # once, at the repo root
-bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.0.zip
+bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.1.zip
 ```
 
 The script builds the release core (`scripts/build-core.sh`; `SKIP_CORE_BUILD=1`
@@ -37,7 +37,7 @@ machine's), so it is effectively macOS arm64 only. On another platform, set
 ## Install
 
 1. In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** and pick
-   `<repo>/dist/localpilot-jetbrains-0.1.0.zip`.
+   `<repo>/dist/localpilot-jetbrains-0.1.1.zip`.
 2. PyCharm 2026.2 loads it without a restart (all of LocalPilot's extension
    points are dynamic). Projects that are already open are set up when the plugin
    loads (document sync, chat hooks, core), and again lazily when the LocalPilot

@@ -59,11 +59,11 @@ Needs a JDK 25 (e.g. Temurin 25), Node.js 20+, and Rust to build the core (or
 
 ```sh
 npm ci
-bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.0.zip
+bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.1.zip
 ```
 
 In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** →
-`dist/localpilot-jetbrains-0.1.0.zip` (it loads without a restart; if an open
+`dist/localpilot-jetbrains-0.1.1.zip` (it loads without a restart; if an open
 project looks inert, reopen it). With Ollama running and the
 models pulled (above), ghost text appears in files and notebook cells, and
 `Cmd+Shift+L` opens the chat tool window. Settings, the manual smoke checklist and
