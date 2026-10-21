@@ -3,7 +3,7 @@ import type { CompletionHandler, IInlineCompletionContext, InlineCompletionTrigg
 import { Text } from '@jupyterlab/coreutils';
 import { Signal } from '@lumino/signaling';
 import type { Widget } from '@lumino/widgets';
-import { LocalPilotInlineProvider, type InlineClient, type InlineSync } from '../src/inlineProvider';
+import { DEFAULT_TIMEOUT_MS, LocalPilotInlineProvider, type InlineClient, type InlineSync } from '../src/inlineProvider';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings';
 
 // Stand-ins for the JupyterLab 4.5 objects the provider reads from
@@ -76,8 +76,9 @@ function req(text: string, jsIdx = text.length): CompletionHandler.IRequest {
   return { text, offset: Text.jsIndexToCharIndex(jsIdx, text), mimeType: 'text/x-python' };
 }
 
-function ctx(widget: object): IInlineCompletionContext {
-  return { widget: widget as unknown as Widget, triggerKind: 1 as InlineCompletionTriggerKind.Automatic };
+/** Typing (`Automatic`, 1) unless `invoke` (`Invoke`, 0: Alt+\\). */
+function ctx(widget: object, invoke = false): IInlineCompletionContext {
+  return { widget: widget as unknown as Widget, triggerKind: (invoke ? 0 : 1) as InlineCompletionTriggerKind };
 }
 
 const RANGE = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
@@ -86,16 +87,18 @@ let client: FakeClient;
 let sync: FakeSync;
 let settings: Settings;
 let provider: LocalPilotInlineProvider;
+let attachment: { dispose(): void };
 
 beforeEach(() => {
   client = new FakeClient();
   sync = new FakeSync();
   settings = { ...DEFAULT_SETTINGS };
-  provider = new LocalPilotInlineProvider({ client, sync, settings: () => settings });
+  provider = new LocalPilotInlineProvider();
+  attachment = provider.attach({ client, sync, settings: () => settings });
 });
 
 afterEach(() => {
-  provider.dispose();
+  attachment.dispose();
   jest.useRealTimers();
 });
 
@@ -103,11 +106,12 @@ afterEach(() => {
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 describe('LocalPilotInlineProvider', () => {
-  it('identifies itself and defaults the completer debounce to completionDebounceMs', () => {
+  it('identifies itself and defaults the completer debounce and timeout', () => {
     expect(provider.identifier).toBe('localpilot');
     expect(provider.name).toBe('LocalPilot');
     settings = { ...settings, completionDebounceMs: 321 };
-    expect(provider.schema.default).toEqual({ enabled: true, debouncerDelay: 321 });
+    expect(DEFAULT_TIMEOUT_MS).toBe(20000);
+    expect(provider.schema.default).toEqual({ enabled: true, debouncerDelay: 321, timeout: 20000 });
   });
 
   it('fetch_sends_request_for_cell_uri_with_utf16_position', async () => {
@@ -148,10 +152,11 @@ describe('LocalPilotInlineProvider', () => {
   });
 
   it('abort_sends_cancel', async () => {
-    const { widget } = notebookWidget('c1', 'x = ');
+    const { widget, model } = notebookWidget('c1', 'x = ');
     const first = provider.fetch(req('x = '), ctx(widget));
     await flush();
     // The completer moved on (a newer keystroke): the in-flight request is cancelled.
+    model.sharedModel.setSource('x = 1');
     const second = provider.fetch(req('x = 1'), ctx(widget));
     await flush();
     expect(client.requests[0].signal?.aborted).toBe(true);
@@ -162,27 +167,71 @@ describe('LocalPilotInlineProvider', () => {
     await second;
   });
 
-  it('cancels a request the completer has timed out', async () => {
-    jest.useFakeTimers();
-    provider.configure({ enabled: true, debouncerDelay: 0, timeout: 1000, autoFillInMiddle: false });
+  /** With fake timers: fetch, let the deferred send go out, then expect the cancel exactly `ms` after fetch. */
+  async function expectCancelAfter(ms: number, invoke = false) {
     const { widget } = notebookWidget('c1', 'x = ');
-    const result = provider.fetch(req('x = '), ctx(widget));
-    await Promise.resolve();
+    const result = provider.fetch(req('x = '), ctx(widget, invoke));
+    await jest.advanceTimersByTimeAsync(0);
     expect(client.requests).toHaveLength(1);
-    jest.advanceTimersByTime(999);
+    await jest.advanceTimersByTimeAsync(ms - 1);
     expect(client.notes).toEqual([]);
-    jest.advanceTimersByTime(1);
+    await jest.advanceTimersByTimeAsync(1);
     expect(client.notes).toEqual([{ method: 'completion/cancel', params: { requestId: '1' } }]);
     expect(await result).toEqual({ items: [] });
+  }
+
+  it('cancels a request the completer has timed out (debouncerDelay + timeout)', async () => {
+    jest.useFakeTimers();
+    provider.configure({ enabled: true, debouncerDelay: 200, timeout: 1000, autoFillInMiddle: false });
+    await expectCancelAfter(1200);
+  });
+
+  it('an explicit invoke is not debounced, so only the timeout counts', async () => {
+    jest.useFakeTimers();
+    provider.configure({ enabled: true, debouncerDelay: 200, timeout: 1000, autoFillInMiddle: false });
+    await expectCancelAfter(1000, true);
+  });
+
+  it('defaults to completionDebounceMs + 20 s before configure', async () => {
+    jest.useFakeTimers();
+    await expectCancelAfter(settings.completionDebounceMs + DEFAULT_TIMEOUT_MS);
+  });
+
+  it('sends the request after the current change emission (didChange goes first)', async () => {
+    const { widget } = notebookWidget('c1', 'x = ');
+    void provider.fetch(req('x = '), ctx(widget));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.requests).toEqual([]);
+    await flush();
+    expect(client.requests).toHaveLength(1);
+  });
+
+  it('a fetch superseded before it was sent sends nothing', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    const first = provider.fetch(req('x = '), ctx(widget));
+    model.sharedModel.setSource('x = 1');
+    void provider.fetch(req('x = 1'), ctx(widget));
+    expect(await first).toEqual({ items: [] });
+    await flush();
+    expect(client.notes).toEqual([]);
+    expect(client.requests.map((r) => r.params.requestId)).toEqual(['2']);
+  });
+
+  it('skips a request whose text is not the target cell (active cell changed while debouncing)', async () => {
+    const { widget } = notebookWidget('c1', 'other cell');
+    expect(await provider.fetch(req('x = '), ctx(widget))).toEqual({ items: [] });
+    expect(client.requests).toEqual([]);
   });
 
   it('empty_items_yield_no_suggestion', async () => {
-    const { widget } = notebookWidget('c1', 'x = ');
+    const { widget, model } = notebookWidget('c1', 'x = ');
     const result = provider.fetch(req('x = '), ctx(widget));
     await flush();
     client.requests[0].resolve({ items: [] });
     expect(await result).toEqual({ items: [] });
     // Nothing was shown, so nothing is rejected by the next fetch.
+    model.sharedModel.setSource('x = 2');
     void provider.fetch(req('x = 2'), ctx(widget));
     await flush();
     expect(client.notes).toEqual([]);
@@ -259,14 +308,59 @@ describe('LocalPilotInlineProvider', () => {
     expect(client.notes).toHaveLength(1);
   });
 
-  it('dispose cancels quietly and stops fetching', async () => {
+  it('typing through a shown suggestion keeps it pending (not rejected)', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    await show('x = ', '42\ny = x', widget);
+    // The user types the first character of the ghost text; the completer
+    // keeps it and fetches again.
+    model.sharedModel.setSource('x = 4');
+    const next = provider.fetch(req('x = 4'), ctx(widget));
+    await flush();
+    expect(client.notes).toEqual([]);
+    expect(client.requests[1].params.position).toEqual({ line: 0, character: 5 });
+    // The core serves the rest from the same cache entry: the new suggestion
+    // takes over without a report for the old one.
+    client.requests[1].resolve({ items: [{ text: '2\ny = x', range: RANGE }] });
+    expect(await next).toEqual({ items: [{ insertText: '2\ny = x' }] });
+    expect(client.notes).toEqual([]);
+    model.sharedModel.setSource('x = 42\ny = x');
+    expect(client.notes).toEqual([{ method: 'completion/accepted', params: { requestId: '2' } }]);
+  });
+
+  it('typing through then diverging rejects the suggestion', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    await show('x = ', '42', widget);
+    model.sharedModel.setSource('x = 4');
+    void provider.fetch(req('x = 4'), ctx(widget));
+    await flush();
+    client.requests[1].resolve({ items: [] }); // nothing new: the first one is still pending
+    await flush();
+    model.sharedModel.setSource('x = 47');
+    void provider.fetch(req('x = 47'), ctx(widget));
+    await flush();
+    expect(client.notes).toEqual([{ method: 'completion/rejected', params: { requestId: '1' } }]);
+  });
+
+  it('detach cancels quietly and stops fetching', async () => {
     const { widget } = notebookWidget('c1', 'x = ');
     const result = provider.fetch(req('x = '), ctx(widget));
     await flush();
-    provider.dispose();
+    attachment.dispose();
     expect(client.requests[0].signal?.aborted).toBe(true);
     expect(await result).toEqual({ items: [] });
     expect(await provider.fetch(req('x = '), ctx(widget))).toEqual({ items: [] });
     expect(client.requests).toHaveLength(1);
+    expect(client.notes).toEqual([]);
+  });
+
+  it('re-attaching serves the new activation', async () => {
+    const { widget } = notebookWidget('c1', 'x = ');
+    attachment.dispose();
+    const client2 = new FakeClient();
+    attachment = provider.attach({ client: client2, sync, settings: () => settings });
+    void provider.fetch(req('x = '), ctx(widget));
+    await flush();
+    expect(client.requests).toEqual([]);
+    expect(client2.requests).toHaveLength(1);
   });
 });

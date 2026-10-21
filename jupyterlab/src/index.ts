@@ -16,7 +16,7 @@ export type { ConnectionState, InitializeResult, OllamaStatus, WsCoreClientOptio
 export * from './cellUri';
 export { CONCAT_DEBOUNCE_MS, DocumentSync } from './documentSync';
 export type { DocumentSyncOptions, SyncClient, SyncNotebookPanel } from './documentSync';
-export { LocalPilotInlineProvider } from './inlineProvider';
+export { DEFAULT_TIMEOUT_MS, LocalPilotInlineProvider } from './inlineProvider';
 export type { InlineClient, InlineProviderOptions, InlineSync } from './inlineProvider';
 export * from './settings';
 export { StatusItem } from './status';
@@ -30,6 +30,11 @@ export { StatusItem } from './status';
  */
 /** Everything the plugin set up; disposed on `deactivate`. */
 let active: DisposableSet | undefined;
+/**
+ * The inline provider, registered once per completion manager (which cannot
+ * unregister it) and attached to each activation.
+ */
+let inlineProvider: { provider: LocalPilotInlineProvider; manager: ICompletionProviderManager } | undefined;
 
 const plugin: JupyterFrontEndPlugin<void> = {
   id: PLUGIN_ID,
@@ -98,12 +103,14 @@ const plugin: JupyterFrontEndPlugin<void> = {
     disposables.add(sync);
 
     // Ghost-text completions through JupyterLab's inline completer (listed in
-    // its settings as "LocalPilot provider", enabled by default). The manager
-    // cannot unregister a provider: after deactivate it answers nothing.
+    // its settings as "LocalPilot provider", enabled by default). Detached on
+    // deactivate (it then answers nothing) and re-attached on the next activate.
     if (completionManager) {
-      const inline = new LocalPilotInlineProvider({ client, sync, settings: () => settings });
-      completionManager.registerInlineProvider(inline);
-      disposables.add(inline);
+      if (inlineProvider?.manager !== completionManager) {
+        inlineProvider = { provider: new LocalPilotInlineProvider(), manager: completionManager };
+        completionManager.registerInlineProvider(inlineProvider.provider);
+      }
+      disposables.add(inlineProvider.provider.attach({ client, sync, settings: () => settings }));
     }
 
     // No beforeunload disposal: it fires before the user can choose "Stay"
