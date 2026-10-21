@@ -34,6 +34,8 @@ dependencies {
             providers.gradleProperty("platformType"),
             providers.gradleProperty("platformVersion"),
         )
+        // JCEF (JBCefBrowser / JBCefJSQuery) ships as the bundled "Web Browser (JCEF)" plugin in 2026.2.
+        bundledPlugin("com.intellij.modules.jcef")
         testFramework(TestFrameworkType.Platform)
     }
 }
