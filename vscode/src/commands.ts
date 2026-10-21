@@ -121,7 +121,15 @@ export async function toggleCompletions(deps: Pick<CommandDeps, "setCompletionsE
   const cfg = vscode.workspace.getConfiguration("localpilot");
   const next = !cfg.get<boolean>("completionsEnabled", true);
   deps.setCompletionsEnabled(next);
-  await cfg.update("completionsEnabled", next, vscode.ConfigurationTarget.Global);
+  // Write where the effective value comes from, so a workspace override can't make this a no-op.
+  const where = cfg.inspect<boolean>("completionsEnabled");
+  const target =
+    where?.workspaceFolderValue !== undefined
+      ? vscode.ConfigurationTarget.WorkspaceFolder
+      : where?.workspaceValue !== undefined
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+  await cfg.update("completionsEnabled", next, target);
 }
 
 async function retry(deps: CommandDeps): Promise<void> {

@@ -225,6 +225,8 @@ Object.assign(workspace, {
   onDidChangeConfiguration: editorEvents.configuration.event,
 });
 // Give getConfiguration an `update` that writes through to configValues.
+/** Full keys (`localpilot.x`) whose `configValues` entry is a workspace setting (see `inspect`). */
+export const workspaceConfigKeys = new Set<string>();
 const baseGetConfiguration = workspace.getConfiguration;
 Object.assign(workspace, {
   getConfiguration(section?: string) {
@@ -234,6 +236,12 @@ Object.assign(workspace, {
       async update(key: string, value: unknown, target?: unknown) {
         configValues[prefix + key] = value;
         registry.configUpdates.push({ key: prefix + key, value, target });
+      },
+      /** Values listed in `workspaceConfigKeys` count as workspace-level, the rest as global. */
+      inspect(key: string) {
+        const full = prefix + key;
+        if (!(full in configValues)) return { key: full };
+        return workspaceConfigKeys.has(full) ? { key: full, workspaceValue: configValues[full] } : { key: full, globalValue: configValues[full] };
       },
     };
   },
@@ -375,4 +383,5 @@ export function resetMock(): void {
   window.showQuickPick = async () => undefined;
   window.showInputBox = async () => undefined;
   for (const k of Object.keys(configValues)) delete configValues[k];
+  workspaceConfigKeys.clear();
 }

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -6,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type * as vscode from "vscode";
 import { activate, deactivate, RESTART_DEBOUNCE_MS, type LocalPilotApi } from "../src/extension";
 import { waitFor } from "./helpers/webview";
-import { configValues, editorEvents, registry, resetMock, Uri, workspace, type MockStatusBarItem } from "./mocks/vscode";
+import { configValues, editorEvents, registry, resetMock, Uri, workspace, workspaceConfigKeys, type MockStatusBarItem } from "./mocks/vscode";
 
 const extensionPath = dirname(dirname(fileURLToPath(import.meta.url)));
 let dir: string;
@@ -31,6 +32,17 @@ afterEach(async () => {
 });
 
 const start = () => activate(context as unknown as vscode.ExtensionContext) as LocalPilotApi;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const configChange = { affectsConfiguration: (s: string) => s === "localpilot" };
+
+/** Fake-core processes launched for this test's workspace (its tmp dir is unique). */
+function liveCores(): number {
+  try {
+    return execFileSync("pgrep", ["-f", `fakeCore.mjs serve --workspace ${dir}`], { encoding: "utf8" }).trim().split("\n").filter(Boolean).length;
+  } catch {
+    return 0; // pgrep exits 1 when nothing matches
+  }
+}
 const item = (): MockStatusBarItem => registry.statusBarItems[0];
 
 describe("activate", () => {
@@ -111,5 +123,53 @@ describe("activate", () => {
     await waitFor(() => states.includes("ready"), 5000, "restart");
     // One restart for the burst of changes.
     expect(states).toEqual(["stopped", "starting", "ready"]);
+  });
+
+  it("overlapping_restarts_leave_exactly_one_core", async () => {
+    const api = start();
+    await api.ready;
+    expect(liveCores()).toBe(1);
+    // Restart Core twice while a debounced settings restart is also due.
+    configValues["localpilot.completionMaxTokens"] = 40;
+    editorEvents.configuration.fire(configChange);
+    const r1 = registry.commands.get("localpilot.restartCore")!() as Promise<void>;
+    const r2 = registry.commands.get("localpilot.restartCore")!() as Promise<void>;
+    await Promise.all([r1, r2]);
+    await sleep(RESTART_DEBOUNCE_MS + 100);
+    await waitFor(() => api.client.state === "ready", 5000, "ready");
+    await sleep(300); // let any stray launch show up
+    expect(api.client.state).toBe("ready");
+    expect(liveCores()).toBe(1);
+    await deactivate();
+    await waitFor(() => liveCores() === 0, 5000, "all cores gone");
+  });
+
+  it("client_only_settings_do_not_restart_core", async () => {
+    const api = start();
+    await api.ready;
+    const states: string[] = [];
+    api.client.onDidChangeState((s) => states.push(s));
+    configValues["localpilot.completionsEnabled"] = false;
+    configValues["localpilot.completionDebounceMs"] = 250;
+    editorEvents.configuration.fire(configChange);
+    await sleep(RESTART_DEBOUNCE_MS + 200);
+    expect(states).toEqual([]);
+    expect(item().text).toBe("$(debug-pause) completions paused");
+  });
+
+  it("toggle_writes_to_the_scope_that_defines_the_value", async () => {
+    const api = start();
+    await api.ready;
+    configValues["localpilot.completionsEnabled"] = true;
+    workspaceConfigKeys.add("localpilot.completionsEnabled");
+    await registry.commands.get("localpilot.toggleCompletions")!();
+    expect(registry.configUpdates).toEqual([{ key: "localpilot.completionsEnabled", value: false, target: 2 }]);
+  });
+
+  it("no_folder_window_has_no_dangling_status_command", () => {
+    workspace.workspaceFolders = [];
+    expect(activate(context as unknown as vscode.ExtensionContext)).toBeUndefined();
+    expect(item().command).toBeUndefined();
+    expect(registry.commands.size).toBe(0);
   });
 });

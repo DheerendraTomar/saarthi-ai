@@ -40,6 +40,7 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
 
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!root) {
+    statusBar.setCommand(undefined); // no commands are registered in a folderless window
     statusBar.setCoreState("crashed", "open a folder to use LocalPilot");
     log("info", "No workspace folder is open; LocalPilot needs one.");
     return undefined;
@@ -66,8 +67,11 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
 
   /** (Re)starts the core with the current settings; resolves the binary again each time. */
   let started = false;
-  const startCore = async (): Promise<void> => {
+  /** The settings the running core was initialized with (to skip restarts for client-only changes). */
+  let coreSettings: Settings | undefined;
+  const startCoreOnce = async (): Promise<void> => {
     settings = readSettings();
+    coreSettings = settings;
     lastCoreError = undefined;
     lastLoggedError = undefined;
     try {
@@ -86,6 +90,28 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
       started = true;
       if (client.state !== "crashed") reportCoreError(`LocalPilot core failed to start: ${errorMessage(e)}`);
     }
+  };
+
+  // Restarts are serialized: overlapping requests (Restart Core during a settings
+  // restart, a slow shutdown) coalesce into one more run instead of launching two cores.
+  let inFlight: Promise<void> | undefined;
+  let again = false;
+  const startCore = (): Promise<void> => {
+    if (inFlight) {
+      again = true;
+      return inFlight;
+    }
+    inFlight = (async () => {
+      try {
+        do {
+          again = false;
+          await startCoreOnce();
+        } while (again);
+      } finally {
+        inFlight = undefined;
+      }
+    })();
+    return inFlight;
   };
 
   const onStatus = (status: StatusNotification) => {
@@ -146,8 +172,10 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
       settings = readSettings();
       inline.updateSettings(settings);
       statusBar.setCompletionsEnabled(settings.completionsEnabled);
-      // The core takes settings only at initialize: restart it once the edits settle.
+      // The core takes settings only at initialize: restart it once the edits settle,
+      // unless only client-side settings changed (a restart would end a running chat reply).
       clearTimeout(restartTimer);
+      if (coreSettings && sameCoreSettings(coreSettings, settings)) return;
       restartTimer = setTimeout(() => void startCore(), RESTART_DEBOUNCE_MS);
     }),
     { dispose: () => clearTimeout(restartTimer) },
@@ -156,6 +184,18 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
 
   const ready = startCore();
   return { client, inline, chatView, statusBar, ready };
+}
+
+/** Settings the client applies itself; changing only these does not restart the core. */
+const CLIENT_ONLY_SETTINGS: ReadonlyArray<keyof Settings> = ["completionsEnabled", "completionDebounceMs"];
+
+export function sameCoreSettings(a: Settings, b: Settings): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)] as Array<keyof Settings>);
+  for (const k of keys) {
+    if (CLIENT_ONLY_SETTINGS.includes(k)) continue;
+    if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) return false;
+  }
+  return true;
 }
 
 export function deactivate(): Promise<unknown> | undefined {

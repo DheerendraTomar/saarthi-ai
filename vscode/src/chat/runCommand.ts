@@ -47,8 +47,22 @@ class Tail {
 }
 
 /**
- * Runs an approved `run_command` through the user's shell (the core asks only
- * after the user approved). Output is echoed to `out` and its tails returned;
+ * The child's environment: the extension host's, minus variables that would make
+ * a spawned `node`/Electron misbehave (`ELECTRON_RUN_AS_NODE`) or talk to this
+ * editor's IPC (`VSCODE_*`), as VS Code's own tasks do.
+ */
+export function commandEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k === "ELECTRON_RUN_AS_NODE" || k.startsWith("VSCODE_")) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * Runs an approved `run_command` with `shell: true` — `/bin/sh -c` on macOS/Linux,
+ * `cmd.exe /d /s /c` on Windows (the core asks only after the user approved). Output is echoed to `out` and its tails returned;
  * after `timeoutMs` the whole process group is killed and `exitCode` is -1.
  * Never throws.
  */
@@ -79,7 +93,7 @@ export function runCommand(params: RunCommandParams, out: vscode.OutputChannel, 
     let child: ReturnType<typeof spawn>;
     try {
       // detached → own process group, so a timeout kills the command's children too.
-      child = spawn(params.command, [], { shell: true, cwd, env: process.env, detached: posix, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(params.command, [], { shell: true, cwd, env: commandEnv(), detached: posix, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       settled = true;
       const msg = e instanceof Error ? e.message : String(e);

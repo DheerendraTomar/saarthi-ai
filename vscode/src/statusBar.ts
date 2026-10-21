@@ -24,6 +24,11 @@ export class StatusBar implements vscode.Disposable {
     this.item.show();
   }
 
+  /** What a click runs (undefined: nothing, e.g. in a window with no folder). */
+  setCommand(command: string | undefined): void {
+    this.item.command = command;
+  }
+
   get text(): string {
     return this.item.text;
   }

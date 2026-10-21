@@ -83,7 +83,8 @@
       {
         "command": "localpilot.openChat",
         "key": "ctrl+shift+l",
-        "mac": "cmd+shift+l"
+        "mac": "cmd+shift+l",
+        "when": "workspaceFolderCount > 0"
       }
     ],
     "configuration": {

@@ -50,6 +50,20 @@ describe("runCommand", () => {
     expect(ok).toEqual({ exitCode: 0, stdout: "one\n", stderr: "two\n" });
   });
 
+  it("runCommand_strips_editor_ipc_env", async () => {
+    const saved = { ...process.env };
+    try {
+      process.env.ELECTRON_RUN_AS_NODE = "1";
+      process.env.VSCODE_IPC_HOOK = "/tmp/ipc.sock";
+      process.env.LP_KEEP_ME = "kept";
+      const script = `const e = process.env; console.log([e.ELECTRON_RUN_AS_NODE, e.VSCODE_IPC_HOOK, e.LP_KEEP_ME].join(","))`;
+      const result = await runCommand({ command: `${node} -e ${JSON.stringify(script)}` }, channel());
+      expect(result.stdout).toBe(",,kept\n");
+    } finally {
+      process.env = saved;
+    }
+  });
+
   it("runCommand_reports_spawn_failure_without_throwing", async () => {
     const result = await runCommand({ command: "echo hi", cwd: join(dir, "does-not-exist") }, channel());
     expect(result.exitCode).toBe(-1);
