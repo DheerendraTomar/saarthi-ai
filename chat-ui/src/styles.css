@@ -1,0 +1,238 @@
+/* Theme from the host's --vscode-* variables, with neutral fallbacks so the
+   panel also works in JetBrains/JupyterLab and in `vite dev`. No external
+   fonts or images: everything here must stay CSP-safe. */
+:root {
+  --lp-fg: var(--vscode-foreground, #cccccc);
+  --lp-bg: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+  --lp-muted: var(--vscode-descriptionForeground, #9d9d9d);
+  --lp-border: var(--vscode-panel-border, var(--vscode-widget-border, #3c3c3c));
+  --lp-input-bg: var(--vscode-input-background, #2a2a2a);
+  --lp-input-fg: var(--vscode-input-foreground, var(--lp-fg));
+  --lp-input-border: var(--vscode-input-border, var(--lp-border));
+  --lp-focus: var(--vscode-focusBorder, #007fd4);
+  --lp-button-bg: var(--vscode-button-background, #0e639c);
+  --lp-button-fg: var(--vscode-button-foreground, #ffffff);
+  --lp-button-hover: var(--vscode-button-hoverBackground, #1177bb);
+  --lp-button2-bg: var(--vscode-button-secondaryBackground, #3a3d41);
+  --lp-button2-fg: var(--vscode-button-secondaryForeground, #ffffff);
+  --lp-user-bg: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.1));
+  --lp-code-bg: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
+  --lp-link: var(--vscode-textLink-foreground, #3794ff);
+  --lp-error: var(--vscode-errorForeground, #f48771);
+  --lp-warn: var(--vscode-editorWarning-foreground, #cca700);
+  --lp-ok: var(--vscode-testing-iconPassed, #73c991);
+  --lp-font: var(--vscode-font-family, system-ui, -apple-system, "Segoe UI", sans-serif);
+  --lp-font-size: var(--vscode-font-size, 13px);
+  --lp-mono: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--lp-fg);
+  background: var(--lp-bg);
+  font-family: var(--lp-font);
+  font-size: var(--lp-font-size);
+  line-height: 1.5;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--lp-border);
+}
+
+button {
+  font: inherit;
+  color: var(--lp-button-fg);
+  background: var(--lp-button-bg);
+  border: none;
+  border-radius: 2px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: var(--lp-button-hover);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button:focus-visible,
+textarea:focus-visible {
+  outline: 1px solid var(--lp-focus);
+  outline-offset: 1px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9em;
+  color: var(--lp-muted);
+  border: 1px solid var(--lp-border);
+  border-radius: 999px;
+  padding: 1px 4px 1px 10px;
+}
+.status-pill.ok {
+  padding-right: 10px;
+}
+.status-pill.ok::before,
+.status-pill.down::before,
+.status-pill.missing::before,
+.status-pill.pulling::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--lp-ok);
+}
+.status-pill.down::before {
+  background: var(--lp-error);
+}
+.status-pill.missing::before,
+.status-pill.pulling::before {
+  background: var(--lp-warn);
+}
+.status-pill button {
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.95em;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.msg {
+  overflow-wrap: anywhere;
+}
+.msg.user {
+  white-space: pre-wrap;
+  background: var(--lp-user-bg);
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+.msg.assistant.error {
+  border-left: 2px solid var(--lp-error);
+  padding-left: 8px;
+}
+.msg-error {
+  color: var(--lp-error);
+  font-size: 0.9em;
+}
+.msg.tool-call,
+.msg.tool-result {
+  font-size: 0.9em;
+  color: var(--lp-muted);
+  border: 1px solid var(--lp-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+.msg.tool-result.err {
+  color: var(--lp-error);
+}
+
+.thinking {
+  color: var(--lp-muted);
+  font-size: 0.9em;
+  margin-bottom: 4px;
+}
+.thinking summary {
+  cursor: pointer;
+}
+.thinking-body {
+  white-space: pre-wrap;
+  border-left: 2px solid var(--lp-border);
+  padding-left: 8px;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown a {
+  color: var(--lp-link);
+}
+.markdown code {
+  font-family: var(--lp-mono);
+  font-size: 0.95em;
+  background: var(--lp-code-bg);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.markdown pre {
+  background: var(--lp-code-bg);
+  border-radius: 4px;
+  padding: 8px 10px;
+  overflow-x: auto;
+}
+.markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 10px 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--lp-warn);
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+.notice button {
+  background: none;
+  color: var(--lp-fg);
+  padding: 0 4px;
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--lp-border);
+}
+.composer textarea {
+  flex: 1;
+  resize: vertical;
+  min-height: 2.5em;
+  font: inherit;
+  color: var(--lp-input-fg);
+  background: var(--lp-input-bg);
+  border: 1px solid var(--lp-input-border);
+  border-radius: 2px;
+  padding: 4px 6px;
+}
+.composer .stop {
+  background: var(--lp-button2-bg);
+  color: var(--lp-button2-fg);
+}
