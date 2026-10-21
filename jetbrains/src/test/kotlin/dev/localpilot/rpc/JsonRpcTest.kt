@@ -115,4 +115,17 @@ class JsonRpcTest {
         )
         for (line in bad) assertNull("expected null for: $line", JsonRpc.decode(line))
     }
+
+    @Test
+    fun numeric_ids_are_validated_strictly() {
+        for (id in listOf("0", "7", "-1", "-42", "1.5", "1e3", "-2E+2", "3.0e-1")) {
+            val msg = JsonRpc.decode("""{"jsonrpc":"2.0","id":$id,"result":{}}""")
+            assertTrue("id $id should be accepted", msg is RpcMessage.Response)
+            assertEquals(id, (msg as RpcMessage.Response).id.content)
+        }
+        for (id in listOf("NaN", "Infinity", "-Infinity", "nan", "abc", "01", "-", "1.", ".5", "+1", "0x10", "1e", "true", "false")) {
+            assertNull("id $id should be rejected", JsonRpc.decode("""{"jsonrpc":"2.0","id":$id,"result":{}}"""))
+            assertNull("request id $id should be rejected", JsonRpc.decode("""{"jsonrpc":"2.0","id":$id,"method":"m"}"""))
+        }
+    }
 }

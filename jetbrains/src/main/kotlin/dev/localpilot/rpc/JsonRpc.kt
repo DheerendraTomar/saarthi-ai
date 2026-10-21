@@ -36,6 +36,9 @@ data class RpcError(val code: Int, val message: String, val data: JsonElement? =
 object JsonRpc {
     private val json = Json { prettyPrint = false }
 
+    /** A JSON number literal (RFC 8259 §6). */
+    private val NUMBER = Regex("""-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?""")
+
     /** Serializes [msg] to a single line: no trailing newline and no embedded newlines (control chars in strings are escaped). */
     fun encode(msg: RpcMessage): String {
         val obj = buildJsonObject {
@@ -90,8 +93,8 @@ object JsonRpc {
         val id: JsonPrimitive? = when (val raw = obj["id"]) {
             null -> null
             JsonNull -> JsonNull
-            // a number or a string; booleans are rejected
-            is JsonPrimitive -> if (raw.isString || raw.longOrNull != null || raw.content.toDoubleOrNull() != null) raw else return null
+            // a string, or a JSON number literal; booleans, NaN/Infinity and other unquoted literals are rejected
+            is JsonPrimitive -> if (raw.isString || NUMBER.matches(raw.content)) raw else return null
             else -> return null
         }
 

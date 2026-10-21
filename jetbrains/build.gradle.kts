@@ -11,8 +11,14 @@ plugins {
 group = providers.gradleProperty("pluginGroup").get()
 version = providers.gradleProperty("pluginVersion").get()
 
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(25)
 }
 
 repositories {
@@ -24,9 +30,9 @@ repositories {
 
 dependencies {
     // kotlinx.serialization-json ships with the IDE (lib/intellij.libraries.kotlinx.serialization.json.jar);
-    // compile against it but don't bundle a second copy.
-    compileOnly("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
+    // compile against the bundled version (1.9.0) but don't ship a second copy.
+    compileOnly("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     testImplementation("junit:junit:4.13.2")
 
     intellijPlatform {
@@ -36,6 +42,11 @@ dependencies {
         )
         testFramework(TestFrameworkType.Platform)
     }
+}
+
+tasks.test {
+    // CoreProcessTest drives the VS Code fake core (`node vscode/test/fakeCore.mjs`); set LOCALPILOT_TEST_NODE to pick a node binary.
+    systemProperty("localpilot.fakeCore", layout.projectDirectory.file("../vscode/test/fakeCore.mjs").asFile.absolutePath)
 }
 
 intellijPlatform {

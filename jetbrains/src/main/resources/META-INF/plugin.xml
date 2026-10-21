@@ -9,4 +9,10 @@
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationConfigurable parentId="tools" id="dev.localpilot.settings" displayName="LocalPilot"
+                                 instance="dev.localpilot.settings.LocalPilotConfigurable"/>
+        <notificationGroup id="LocalPilot" displayType="BALLOON"/>
+    </extensions>
 </idea-plugin>
