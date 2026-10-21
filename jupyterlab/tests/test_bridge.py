@@ -704,3 +704,33 @@ async def test_clear_sessions_keeps_only_skipped_and_tells_the_other_tabs(bridge
     assert bridge._owners == {"s1": a_id}
     assert sessions_changed(a) == [{"cleared": True, "skipped": ["s1"]}]
     assert sessions_changed(b) == []
+
+
+async def test_clear_sessions_forgets_only_sessions_known_at_forward_time(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s1", "stopReason": "done"}})
+    await send(bridge, b_id, {"id": 9, "method": "chat/clearSessions", "params": {}})
+    clear = next(m for m in stub.sent if m.get("method") == "chat/clearSessions")
+    # The core handles requests concurrently: a's send, forwarded after the clear,
+    # is processed after it but answered first.
+    await chat_send(bridge, a_id, "s2", id=3)
+    stub.emit({"id": forwarded_send(stub, a_id, 3)["id"], "result": {}})
+    assert bridge._owners.get("s2") == a_id and "s2" in bridge._running
+    stub.emit({"id": clear["id"], "result": {"deleted": 1, "skipped": []}})
+    assert "s1" not in bridge._owners
+    assert bridge._owners == {"s2": a_id} and bridge._running == {"s2"}
+
+
+async def test_delete_session_forgets_only_a_session_known_at_forward_time(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await send(bridge, b_id, {"id": 9, "method": "chat/deleteSession", "params": {"sessionId": "s1"}})
+    delete = next(m for m in stub.sent if m.get("method") == "chat/deleteSession")
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    stub.emit({"id": delete["id"], "result": {}})
+    assert bridge._owners == {"s1": a_id} and bridge._running == {"s1"}
+    assert sessions_changed(a) == [{"deleted": ["s1"]}]

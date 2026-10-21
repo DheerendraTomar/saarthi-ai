@@ -23,10 +23,10 @@ script needs).
 ```sh
 pip install "jupyterlab>=4.5,<5"           # provides jlpm
 npm ci                                     # once, from the repo root
-bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.2.0-py3-none-any.whl
-pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.2.0-py3-none-any.whl
+bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.2.1-py3-none-any.whl
+pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.2.1-py3-none-any.whl
 jupyter server extension list              # → localpilot_jupyter enabled, OK
-jupyter labextension list                  # → localpilot-jupyter v0.2.0 enabled OK
+jupyter labextension list                  # → localpilot-jupyter v0.2.1 enabled OK
 ```
 
 `--no-deps` keeps pip from reinstalling (or upgrading) JupyterLab and the rest of

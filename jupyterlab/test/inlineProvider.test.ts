@@ -3,7 +3,7 @@ import type { CompletionHandler, IInlineCompletionContext, InlineCompletionTrigg
 import { Text } from '@jupyterlab/coreutils';
 import { Signal } from '@lumino/signaling';
 import type { Widget } from '@lumino/widgets';
-import { DEFAULT_TIMEOUT_MS, LocalPilotInlineProvider, type InlineClient, type InlineSync } from '../src/inlineProvider';
+import { DEFAULT_TIMEOUT_MS, LocalPilotInlineProvider, OUTCOME_IDLE_MS, type InlineClient, type InlineSync } from '../src/inlineProvider';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings';
 
 // Stand-ins for the JupyterLab 4.5 objects the provider reads from
@@ -328,6 +328,27 @@ describe('LocalPilotInlineProvider', () => {
     expect(client.notes).toEqual([outcome('1', 'rejected')]);
   });
 
+  it('supersede_timer_ignores_a_suggestion_shown_meanwhile', async () => {
+    const { widget } = notebookWidget('c1', 'x = ');
+    await show('x = ', '42', widget);
+    // Hold back the supersede's deferred settle (the fetch's first timer) until
+    // the next suggestion is already shown.
+    let settle: (() => void) | undefined;
+    jest.spyOn(global, 'setTimeout').mockImplementationOnce(((fn: () => void) => {
+      settle = fn;
+      return 0;
+    }) as unknown as typeof setTimeout);
+    const next = provider.fetch(req('x = ', 2), ctx(widget, true));
+    await flush();
+    client.requests[1].resolve({ items: [{ text: '7', range: RANGE }] });
+    expect(await next).toEqual({ items: [{ insertText: '7' }] });
+    expect(client.notes).toEqual([outcome('1', 'rejected')]); // settled by the new show
+    settle!();
+    // The brand-new, untouched suggestion is not rejected (nor the old one twice).
+    expect(client.notes).toEqual([outcome('1', 'rejected')]);
+    jest.restoreAllMocks();
+  });
+
   it('typing the whole suggestion by hand is typedThrough', async () => {
     const { widget, model } = notebookWidget('c1', 'x = ');
     await show('x = ', '42', widget);
@@ -373,6 +394,43 @@ describe('LocalPilotInlineProvider', () => {
     expect(client.notes).toEqual([]);
     model.sharedModel.setSource('x = 42\ny = x');
     expect(client.notes).toEqual([outcome('2', 'accepted', '2\ny = x')]);
+  });
+
+  /** Shows `foo(bar)`, takes the chunk `foo`, then the typed-prefix hit `(bar)` takes the watch over as id 2. */
+  async function chunkThenHandOff(beforeHit?: () => void) {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    await show('x = ', 'foo(bar)', widget);
+    model.sharedModel.setSource('x = foo'); // a chunk
+    const next = provider.fetch(req('x = foo'), ctx(widget));
+    await flush();
+    beforeHit?.();
+    client.requests[1].resolve({ items: [{ text: '(bar)', range: RANGE }] });
+    expect(await next).toEqual({ items: [{ insertText: '(bar)' }] });
+    expect(client.notes).toEqual([]);
+    return model;
+  }
+
+  it('chunk_then_divergence_reports_partial', async () => {
+    const model = await chunkThenHandOff();
+    model.sharedModel.setSource('x = fooz'); // something else, nothing more taken
+    // Under the typed-prefix id, acceptedText is what was taken since it (the
+    // core puts the text typed before that hit, `foo`, back in front).
+    expect(client.notes).toEqual([outcome('2', 'partial', '')]);
+  });
+
+  it('chunk_then_idle_reports_partial', async () => {
+    await chunkThenHandOff(() => jest.useFakeTimers());
+    jest.advanceTimersByTime(OUTCOME_IDLE_MS - 1);
+    expect(client.notes).toEqual([]);
+    jest.advanceTimersByTime(1);
+    expect(client.notes).toEqual([outcome('2', 'partial', '')]);
+  });
+
+  it('a chunk then more after the hand-off reports the rest taken since the hit', async () => {
+    const model = await chunkThenHandOff();
+    model.sharedModel.setSource('x = foo(b');
+    model.sharedModel.setSource('x = foo(b!');
+    expect(client.notes).toEqual([outcome('2', 'partial', '(b')]);
   });
 
   it('a different new suggestion settles the partly typed one first', async () => {

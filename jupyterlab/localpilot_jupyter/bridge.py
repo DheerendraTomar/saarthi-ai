@@ -21,7 +21,8 @@ Tab → core
 - `chat/deleteSession` / `chat/clearSessions` never adopt a session (a tab may delete a
   session another tab owns; the core refuses one with a running turn). On success the
   bridge drops its ownership / running / pending-call entries for the deleted sessions
-  (for `clearSessions`: every session not in `skipped`) and sends every *other* tab
+  (for `clearSessions`: every session not in `skipped`), but only for sessions it knew
+  when forwarding the request (the core may answer a later `chat/send` first), and sends every *other* tab
   `localpilot/sessionsChanged` (`{deleted: [id]}` or `{cleared: true, skipped}`), so
   their chat panels refresh; the deleting tab updates its own UI from the response.
 - Document sync is refcounted per (uri, tab): `didOpen` is forwarded only for the first
@@ -122,8 +123,10 @@ class Bridge:
         # forwarded chat/send id → [session, whether it had a running turn when forwarded,
         # stale]; a successful response starts a turn unless the turn already ended (stale)
         self._send_after: dict[str, list[Any]] = {}
-        # forwarded chat/deleteSession|clearSessions id → the deleted session (None: clear all)
-        self._delete_after: dict[str, Optional[str]] = {}
+        # forwarded chat/deleteSession|clearSessions id → (the deleted session (None: clear
+        # all), the affected sessions the bridge knew when forwarding: only those are
+        # forgotten on success, since the core may answer a later chat/send first)
+        self._delete_after: dict[str, tuple[Optional[str], set[str]]] = {}
         # sessions with a running turn (successful chat/send until chat/done)
         self._running: set[str] = set()
         # document uri → tabs that have it open
@@ -277,9 +280,10 @@ class Bridge:
         if isinstance(send_session, str):
             self._send_after[forwarded] = [send_session, send_session in self._running, False]
         if method == "chat/clearSessions":
-            self._delete_after[forwarded] = None
+            self._delete_after[forwarded] = (None, self._known_sessions())
         elif method == "chat/deleteSession" and isinstance(params.get("sessionId"), str):
-            self._delete_after[forwarded] = params["sessionId"]
+            target = params["sessionId"]
+            self._delete_after[forwarded] = (target, self._known_sessions() & {target})
         msg["id"] = forwarded
         if not self._send_core(json.dumps(msg)):
             self._pending_client.pop(forwarded, None)
@@ -401,25 +405,27 @@ class Bridge:
             self._owners[sent_session] = tab_id
             if not stale:
                 self._running.add(sent_session)
-        deleting = forwarded in self._delete_after
-        deleted_session = self._delete_after.pop(forwarded, None)
+        deleting = self._delete_after.pop(forwarded, None)
         msg["id"] = original
         self._send_tab(tab_id, json.dumps(msg))
-        if deleting and "error" not in msg:
-            self._sessions_deleted(tab_id, deleted_session, msg.get("result"))
+        if deleting is not None and "error" not in msg:
+            self._sessions_deleted(tab_id, *deleting, msg.get("result"))
         session = self._replay_after.pop(forwarded, None)
         if session is not None and self._owners.get(session) == tab_id and session in self._pending_calls:
             self._send_tab(tab_id, self._pending_calls[session][1])
 
-    def _sessions_deleted(self, tab_id: str, session: Optional[str], result: Any) -> None:
-        """A successful `chat/deleteSession` (`session`) or `chat/clearSessions` (None) from `tab_id`."""
+    def _known_sessions(self) -> set[str]:
+        return set(self._owners) | set(self._running) | set(self._pending_calls)
+
+    def _sessions_deleted(self, tab_id: str, session: Optional[str], known: set[str], result: Any) -> None:
+        """A successful `chat/deleteSession` (`session`) or `chat/clearSessions` (None) from
+        `tab_id`; `known` is what the bridge knew of the affected sessions when forwarding."""
         if session is not None:
-            gone = {session}
+            gone = known
             params: dict[str, Any] = {"deleted": [session]}
         else:
             raw = result.get("skipped") if isinstance(result, dict) else None
             skipped = [s for s in raw if isinstance(s, str)] if isinstance(raw, list) else []
-            known = set(self._owners) | set(self._running) | set(self._pending_calls)
             gone = known - set(skipped)
             params = {"cleared": True, "skipped": skipped}
         for s in gone:

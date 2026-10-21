@@ -66,6 +66,8 @@ interface Shown {
   baseline: number;
   /** Some gain arrived as a chunk: one edit inserting ≥ 2 characters (with a letter or digit), e.g. the completer's accept. */
   chunked: boolean;
+  /** Taken over from a suggestion typed into (a typed-prefix hit): the run already progressed. */
+  carried: boolean;
   timer?: ReturnType<typeof setTimeout>;
   off: () => void;
 }
@@ -181,7 +183,10 @@ interface Attachment {
  *   Typing into the ghost text keeps it watched; when the next fetch shows
  *   the rest of it (the core's typed-prefix cache hit, whose request id the
  *   core resolves to the original suggestion) the watch moves to the new id
- *   unreported, keeping whether a chunk was taken.
+ *   unreported, keeping that the run progressed and whether a chunk was
+ *   taken (and its idle wait), so a run with a chunk that then diverges or
+ *   stalls is still `partial`; `acceptedText` is then what was taken since
+ *   that id, and the core prepends what was typed before it.
  */
 export class LocalPilotInlineProvider implements IInlineCompletionProvider {
   readonly identifier = 'localpilot';
@@ -311,6 +316,7 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
   private show(requestId: string, target: Target, before: string, after: string, suggestion: string): void {
     const prev = this.shown;
     let chunked = false;
+    let carried = false;
     if (prev) {
       const handOff =
         prev.uri === target.uri &&
@@ -319,6 +325,7 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
         prev.suggestion === prev.gained + suggestion;
       if (handOff) {
         chunked = prev.chunked;
+        carried = true;
         this.unwatch(prev);
       } else {
         this.finish(prev);
@@ -336,6 +343,7 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
       gained: '',
       baseline: 0,
       chunked,
+      carried,
       off: () => target.text.changed.disconnect(changed)
     };
     // The user may have typed on while the request ran.
@@ -346,6 +354,8 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
     }
     target.text.changed.connect(changed);
     this.shown = shown;
+    // A run with a chunk taken settles as partial if it stalls here.
+    if (chunked) this.armIdle(shown);
   }
 
   /** The part of the suggestion now between its surroundings in `text`; undefined once it diverged. */
@@ -363,6 +373,11 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
     if (gained.length <= t.baseline) return;
     // Nothing more to take (trailing whitespace is not required: Enter auto-indents differently).
     if (gained.trimEnd() === t.suggestion.trimEnd()) return this.finish(t);
+    this.armIdle(t);
+  }
+
+  /** (Re)starts `t`'s `OUTCOME_IDLE_MS` wait for progress. */
+  private armIdle(t: Shown): void {
     clearTimeout(t.timer);
     t.timer = setTimeout(() => this.shown === t && this.finish(t), OUTCOME_IDLE_MS);
   }
@@ -380,7 +395,9 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
     const client = this.attached?.options.client;
     if (!client) return;
     const { requestId, gained, suggestion } = t;
-    const progressed = gained.length > t.baseline;
+    // Under a typed-prefix id, `acceptedText` is what was taken since it (the
+    // core puts the text typed before that hit back in front).
+    const progressed = t.carried || gained.length > t.baseline;
     const whole = gained.trimEnd() === suggestion.trimEnd();
     let params: Record<string, string>;
     if (progressed && whole && t.chunked) params = { requestId, outcome: 'accepted', acceptedText: suggestion };
@@ -397,15 +414,17 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
    * own listener can call `fetch` first, with `debouncerDelay: 0`): rejected
    * if it is untouched or this fetch is for another document; one being
    * typed through stays watched (rejecting it would evict the core's cache
-   * entry the typed-prefix lookup serves from).
+   * entry the typed-prefix lookup serves from). Only the suggestion shown now
+   * is settled: one shown meanwhile belongs to a later fetch (and one already
+   * settled by it must not be reported twice).
    */
   private supersede(uri: string | undefined): void {
     this.inflight?.cancel(true);
     this.inflight = undefined;
-    if (!this.shown) return;
+    const t = this.shown;
+    if (!t) return;
     setTimeout(() => {
-      const t = this.shown;
-      if (t && (t.uri !== uri || t.gained.length <= t.baseline)) this.finish(t);
+      if (this.shown === t && (t.uri !== uri || t.gained.length <= t.baseline)) this.finish(t);
     }, 0);
   }
 }
