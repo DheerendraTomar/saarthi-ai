@@ -29,7 +29,7 @@ tests on macOS arm64, then builds release artifacts for `aarch64-apple-darwin`,
 
 ```text
 localpilot-core serve --workspace <dir> [--log-level <filter>]
-localpilot-core bench --workspace <dir> --file <path> [--n <count>] [--model <name>] [--json] [--mode spread|typing]
+localpilot-core bench --workspace <dir> --file <path> [--n <count>] [--model <name>] [--max-tokens <n>] [--json] [--mode spread|typing]
 ```
 
 `serve` — JSON-RPC over stdio for one workspace, until `shutdown` or stdin EOF.
@@ -46,7 +46,9 @@ localpilot-core bench --workspace <dir> --file <path> [--n <count>] [--model <na
 - `--file <path>`: file to complete in, relative to the workspace.
 - `--n <count>`: timed completions after one uncounted warm-up. Default `20`.
 - `--model <name>`: completion model. Default: the settings default
-  (`qwen2.5-coder:1.5b-base`).
+  (`qwen2.5-coder:0.5b-base`).
+- `--max-tokens <n>`: completion max tokens (`num_predict`). Default: the
+  settings default (`32`).
 - `--json`: print the report as one JSON object.
 - `--mode spread|typing`: `spread` (default, worst case) completes at line ends
   spread across the file, so prompts are fresh; `typing` types one character
@@ -122,8 +124,9 @@ down, `-32001` model missing, `-32002` cancelled.
 Verified on Ollama 0.40.6, Apple M4 Pro 48 GB
 ([notes](../docs/superpowers/notes/2026-10-20-ollama-assumptions.md)):
 
-- Default models: `qwen2.5-coder:1.5b-base` (completion, FIM through
-  `/api/generate` + `suffix`, no raw template) and `qwen3.8:27b-mlx` (chat,
+- Default models: `qwen2.5-coder:0.5b-base` (completion, FIM through
+  `/api/generate` + `suffix`, no raw template; `completionMaxTokens` 32 — see
+  Measured performance) and `qwen3.8:27b-mlx` (chat,
   native `tool_calls`).
 - **`OLLAMA_MAX_LOADED_MODELS` does not need to be set**: with defaults
   (unset) both models stayed resident on the 48 GB test machine; other values
@@ -151,11 +154,24 @@ TTFT is model-bound; core overhead is ~50× under target.
 
 **What the user waits for is the bench's `total` column, not TTFT**: the client
 receives one final completion (no streaming to the editor), so ghost text
-appears after the whole generation. Typing-mode **total p50 is 640 ms with
-1.5b and 337 ms with 0.5b** (TTFT p50 220.52 ms / 81.12 ms). The default
-completion model (`qwen2.5-coder:1.5b-base`, chosen on TTFT) is being
-re-evaluated on that basis; `qwen2.5-coder:0.5b-base` meets every target with
-headroom.
+appears after the whole generation. Re-measured on total (typing mode, `--n 20`,
+p50 / p95 ms;
+[details](../docs/superpowers/notes/2026-10-21-core-bench.md#re-measurement-on-total-2026-10-21)):
+
+| max tokens | 1.5b total | 0.5b total |
+|---|---|---|
+| 64 | 628 / 640 | 295 / 300 |
+| 32 | 426 / 429 | **211 / 212** |
+| 16 | 326 / 327 | 146 / 147 |
+
+Rule: the largest max tokens whose typing-mode total meets p50 ≤ 250 ms and
+p95 ≤ 600 ms, preferring 1.5b at equal max tokens. 1.5b misses p50 at every
+setting (TTFT alone is ≈ 222 ms), so the defaults are
+**`qwen2.5-coder:0.5b-base` with `completionMaxTokens` 32** (spread mode, the
+worst case: total p50 262 / p95 464 ms). Trade-off: 32 tokens is about 2–4
+short lines, so multi-line suggestions are shorter than the 8-line cap allows;
+users who prefer longer or higher-quality suggestions can set
+`completionModel` / `completionMaxTokens` and accept the latency above.
 
 ### Known limits
 

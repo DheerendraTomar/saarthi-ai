@@ -156,7 +156,10 @@ async fn returns_streamed_completion_and_caches() {
     assert_eq!(body["raw"], false);
     assert_eq!(body["stream"], true);
     assert_eq!(body["keep_alive"], "30m");
-    assert_eq!(body["options"]["num_predict"], 64);
+    assert_eq!(
+        body["options"]["num_predict"],
+        Settings::default().completion_max_tokens
+    );
     assert_eq!(body["options"]["temperature"], 0.0);
     assert!(body["options"].get("stop").is_none(), "stop = []");
     assert_eq!(

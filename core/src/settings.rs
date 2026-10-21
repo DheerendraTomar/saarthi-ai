@@ -44,11 +44,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             ollama_url: "http://localhost:11434".to_string(),
-            completion_model: "qwen2.5-coder:1.5b-base".to_string(),
+            completion_model: "qwen2.5-coder:0.5b-base".to_string(),
             chat_model: "qwen3.8:27b-mlx".to_string(),
             completions_enabled: true,
             completion_debounce_ms: 120,
-            completion_max_tokens: 64,
+            completion_max_tokens: 32,
             chat_thinking: Thinking::Off,
             core_binary_path: None,
             allowed_commands_always: Vec::new(),
@@ -67,11 +67,11 @@ mod tests {
     fn settings_defaults_match_spec() {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.ollama_url, "http://localhost:11434");
-        assert_eq!(s.completion_model, "qwen2.5-coder:1.5b-base");
+        assert_eq!(s.completion_model, "qwen2.5-coder:0.5b-base");
         assert_eq!(s.chat_model, "qwen3.8:27b-mlx");
         assert!(s.completions_enabled);
         assert_eq!(s.completion_debounce_ms, 120);
-        assert_eq!(s.completion_max_tokens, 64);
+        assert_eq!(s.completion_max_tokens, 32);
         assert_eq!(s.chat_thinking, Thinking::Off);
         assert_eq!(s.core_binary_path, None);
         assert!(s.allowed_commands_always.is_empty());

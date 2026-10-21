@@ -283,3 +283,33 @@ overhead p50 0.06 / p95 0.12 ms; total p50 334.54 / p95 372.03 ms; warm-up TTFT
 - **Bench RSS vs idle RSS**: the bench process RSS (14.2 MB after 21 requests) is shown for reference; the target applies to idle `serve` RSS, measured separately above (14.0 MB).
 - The bench uses the default settings (`http://localhost:11434`); it does not read `OLLAMA_HOST`.
 - `bench` exits 0 if every check passes, 1 if any check fails, 2 if it could not run.
+
+## Re-measurement on total (2026-10-21)
+
+The core answers each `completion/request` with one final completion (the IDE inline-completion API cannot stream), so the latency a user sees is the bench's **total** (request start → generation done), not TTFT. The spec target (§5.5: p50 ≤ 250 ms, p95 ≤ 600 ms for ghost text appearing) is therefore applied to total.
+
+- Setup: same machine and Ollama 0.40.6 as above; chat model idle; both coder models resident. `bench` gained `--max-tokens <n>` (overrides `completion_max_tokens`; default = settings default).
+- Command: `bench --workspace /Users/dst/projects/ollama --file core/src/handlers.rs --mode typing --n 20 --model qwen2.5-coder:<m>-base --max-tokens <t> --json`, one discarded warm-up run per model first. Each cell was run twice (JSON, then text); the table shows the JSON run, the text run agreed within 9 ms on every figure. 0 empty suggestions in every typing run.
+
+Typing mode (keystroke path), p50 / p95 ms:
+
+| model | max tokens | TTFT p50 / p95 | total p50 / p95 | total max | total meets target |
+|---|---|---|---|---|---|
+| 1.5b | 64 | 223.98 / 231.08 | 627.87 / 640.29 | 644.5 | no (p50, p95) |
+| 1.5b | 32 | 221.04 / 221.76 | 426.31 / 429.20 | 434.2 | no (p50) |
+| 1.5b | 16 | 221.82 / 222.57 | 325.53 / 326.79 | 327.1 | no (p50) |
+| 0.5b | 64 | 82.01 / 82.79 | 295.36 / 300.43 | 303.5 | no (p50) |
+| **0.5b** | **32** | **78.18 / 79.04** | **210.80 / 212.35** | 212.4 | **yes** |
+| 0.5b | 16 | 78.49 / 79.04 | 146.49 / 147.18 | 147.2 | yes |
+
+Total grows almost linearly with max tokens (≈ 6.3 ms/token on 1.5b, ≈ 3.1 ms/token on 0.5b) and its p95 is within a few ms of p50: on a freshly opened line the cursor's rest-of-line is empty, so the multi-line stop mode applies and the model nearly always runs to `num_predict` before the 8-line cap or a blank-line stop fires. 1.5b cannot meet p50 ≤ 250 ms at any max tokens, since its TTFT alone is ≈ 222 ms.
+
+Worst case for the chosen configuration (0.5b, 32 tokens, `--mode spread`, first run): TTFT p50 128.93 / p95 352.36 ms; **total p50 262.04 / p95 463.72 / max 483.76 ms**; 7/20 empty. Spread p50 is 12 ms over the 250 ms target but p95 is well within; spread is the pessimistic fresh-prompt path, not what typing sees. (An immediate second spread run gave total 140.66 / 257.19 ms because Ollama reused its KV cache for the identical prompts; the first run is the one quoted.)
+
+Cross-check with workspace `core/` (42 files instead of 49): the same cells within 15 ms (e.g. 0.5b/32 total 210 / 212, 1.5b/64 629 / 642).
+
+**Rule (controller ruling):** pick the configuration with the largest max tokens whose typing-mode total p50 ≤ 250 ms and p95 ≤ 600 ms, preferring 1.5b over 0.5b at equal max tokens; if none qualifies, pick the closest with the best model and say the target is missed.
+
+**Decision:** `completionModel` = `qwen2.5-coder:0.5b-base`, `completionMaxTokens` = **32** (was 1.5b / 64). Typing total 211 / 212 ms meets the target with ≈ 40 ms headroom at p50. Applied to the `Settings` defaults (so `bench` defaults to it as well) and the core README.
+
+**Trade-off:** fewer tokens means shorter multi-line suggestions. 32 tokens is roughly 2–4 short lines of code (64 was 4–8), so the 8-line cap is rarely reached; single-line completions (text after the cursor) are unaffected in practice. The 0.5b model also gives lower-quality suggestions than 1.5b. Users who prefer longer or better suggestions can set `completionModel` / `completionMaxTokens` and accept the latency in the table.
