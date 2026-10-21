@@ -1284,3 +1284,95 @@ async fn reserve_marks_the_session_running_until_dropped() {
             .is_ok()
     );
 }
+
+fn session_file(root: &std::path::Path, id: &str) -> PathBuf {
+    root.join(".localpilot/sessions").join(format!("{id}.json"))
+}
+
+#[tokio::test]
+async fn delete_session_removes_file() {
+    let env = Env::new(script(vec![vec![chat_text("Hi."), chat_done()]])).await;
+    finish(env.send("hello")).await;
+    let file = session_file(&env.root, SESSION);
+    assert!(file.is_file());
+    Session::with_id("other").unwrap().save(&env.root).unwrap();
+
+    env.runner.delete_session(SESSION).unwrap();
+    assert!(!file.exists());
+    let ids: Vec<String> = env
+        .runner
+        .list_sessions()
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+    assert_eq!(ids, ["other"]);
+    assert!(env.runner.history(SESSION).unwrap().messages.is_empty());
+
+    // Deleting a session that has no file (never ran a turn, or already
+    // deleted) is not an error.
+    env.runner.delete_session(SESSION).unwrap();
+    env.runner.delete_session("never-saved").unwrap();
+
+    // Ids name files: anything that could escape the directory is refused.
+    let err = env.runner.delete_session("../other").unwrap_err();
+    assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    assert!(session_file(&env.root, "other").is_file());
+}
+
+#[tokio::test]
+async fn delete_running_session_is_refused_32602() {
+    let env = Env::new(script(vec![vec![chat_text("Hi."), chat_done()]])).await;
+    Session::with_id(SESSION).unwrap().save(&env.root).unwrap();
+    Session::with_id("idle").unwrap().save(&env.root).unwrap();
+    let turn = env
+        .runner
+        .reserve(SESSION, CancellationToken::new())
+        .unwrap();
+
+    let err = env.runner.delete_session(SESSION).unwrap_err();
+    assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    assert!(err.message.contains("turn running"), "{}", err.message);
+    assert!(session_file(&env.root, SESSION).is_file());
+
+    // Another session can be deleted while that turn runs.
+    env.runner.delete_session("idle").unwrap();
+    assert!(!session_file(&env.root, "idle").exists());
+
+    // Once the turn is over, the session can be deleted.
+    drop(turn);
+    env.runner.delete_session(SESSION).unwrap();
+    assert!(!session_file(&env.root, SESSION).exists());
+}
+
+#[tokio::test]
+async fn clear_sessions_skips_running() {
+    let env = Env::new(script(vec![vec![chat_text("Hi."), chat_done()]])).await;
+    for id in [SESSION, "a", "b"] {
+        Session::with_id(id).unwrap().save(&env.root).unwrap();
+    }
+    // An unreadable session file is cleared too (`list` would skip it).
+    std::fs::write(session_file(&env.root, "corrupt"), "not json").unwrap();
+    let turn = env
+        .runner
+        .reserve(SESSION, CancellationToken::new())
+        .unwrap();
+
+    let result = env.runner.clear_sessions();
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        json!({"deleted": 3, "skipped": [SESSION]})
+    );
+    for id in ["a", "b", "corrupt"] {
+        assert!(!session_file(&env.root, id).exists(), "{id}");
+    }
+    assert!(session_file(&env.root, SESSION).is_file());
+
+    drop(turn);
+    assert_eq!(
+        serde_json::to_value(env.runner.clear_sessions()).unwrap(),
+        json!({"deleted": 1, "skipped": []})
+    );
+    assert!(env.runner.list_sessions().is_empty());
+    // Nothing left: still fine.
+    assert_eq!(env.runner.clear_sessions().deleted, 0);
+}

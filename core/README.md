@@ -76,6 +76,21 @@ Additions beyond the spec:
 - **`sessionId` on `workspace/applyEdit` and `workspace/runCommand`**: both
   requests carry the `sessionId` of the chat turn that asked for them, so a
   client serving several sessions (the JupyterLab bridge) can route them.
+- **`ollama/models {}`** → `{ models: [{ name, sizeBytes, family?,
+  supportsInsert, supportsTools }] }`: the models installed in Ollama, in
+  `/api/tags` order. The capabilities come from one `/api/show` per model
+  (`"insert"` = fill-in-the-middle, usable for completions; `"tools"` = usable
+  for agent chat); if `/api/show` fails for a model both are `false`.
+  `family` is omitted when Ollama reports none. Ollama unreachable (or not
+  answering within 10 s) fails with `-32000`, never an empty list.
+- **`chat/deleteSession { sessionId }`** → `{}`: removes
+  `.localpilot/sessions/<sessionId>.json`. A session without a file (one that
+  never ran a turn, or already deleted) is not an error. Refused with
+  `-32602` (message starts with `turn running`) while a turn runs in that
+  session; other sessions can be deleted meanwhile. An invalid id is `-32602`.
+- **`chat/clearSessions {}`** → `{ deleted, skipped }`: deletes every saved
+  session file (unreadable ones too) except those of sessions with a running
+  turn; `skipped` lists the ids of all sessions with a running turn.
 - **One Ollama status shape everywhere: `{ ollama, detail }`**, with
   `ollama` one of `"ok" | "down" | "modelMissing"`. It is
   `InitializeResult.ollamaStatus`, the `ollama/status` result and the params

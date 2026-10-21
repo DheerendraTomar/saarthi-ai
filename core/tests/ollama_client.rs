@@ -4,6 +4,7 @@
 #[path = "support/mock_ollama.rs"]
 mod mock_ollama;
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -12,7 +13,8 @@ use localpilot_core::ollama::{
     PullProgress, Role, ToolSpec,
 };
 use mock_ollama::{
-    MockOllama, Script, chat_done, chat_text, chat_tool_call, generate_chunk, generate_done,
+    MockOllama, ModelInfo, Script, chat_done, chat_text, chat_tool_call, generate_chunk,
+    generate_done,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -410,4 +412,79 @@ async fn pull_forwards_progress() {
     let requests = mock.received_requests();
     assert_eq!(requests[0].0, "/api/pull");
     assert_eq!(requests[0].1["model"], "qwen3.8:27b-mlx");
+}
+
+fn info(size: u64, family: &str, capabilities: &[&str]) -> ModelInfo {
+    ModelInfo {
+        size,
+        family: family.to_owned(),
+        capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn models_lists_installed_with_capabilities() {
+    let mock = MockOllama::start(Script {
+        models: vec![
+            "qwen2.5-coder:1.5b-base".to_owned(),
+            "qwen3:8b".to_owned(),
+            "mlx-model:latest".to_owned(),
+            "broken:latest".to_owned(),
+        ],
+        model_info: HashMap::from([
+            (
+                "qwen2.5-coder:1.5b-base".to_owned(),
+                info(2_122_024_222, "qwen2", &["completion", "insert"]),
+            ),
+            (
+                "qwen3:8b".to_owned(),
+                info(5_225_388_164, "qwen3", &["completion", "tools", "thinking"]),
+            ),
+            // Ollama sends `family: ""` for some models (e.g. MLX ones).
+            (
+                "mlx-model:latest".to_owned(),
+                info(20_062_412_916, "", &["completion", "insert", "tools"]),
+            ),
+            // "broken" has no entry: `/api/show` answers 404 for it.
+        ]),
+        ..Script::default()
+    })
+    .await;
+
+    let models = client(&mock).list_models().await.unwrap();
+    let wire = serde_json::to_value(&models).unwrap();
+    assert_eq!(
+        wire,
+        json!([
+            {"name": "qwen2.5-coder:1.5b-base", "sizeBytes": 2_122_024_222u64, "family": "qwen2",
+             "supportsInsert": true, "supportsTools": false},
+            {"name": "qwen3:8b", "sizeBytes": 5_225_388_164u64, "family": "qwen3",
+             "supportsInsert": false, "supportsTools": true},
+            {"name": "mlx-model:latest", "sizeBytes": 20_062_412_916u64,
+             "supportsInsert": true, "supportsTools": true},
+            {"name": "broken:latest", "sizeBytes": 0,
+             "supportsInsert": false, "supportsTools": false},
+        ])
+    );
+
+    // One `/api/show` per installed model per call, asking by name.
+    let shows: Vec<_> = mock
+        .received_requests()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/show")
+        .map(|(_, body)| body["model"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(shows.len(), 4, "{shows:?}");
+    assert!(shows.contains(&"qwen3:8b".to_owned()));
+
+    // Ollama down: the listing fails with `Down`, not an empty list.
+    let down = MockOllama::start(Script {
+        refuse_connections: true,
+        ..Script::default()
+    })
+    .await;
+    assert!(matches!(
+        client(&down).list_models().await,
+        Err(OllamaError::Down(_))
+    ));
 }

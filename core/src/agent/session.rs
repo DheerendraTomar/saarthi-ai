@@ -164,6 +164,34 @@ impl Session {
         serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    /// Removes session `id`'s file. `Ok(false)` if there was none.
+    pub fn delete(root: &Path, id: &str) -> io::Result<bool> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        match fs::remove_file(sessions_dir(root).join(format!("{id}.json"))) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Ids of every `<id>.json` in the sessions directory, readable or not
+    /// (unlike [`list`](Self::list), which skips unreadable files).
+    pub fn ids(root: &Path) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(sessions_dir(root)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let id = name.to_str()?.strip_suffix(".json")?;
+                valid_id(id).then(|| id.to_owned())
+            })
+            .collect()
+    }
+
     /// Summaries of the saved sessions, most recently updated first.
     /// Unreadable files are skipped.
     pub fn list(root: &Path) -> Vec<SessionSummary> {

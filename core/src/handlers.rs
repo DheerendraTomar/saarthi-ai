@@ -32,11 +32,12 @@ use crate::index::{WorkspaceIndex, watcher};
 use crate::ollama::{OllamaClient, OllamaError, OllamaState, OllamaStatus, PullProgress};
 use crate::overlay::{DocumentStore, normalize_path, uri_to_path};
 use crate::protocol::{
-    Capabilities, ChatApproveParams, ChatDone, ChatHistoryParams, ChatListSessionsResult,
-    ChatNewSessionResult, ChatSendParams, ChatSendResult, ChatStopParams, CompletionAcceptedParams,
-    CompletionCancelParams, CompletionRejectedParams, CompletionRequestParams, DidChangeParams,
-    DidCloseParams, DidOpenParams, DidSaveParams, IndexReady, IndexStatus, InitializeParams,
-    InitializeResult, OllamaPullParams, OllamaPullProgress, OllamaPullResult, StopReason, methods,
+    Capabilities, ChatApproveParams, ChatDeleteSessionParams, ChatDone, ChatHistoryParams,
+    ChatListSessionsResult, ChatNewSessionResult, ChatSendParams, ChatSendResult, ChatStopParams,
+    CompletionAcceptedParams, CompletionCancelParams, CompletionRejectedParams,
+    CompletionRequestParams, DidChangeParams, DidCloseParams, DidOpenParams, DidSaveParams,
+    IndexReady, IndexStatus, InitializeParams, InitializeResult, OllamaModelsResult,
+    OllamaPullParams, OllamaPullProgress, OllamaPullResult, StopReason, methods,
 };
 use crate::rpc::{Ctx, Handler, RpcError};
 use crate::settings::Settings;
@@ -46,6 +47,10 @@ pub const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Upper bound on one status probe.
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Upper bound on `ollama/models` (`/api/tags` plus one `/api/show` per
+/// model); past it Ollama counts as down.
+pub const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// JSON-RPC "Invalid Request": used for calls made in the wrong state.
 const INVALID_REQUEST: i64 = -32600;
@@ -319,6 +324,28 @@ impl AppHandler {
             methods::CHAT_HISTORY => {
                 let params: ChatHistoryParams = parse(params)?;
                 Ok(to_json(state.agent.history(&params.session_id)?))
+            }
+            methods::CHAT_DELETE_SESSION => {
+                let params: ChatDeleteSessionParams = parse(params)?;
+                state.agent.delete_session(&params.session_id)?;
+                Ok(json!({}))
+            }
+            methods::CHAT_CLEAR_SESSIONS => {
+                parse::<Value>(params)?;
+                Ok(to_json(state.agent.clear_sessions()))
+            }
+            methods::OLLAMA_MODELS => {
+                parse::<Value>(params)?;
+                let models = tokio::time::timeout(MODELS_TIMEOUT, state.ollama.list_models())
+                    .await
+                    .map_err(|_| {
+                        RpcError::ollama_down(format!(
+                            "Ollama did not list its models within {} s (timed out)",
+                            MODELS_TIMEOUT.as_secs()
+                        ))
+                    })?
+                    .map_err(ollama_error)?;
+                Ok(to_json(OllamaModelsResult { models }))
             }
             methods::OLLAMA_STATUS => {
                 parse::<Value>(params)?;

@@ -5,13 +5,15 @@
 #[path = "support/mock_ollama.rs"]
 mod mock_ollama;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use localpilot_core::overlay::path_to_uri;
 use mock_ollama::{
-    MockOllama, Script, chat_done, chat_text, chat_tool_call, generate_chunk, generate_done,
+    MockOllama, ModelInfo, Script, chat_done, chat_text, chat_tool_call, generate_chunk,
+    generate_done,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -598,6 +600,102 @@ async fn status_recovers_after_a_failed_chat_turn() {
         json!({"ollama": "ok", "detail": up["params"]["detail"]}),
         "{up}"
     );
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn ollama_models_over_stdio() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder:latest".to_owned(), "chat:latest".to_owned()],
+        model_info: HashMap::from([
+            (
+                "coder:latest".to_owned(),
+                ModelInfo {
+                    size: 986_000_000,
+                    family: "qwen2".to_owned(),
+                    capabilities: vec!["completion".to_owned(), "insert".to_owned()],
+                },
+            ),
+            (
+                "chat:latest".to_owned(),
+                ModelInfo {
+                    size: 5_200_000_000,
+                    family: "qwen3".to_owned(),
+                    capabilities: vec!["completion".to_owned(), "tools".to_owned()],
+                },
+            ),
+        ]),
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+
+    let result = core.call("ollama/models", json!({})).await;
+    assert_eq!(
+        result,
+        json!({"models": [
+            {"name": "coder:latest", "sizeBytes": 986_000_000u64, "family": "qwen2",
+             "supportsInsert": true, "supportsTools": false},
+            {"name": "chat:latest", "sizeBytes": 5_200_000_000u64, "family": "qwen3",
+             "supportsInsert": false, "supportsTools": true},
+        ]})
+    );
+    core.shutdown().await;
+
+    // Ollama down: an error with the "Ollama down" code, never an empty list.
+    let down = MockOllama::start(Script {
+        refuse_connections: true,
+        ..Script::default()
+    })
+    .await;
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &down).await;
+    let id = core.send("ollama/models", Value::Null).await;
+    let response = core.response(id).await;
+    assert_eq!(response["error"]["code"], -32000, "{response}");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_deletion_over_stdio() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder:latest".to_owned(), "chat:latest".to_owned()],
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let sessions = ws.root.join(".localpilot/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    for id in ["s1", "s2", "s3"] {
+        let session = json!({"id": id, "created": 1, "messages": [
+            {"role": "user", "content": format!("chat {id}")}
+        ]});
+        std::fs::write(sessions.join(format!("{id}.json")), session.to_string()).unwrap();
+    }
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+
+    let result = core
+        .call("chat/deleteSession", json!({"sessionId": "s1"}))
+        .await;
+    assert_eq!(result, json!({}));
+    assert!(!sessions.join("s1.json").exists());
+    let listed = core.call("chat/listSessions", Value::Null).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 2, "{listed}");
+
+    let id = core
+        .send("chat/deleteSession", json!({"sessionId": "../escape"}))
+        .await;
+    let response = core.response(id).await;
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+
+    let result = core.call("chat/clearSessions", json!({})).await;
+    assert_eq!(result, json!({"deleted": 2, "skipped": []}));
+    let listed = core.call("chat/listSessions", Value::Null).await;
+    assert_eq!(listed, json!({"sessions": []}));
 
     core.shutdown().await;
 }

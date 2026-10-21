@@ -1,13 +1,14 @@
 //! Scripted stand-in for an Ollama server, shared by integration tests via
 //! `#[path = "support/mock_ollama.rs"] mod mock_ollama;`.
 //!
-//! Serves `/api/version`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/generate`
-//! and `/api/chat` over real HTTP on 127.0.0.1. Streaming endpoints answer
+//! Serves `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/pull`,
+//! `/api/generate` and `/api/chat` over real HTTP on 127.0.0.1. Streaming endpoints answer
 //! with NDJSON, one scripted `Value` per line, each preceded by
 //! `Script::chunk_delay`. Every request is recorded (before responding) and
 //! the mock notices when a client hangs up mid-stream.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,6 +32,11 @@ pub struct Script {
     pub models: Vec<String>,
     /// Names returned by `/api/ps`.
     pub loaded: Vec<String>,
+    /// Per-model details, by name: `size` and `details.family` in the
+    /// `/api/tags` entry and the `capabilities` `/api/show` returns. A model
+    /// not listed here has size 0 and no details, and `/api/show` answers 404
+    /// for it.
+    pub model_info: HashMap<String, ModelInfo>,
     /// One response (NDJSON lines) per `/api/generate` request, consumed in
     /// order; the last one repeats once the list is exhausted.
     pub generate: Vec<Vec<Value>>,
@@ -54,6 +60,7 @@ impl Default for Script {
             version: "0.40.6".to_owned(),
             models: Vec::new(),
             loaded: Vec::new(),
+            model_info: HashMap::new(),
             generate: Vec::new(),
             chat: Vec::new(),
             pull: Vec::new(),
@@ -62,6 +69,16 @@ impl Default for Script {
             refuse_connections: false,
         }
     }
+}
+
+/// What the mock reports about one model (see [`Script::model_info`]).
+#[derive(Debug, Clone, Default)]
+pub struct ModelInfo {
+    pub size: u64,
+    /// `details.family` (Ollama sends `""` for some models).
+    pub family: String,
+    /// `/api/show` `capabilities`, e.g. `["completion", "insert"]`.
+    pub capabilities: Vec<String>,
 }
 
 /// A mid-stream `/api/generate` chunk.
@@ -145,6 +162,7 @@ impl MockOllama {
             .route("/api/version", get(version))
             .route("/api/tags", get(tags))
             .route("/api/ps", get(ps))
+            .route("/api/show", post(show))
             .route("/api/pull", post(pull))
             .route("/api/generate", post(generate))
             .route("/api/chat", post(chat))
@@ -219,10 +237,17 @@ fn failure(shared: &Shared, body: &Value) -> Option<Response> {
     Some((status, axum::Json(json!({"error": message}))).into_response())
 }
 
-fn names(list: &[String]) -> Value {
+fn names(shared: &Shared, list: &[String]) -> Value {
     let entries: Vec<Value> = list
         .iter()
-        .map(|name| json!({"name": name, "model": name, "size": 0, "digest": "0"}))
+        .map(|name| match shared.script.model_info.get(name) {
+            Some(info) => json!({
+                "name": name, "model": name, "size": info.size, "digest": "0",
+                "details": {"parent_model": "", "format": "gguf", "family": info.family,
+                            "families": null, "parameter_size": "", "quantization_level": ""}
+            }),
+            None => json!({"name": name, "model": name, "size": 0, "digest": "0"}),
+        })
         .collect();
     json!({"models": entries})
 }
@@ -270,13 +295,34 @@ async fn version(State(shared): State<Arc<Shared>>, req: Request) -> Response {
 async fn tags(State(shared): State<Arc<Shared>>, req: Request) -> Response {
     let body = record(&shared, req).await;
     failure(&shared, &body)
-        .unwrap_or_else(|| axum::Json(names(&shared.script.models)).into_response())
+        .unwrap_or_else(|| axum::Json(names(&shared, &shared.script.models)).into_response())
 }
 
 async fn ps(State(shared): State<Arc<Shared>>, req: Request) -> Response {
     let body = record(&shared, req).await;
     failure(&shared, &body)
-        .unwrap_or_else(|| axum::Json(names(&shared.script.loaded)).into_response())
+        .unwrap_or_else(|| axum::Json(names(&shared, &shared.script.loaded)).into_response())
+}
+
+async fn show(State(shared): State<Arc<Shared>>, req: Request) -> Response {
+    let body = record(&shared, req).await;
+    if let Some(resp) = failure(&shared, &body) {
+        return resp;
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    match shared.script.model_info.get(model) {
+        Some(info) => axum::Json(json!({
+            "modelfile": "", "parameters": "", "template": "",
+            "details": {"family": info.family},
+            "capabilities": info.capabilities,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": format!("model '{model}' not found")})),
+        )
+            .into_response(),
+    }
 }
 
 async fn pull(State(shared): State<Arc<Shared>>, req: Request) -> Response {

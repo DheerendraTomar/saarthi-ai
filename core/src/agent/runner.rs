@@ -32,10 +32,10 @@ use crate::index::WorkspaceIndex;
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient, OllamaError, Options, Role, ToolCall};
 use crate::overlay::{DocumentStore, offset_of, path_to_uri, uri_to_path};
 use crate::protocol::{
-    ApplyEditParams, ApplyEditResult, ChatDone, ChatHistoryResult, ChatSendParams, ChatToken,
-    ChatToolCall, ChatToolResult, Decision, EditOp, HistoryMessage, HistoryToolCall, OllamaState,
-    RunCommandParams, RunCommandResult, SessionSummary, StatusNotification, StopReason, TokenKind,
-    methods,
+    ApplyEditParams, ApplyEditResult, ChatClearSessionsResult, ChatDone, ChatHistoryResult,
+    ChatSendParams, ChatToken, ChatToolCall, ChatToolResult, Decision, EditOp, HistoryMessage,
+    HistoryToolCall, OllamaState, RunCommandParams, RunCommandResult, SessionSummary,
+    StatusNotification, StopReason, TokenKind, methods,
 };
 use crate::rpc::{Ctx, RpcError};
 use crate::settings::{Settings, Thinking};
@@ -251,6 +251,50 @@ impl AgentRunner {
     /// Saved sessions, most recent first (`chat/listSessions`).
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
         Session::list(&self.root)
+    }
+
+    /// Deletes a saved session (`chat/deleteSession`). Refused with `-32602`
+    /// while a turn runs in it; a session with no file is not an error.
+    pub fn delete_session(&self, session_id: &str) -> Result<(), RpcError> {
+        if !session::valid_id(session_id) {
+            return Err(RpcError::invalid_params(format!(
+                "invalid session id {session_id:?}"
+            )));
+        }
+        // Held across the check and the removal, so no turn can be reserved
+        // (and later save the session again) in between.
+        let running = lock(&self.running);
+        if running.contains_key(session_id) {
+            return Err(RpcError::invalid_params(format!(
+                "turn running in session {session_id:?}; stop it before deleting the session"
+            )));
+        }
+        Session::delete(&self.root, session_id)
+            .map_err(|err| RpcError::internal(format!("cannot delete session: {err}")))?;
+        lock(&self.trusted_allow).remove(session_id);
+        Ok(())
+    }
+
+    /// Deletes every saved session except those with a running turn
+    /// (`chat/clearSessions`), which are reported in `skipped`.
+    pub fn clear_sessions(&self) -> ChatClearSessionsResult {
+        let running = lock(&self.running);
+        let mut result = ChatClearSessionsResult::default();
+        let mut skipped: Vec<String> = running.keys().cloned().collect();
+        skipped.sort();
+        for id in Session::ids(&self.root) {
+            if running.contains_key(&id) {
+                continue;
+            }
+            match Session::delete(&self.root, &id) {
+                Ok(true) => result.deleted += 1,
+                Ok(false) => {}
+                Err(err) => tracing::warn!(%err, session = id, "cannot delete session"),
+            }
+        }
+        lock(&self.trusted_allow).retain(|id, _| running.contains_key(id));
+        result.skipped = skipped;
+        result
     }
 
     /// The session's messages for replay in the UI (`chat/history`), without

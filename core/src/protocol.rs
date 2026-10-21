@@ -37,8 +37,11 @@ pub mod methods {
     pub const CHAT_NEW_SESSION: &str = "chat/newSession";
     pub const CHAT_LIST_SESSIONS: &str = "chat/listSessions";
     pub const CHAT_HISTORY: &str = "chat/history";
+    pub const CHAT_DELETE_SESSION: &str = "chat/deleteSession";
+    pub const CHAT_CLEAR_SESSIONS: &str = "chat/clearSessions";
     pub const OLLAMA_STATUS: &str = "ollama/status";
     pub const OLLAMA_PULL: &str = "ollama/pull";
+    pub const OLLAMA_MODELS: &str = "ollama/models";
     pub const BENCH_RUN: &str = "bench/run";
     pub const SHUTDOWN: &str = "shutdown";
 
@@ -303,6 +306,24 @@ pub struct SessionSummary {
     pub updated_at_ms: u64,
 }
 
+/// `chat/deleteSession` removes the session's file and responds `{}` (also
+/// when there is no file). Refused with `-32602` ("turn running …") while a
+/// turn runs in that session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatDeleteSessionParams {
+    pub session_id: String,
+}
+
+/// Result of `chat/clearSessions {}`: every saved session is deleted except
+/// those with a running turn, which are listed in `skipped`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatClearSessionsResult {
+    pub deleted: usize,
+    pub skipped: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatHistoryParams {
@@ -498,6 +519,30 @@ pub struct OllamaPullParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaPullResult {}
 
+/// Result of `ollama/models {}`: the models installed in Ollama, in
+/// `/api/tags` order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaModelsResult {
+    pub models: Vec<OllamaModel>,
+}
+
+/// One installed model. The capabilities come from `/api/show`; if that
+/// fails for a model, both are `false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaModel {
+    pub name: String,
+    pub size_bytes: u64,
+    /// `details.family`; absent when Ollama reports none (or `""`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Fill-in-the-middle (`insert` capability): usable as completion model.
+    pub supports_insert: bool,
+    /// Tool calling (`tools` capability): usable as agent chat model.
+    pub supports_tools: bool,
+}
+
 /// Notification `ollama/pullProgress`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -557,6 +602,9 @@ mod tests {
         assert_eq!(methods::CHAT_HISTORY, "chat/history");
         assert_eq!(methods::OLLAMA_STATUS, "ollama/status");
         assert_eq!(methods::OLLAMA_PULL, "ollama/pull");
+        assert_eq!(methods::OLLAMA_MODELS, "ollama/models");
+        assert_eq!(methods::CHAT_DELETE_SESSION, "chat/deleteSession");
+        assert_eq!(methods::CHAT_CLEAR_SESSIONS, "chat/clearSessions");
         assert_eq!(methods::BENCH_RUN, "bench/run");
         assert_eq!(methods::SHUTDOWN, "shutdown");
         assert_eq!(methods::CHAT_TOKEN, "chat/token");

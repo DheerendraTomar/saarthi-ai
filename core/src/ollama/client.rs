@@ -5,6 +5,7 @@
 //! stream) that task drops the body at once, closing the connection so Ollama
 //! stops generating, whether or not the caller is currently polling.
 
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::types::*;
 use super::{OllamaError, OllamaState, OllamaStatus, Result};
+use crate::protocol::OllamaModel;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Parsed lines buffered between the body reader task and the consumer.
@@ -50,6 +52,22 @@ struct ModelList {
 #[derive(Deserialize)]
 struct ModelEntry {
     name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    details: Option<ModelDetails>,
+}
+
+#[derive(Deserialize)]
+struct ModelDetails {
+    #[serde(default)]
+    family: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ShowBody {
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 impl OllamaClient {
@@ -78,6 +96,64 @@ impl OllamaClient {
     pub async fn models(&self) -> Result<Vec<String>> {
         let body: ModelList = self.get_json("/api/tags").await?;
         Ok(body.names())
+    }
+
+    /// The installed models with size, family and capabilities: `GET
+    /// /api/tags`, then one `POST /api/show` per distinct model (in
+    /// parallel). A model whose `/api/show` fails is reported with both
+    /// capabilities `false`; only a failing `/api/tags` is an error.
+    pub async fn list_models(&self) -> Result<Vec<OllamaModel>> {
+        let body: ModelList = self.get_json("/api/tags").await?;
+        let entries = body.models.unwrap_or_default();
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let shows = futures::future::join_all(names.iter().map(|name| self.capabilities(name)));
+        let capabilities: HashMap<&str, Vec<String>> = names.into_iter().zip(shows.await).collect();
+        Ok(entries
+            .iter()
+            .map(|entry| {
+                let caps = capabilities
+                    .get(entry.name.as_str())
+                    .map_or(&[][..], Vec::as_slice);
+                let has = |cap: &str| caps.iter().any(|c| c == cap);
+                OllamaModel {
+                    name: entry.name.clone(),
+                    size_bytes: entry.size,
+                    family: entry
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.family.clone())
+                        .filter(|f| !f.is_empty()),
+                    supports_insert: has("insert"),
+                    supports_tools: has("tools"),
+                }
+            })
+            .collect())
+    }
+
+    /// `capabilities` from `POST /api/show`; empty if the call fails.
+    async fn capabilities(&self, model: &str) -> Vec<String> {
+        let request = self
+            .http
+            .post(self.url("/api/show"))
+            .json(&json!({"model": model}));
+        let shown = async {
+            let response = self.send(request, Some(model)).await?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|err| OllamaError::Other(describe(&err)))?;
+            serde_json::from_slice::<ShowBody>(&bytes)
+                .map_err(|err| OllamaError::Other(format!("unexpected /api/show response: {err}")))
+        };
+        match shown.await {
+            Ok(body) => body.capabilities,
+            Err(err) => {
+                tracing::warn!(model, %err, "cannot read model capabilities");
+                Vec::new()
+            }
+        }
     }
 
     /// Names of models currently loaded in memory (`GET /api/ps`).
