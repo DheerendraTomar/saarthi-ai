@@ -177,7 +177,7 @@ describe("session and learning commands", () => {
   it("reset_learning_confirms_and_stats_are_shown", async () => {
     const stats = {
       languages: {
-        python: { served: 10, accepted: 4, partial: 1, rejected: 4, typedThrough: 1, acceptRate: 0.5, learnedMaxLines: 4, learnedNumPredict: 48, examples: 2 },
+        python: { served: 10, accepted: 4, partial: 1, rejected: 4, typedThrough: 1, acceptRate: 0.5, learnedMaxLines: 4, learnedNumPredict: 48, learned: true, examples: 2 },
       },
       logPath: "/w/.localpilot/completions.jsonl",
       adaptive: true,
@@ -199,5 +199,18 @@ describe("session and learning commands", () => {
     ]);
     expect(picks[0].items[0].detail).toBe("accepted 4 · partial 1 · typed through 1 · rejected 4 — learned: 4 lines, 48 tokens, 2 examples");
     expect(registry.executed.map((e) => e.command)).toEqual(["vscode.open"]);
+
+    // Too few outcomes, or adaptive off: the limits are the defaults.
+    for (const [learned, adaptive] of [
+      [false, true],
+      [true, false],
+    ]) {
+      stats.languages.python.learned = learned;
+      stats.adaptive = adaptive;
+      picks.length = 0;
+      answerPicks(undefined);
+      await showCompletionStats(deps);
+      expect(picks[0].items[0].detail).toBe("accepted 4 · partial 1 · typed through 1 · rejected 4 — default: 4 lines, 48 tokens, 2 examples");
+    }
   });
 });

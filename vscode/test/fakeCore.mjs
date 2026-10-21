@@ -276,7 +276,7 @@ async function handleRequest(msg) {
       const acceptRate = c.served ? (c.accepted + c.partial) / c.served : 0;
       return respond(id, {
         languages: c.served
-          ? { typescript: { ...c, acceptRate, learnedMaxLines: 8, learnedNumPredict: 32, examples: 0 } }
+          ? { typescript: { ...c, acceptRate, learnedMaxLines: 8, learnedNumPredict: 32, learned: false, examples: 0 } }
           : {},
         logPath: join(workspace, ".localpilot", "completions.jsonl"),
         adaptive: true,

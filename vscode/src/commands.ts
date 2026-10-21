@@ -283,6 +283,8 @@ interface LanguageStats {
   acceptRate: number;
   learnedMaxLines: number;
   learnedNumPredict: number;
+  /** The limits were learned; `false`: the configured defaults (< 10 outcomes or adaptive off). */
+  learned: boolean;
   examples: number;
 }
 
@@ -300,7 +302,8 @@ export async function showCompletionStats(deps: Pick<CommandDeps, "client">): Pr
     description: `${Math.round(l.acceptRate * 100)}% accepted of ${l.served}`,
     detail:
       `accepted ${l.accepted} · partial ${l.partial} · typed through ${l.typedThrough} · rejected ${l.rejected}` +
-      ` — learned: ${l.learnedMaxLines} lines, ${l.learnedNumPredict} tokens, ${l.examples} example${l.examples === 1 ? "" : "s"}`,
+      ` — ${l.learned && stats.adaptive ? "learned" : "default"}: ${l.learnedMaxLines} lines, ${l.learnedNumPredict} tokens` +
+      `, ${l.examples} example${l.examples === 1 ? "" : "s"}`,
   }));
   if (items.length === 0) items.push({ label: "No completion outcomes recorded yet" });
   const logPath = stats.logPath;

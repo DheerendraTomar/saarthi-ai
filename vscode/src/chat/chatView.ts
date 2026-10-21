@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { syncUri } from "../documentSync";
-import { isModelKind, MODEL_SETTING, ModelCatalog } from "../models";
+import { isModelKind, MODEL_SETTING, ModelCatalog, type ModelKind } from "../models";
 import type { CoreClient } from "../rpc/coreClient";
 import { readSettings, updateSetting, type Settings } from "../settings";
 
@@ -442,16 +442,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return { chat: s.chatModel, completion: s.completionModel };
   }
 
-  /** `model/select`: writes the chat/completion model setting (the core restarts), then always answers `models/list`. */
+  /**
+   * `model/select`: writes the chat/completion model setting (the core restarts), then always answers `models/list`.
+   * Only a name from the last-known installed list (fetched first if there is none yet) or the current setting is
+   * written — the webview is not trusted to name arbitrary models.
+   */
   private async selectModel(kind: unknown, name: unknown): Promise<void> {
     if (isModelKind(kind) && typeof name === "string" && name.trim()) {
-      try {
-        await updateSetting(MODEL_SETTING[kind], name.trim());
-      } catch (e) {
-        this.postError(`Could not save the ${kind} model: ${errorMessage(e)}`);
+      const model = name.trim();
+      if (await this.isSelectable(kind, model)) {
+        try {
+          await updateSetting(MODEL_SETTING[kind], model);
+        } catch (e) {
+          this.postError(`Could not save the ${kind} model: ${errorMessage(e)}`);
+        }
+      } else {
+        this.postError(`Model "${model}" is not installed in Ollama.`);
       }
     }
     await this.postModels();
+  }
+
+  private async isSelectable(kind: ModelKind, model: string): Promise<boolean> {
+    if (this.currentModels()[kind] === model) return true;
+    const known = this.models.lastKnown ?? (await this.models.fetch().catch(() => undefined));
+    return known?.some((m) => m.name === model) ?? false;
   }
 
   private postSettings(): void {

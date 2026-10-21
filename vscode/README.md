@@ -17,8 +17,8 @@ Requires Rust (stable), Node 20+ and npm; the bundled core is built for this mac
 
 ```sh
 npm ci                                   # once, from the repo root
-bash scripts/package-vscode.sh           # → dist/localpilot-0.1.0.vsix
-code --install-extension dist/localpilot-0.1.0.vsix --force
+bash scripts/package-vscode.sh           # → dist/localpilot-0.2.1.vsix
+code --install-extension dist/localpilot-0.2.1.vsix --force
 code --list-extensions | grep localpilot # → localpilot.localpilot
 ```
 
@@ -112,15 +112,21 @@ per-language bookkeeping in the core:
   - taking part of a suggestion and pressing `Tab` more than 2 s later is logged
     as **partial**, not accepted;
   - after each key or partial accept VS Code asks again, and the core may serve
-    the rest as a new suggestion; each served suggestion gets its own outcome, so
-    one typing run can log several.
+    the rest of the suggestion from its cache; that rest is not logged as a new
+    suggestion — the original suggestion's record carries the outcome of the whole
+    typing run (so one typing run logs one record).
 - From the last 50 outcomes per language the core picks how many lines and tokens
-  to generate (bounded to 1–8 lines and 16–2× `completionMaxTokens` tokens), and adds
-  up to 3 recently accepted multi-line suggestions as style examples to the prompt.
+  to generate (bounded to 1–8 lines and 16–`completionMaxTokens` tokens: learning only
+  shortens, never lengthens past your setting), and adds up to 3 recently accepted
+  multi-line suggestions as style examples to the prompt. So that longer lengths keep
+  being tried, every 10th multi-line suggestion runs with your configured limits —
+  learning explores the configured length 10% of the time.
 - **LocalPilot: Show Completion Stats** (or the status bar menu, or the Settings
-  panel) shows per-language accept rates and the learned values.
-- **To reset**: **LocalPilot: Reset Completion Learning** (or **Reset learning** in
-  the Settings panel) forgets the learned values and examples; the log file is kept.
+  panel) shows per-language outcome counts, the accept rate (accepted + partial),
+  and the line / token limits, tagged *learned* or *default* (default until a
+  language has 10 outcomes, or while adaptive completions are off).
+- **To reset**: **LocalPilot: Reset Completion Learning** (or **Reset learning**, then
+  **Confirm**, in the Settings panel) forgets the learned values and examples; the log file is kept.
   To stop adapting without resetting, set `localpilot.adaptiveCompletions` to `false`.
   To delete the history entirely, delete `.localpilot/completions.jsonl` too.
 

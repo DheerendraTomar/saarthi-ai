@@ -435,7 +435,7 @@ const MODELS = [
 ];
 const STATS = {
   languages: {
-    python: { served: 10, accepted: 4, partial: 1, rejected: 4, typedThrough: 1, acceptRate: 0.5, learnedMaxLines: 4, learnedNumPredict: 48, examples: 2 },
+    python: { served: 10, accepted: 4, partial: 1, rejected: 4, typedThrough: 1, acceptRate: 0.5, learnedMaxLines: 4, learnedNumPredict: 48, learned: true, examples: 2 },
   },
   logPath: "/work/proj/.localpilot/completions.jsonl",
   adaptive: true,
@@ -515,7 +515,7 @@ describe("ChatViewProvider v2 relays", () => {
     })) as typeof workspace.getConfiguration;
     try {
       ui.posted.length = 0;
-      ui.send({ type: "model/select", kind: "chat", name: "other:7b" });
+      ui.send({ type: "model/select", kind: "chat", name: "qwen2.5-coder:1.5b-base" });
       await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, "models/list after failed select");
       expect(ui.posted.find((m) => m.type === "ui/error")?.message).toContain("settings.json is read-only");
       expect(ui.posted.find((m) => m.type === "models/list")).toMatchObject({ current: { chat: "qwen3.8:27b-mlx" } });
@@ -526,6 +526,36 @@ describe("ChatViewProvider v2 relays", () => {
     } finally {
       workspace.getConfiguration = failing;
     }
+  });
+
+  it("model_select_only_writes_installed_or_current_names", async () => {
+    let down = true;
+    const { ui } = v2Setup((method, params) => {
+      if (method !== "ollama/models") return defaultResponder(method, params);
+      if (down) throw Object.assign(new Error("cannot reach Ollama"), { code: -32000 });
+      return { models: MODELS };
+    });
+    configValues["localpilot.chatModel"] = "qwen3.8:27b-mlx";
+    const select = async (kind: string, name: string) => {
+      ui.posted.length = 0;
+      ui.send({ type: "model/select", kind, name });
+      await waitFor(() => ui.posted.some((m) => m.type === "models/list"), 5000, `models/list after ${name}`);
+    };
+
+    // No list known and Ollama down: only the current setting may be (re)written.
+    await select("chat", "qwen2.5-coder:1.5b-base");
+    expect(registry.configUpdates).toEqual([]);
+    expect(ui.posted.find((m) => m.type === "ui/error")?.message).toContain('"qwen2.5-coder:1.5b-base" is not installed');
+    await select("chat", "qwen3.8:27b-mlx");
+    expect(registry.configUpdates).toEqual([{ key: "localpilot.chatModel", value: "qwen3.8:27b-mlx", target: 1 }]);
+
+    // Once a list is known, its names pass and anything else is refused.
+    down = false;
+    await select("completion", "qwen2.5-coder:1.5b-base");
+    expect(registry.configUpdates.at(-1)).toEqual({ key: "localpilot.completionModel", value: "qwen2.5-coder:1.5b-base", target: 1 });
+    await select("completion", "evil:1b");
+    expect(registry.configUpdates).toHaveLength(2);
+    expect(ui.posted.find((m) => m.type === "ui/error")?.message).toContain('"evil:1b" is not installed');
   });
 
   it("settings_patch_written_to_defining_scope", async () => {
