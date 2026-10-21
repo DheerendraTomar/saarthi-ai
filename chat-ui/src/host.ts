@@ -37,6 +37,8 @@ export type HostToUi =
   | ({ type: "chat/done" } & ChatDone)
   | ({ type: "status" } & StatusNotification)
   | ({ type: "ollama/pullProgress" } & OllamaPullProgress)
+  /** Host-originated: whether `sessionId` has a turn in progress (sent after `session/history`, so Stop shows for a running turn). */
+  | { type: "chat/turnState"; sessionId: string; running: boolean }
   | { type: "session/list"; sessions: SessionSummary[]; current: string | null }
   | { type: "session/history"; sessionId: string; messages: HistoryMessage[] }
   | { type: "ui/activeFile"; uri: string | null; selection?: Range }

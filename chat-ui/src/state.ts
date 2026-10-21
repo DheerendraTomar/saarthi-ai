@@ -16,7 +16,7 @@ export interface AssistantMsg {
   error?: true;
 }
 
-/** Placeholder row in v1; Task 3 renders it as a ToolCard. */
+/** A tool call row; rendered as a ToolCard (live buttons while it is in `pendingApprovals`). */
 export interface ToolCallMsg {
   kind: "toolCall";
   toolCallId: string;
@@ -35,7 +35,7 @@ export interface ToolResultMsg {
 
 export type Msg = UserMsg | AssistantMsg | ToolCallMsg | ToolResultMsg;
 
-/** A tool call awaiting the user's approve / always / deny (Task 3 renders it). */
+/** A tool call awaiting the user's approve / always / deny. */
 export interface ToolCardState {
   toolCallId: string;
   name: string;
@@ -157,14 +157,22 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
         if (event.preview !== undefined) card.preview = event.preview;
         pendingApprovals.set(event.toolCallId, card);
       }
+      // A call already shown (replayed from history, then re-sent by the host
+      // because it still awaits approval) is updated in place, not duplicated.
+      const at = state.messages.findIndex((m) => m.kind === "toolCall" && m.toolCallId === event.toolCallId);
+      const messages = at >= 0 ? state.messages.map((m, i) => (i === at ? row : m)) : [...commitStreaming(state.messages, state.streaming), row];
       return {
         ...state,
-        messages: [...commitStreaming(state.messages, state.streaming), row],
+        messages,
         // The turn continues after the tool runs: keep an (empty) buffer.
-        streaming: { text: "", thinking: "" },
+        streaming: at >= 0 ? (state.streaming ?? { text: "", thinking: "" }) : { text: "", thinking: "" },
         pendingApprovals,
       };
     }
+    case "chat/turnState":
+      // Running: keep or open an (empty) buffer so the composer offers Stop.
+      if (event.running) return state.streaming ? state : { ...state, streaming: { text: "", thinking: "" } };
+      return { ...state, messages: commitStreaming(state.messages, state.streaming), streaming: null };
     case "chat/toolResult": {
       let pendingApprovals = state.pendingApprovals;
       if (pendingApprovals.has(event.toolCallId)) {

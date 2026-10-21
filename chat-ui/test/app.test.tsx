@@ -173,3 +173,59 @@ describe("attachments", () => {
     expect(bridge.sent).toContainEqual({ type: "chat/send", message: "three", attachments: [] });
   });
 });
+
+describe("running turns and scrolling", () => {
+  it("shows_stop_for_a_running_turn_reattached_after_history", () => {
+    const { bridge, emit } = setup();
+    emit({ type: "session/list", sessions: [{ sessionId: "s1", title: "t", updatedAtMs: 1 }], current: "s1" });
+    emit({ type: "session/history", sessionId: "s1", messages: [{ role: "user", content: "edit it" }] });
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+
+    // The host reports the session's turn still runs: Stop shows although nothing streams.
+    emit({ type: "chat/turnState", sessionId: "s1", running: true });
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(bridge.sent).toContainEqual({ type: "chat/stop" });
+
+    // And its re-posted approval is live again.
+    emit({
+      type: "chat/toolCall",
+      sessionId: "s1",
+      toolCallId: "t1",
+      name: "run_command",
+      args: { command: "ls" },
+      requiresApproval: true,
+      preview: "ls",
+    });
+    expect(screen.getByRole("button", { name: /deny/i })).toBeTruthy();
+    emit({ type: "chat/done", sessionId: "s1", stopReason: "stopped" });
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
+  it("auto_scrolls_only_while_the_user_is_at_the_bottom", () => {
+    const { emit, container } = setup();
+    const list = container.querySelector(".messages") as HTMLElement;
+    let top = 0;
+    Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => 1000 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, get: () => 200 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    emit({ type: "session/list", sessions: [], current: "s1" });
+
+    // At the bottom: new output keeps the newest line in view.
+    top = 800;
+    fireEvent.scroll(list);
+    emit({ type: "chat/token", sessionId: "s1", delta: "one", kind: "text" });
+    expect(top).toBe(1000);
+
+    // Scrolled up to read: streaming does not yank the view back down.
+    top = 100;
+    fireEvent.scroll(list);
+    emit({ type: "chat/token", sessionId: "s1", delta: " two", kind: "text" });
+    expect(top).toBe(100);
+
+    // Back near the bottom (within a few lines): sticking resumes.
+    top = 780;
+    fireEvent.scroll(list);
+    emit({ type: "chat/token", sessionId: "s1", delta: " three", kind: "text" });
+    expect(top).toBe(1000);
+  });
+});

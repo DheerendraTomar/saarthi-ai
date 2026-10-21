@@ -13,6 +13,9 @@ export interface AppProps {
   bridge: HostBridge;
 }
 
+/** Within this distance of the bottom, the message list follows new output. */
+const STICK_THRESHOLD_PX = 40;
+
 /** Model name from a `modelMissing` detail such as `model "x:1b" is not installed`. */
 export function modelFromDetail(detail: string): string {
   return /"([^"]+)"/.exec(detail)?.[1] ?? "";
@@ -142,10 +145,15 @@ export function App({ bridge }: AppProps) {
     return off;
   }, [bridge]);
 
-  // Keep the newest output in view while streaming.
+  // Keep the newest output in view while streaming, unless the user scrolled up to read.
+  const stickToBottom = useRef(true);
+  const onScroll = useCallback(() => {
+    const el = listRef.current;
+    if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+  }, []);
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
   }, [state.messages, state.streaming]);
 
   const onSend = (text: string, attachments: Attachment[]) => {
@@ -189,7 +197,7 @@ export function App({ bridge }: AppProps) {
         <SessionSwitcher sessions={state.sessions} currentSessionId={state.currentSessionId} bridge={bridge} />
         <StatusPill status={state.status} pull={state.pull} bridge={bridge} />
       </header>
-      <div class="messages" ref={listRef} role="log" aria-live="polite">
+      <div class="messages" ref={listRef} role="log" aria-live="polite" onScroll={onScroll}>
         {state.messages.map((m, i) => {
           if (m.kind === "toolCall") {
             return (

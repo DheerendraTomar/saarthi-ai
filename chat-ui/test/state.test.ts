@@ -150,6 +150,59 @@ describe("reduce", () => {
   });
 });
 
+describe("reattaching to a running turn", () => {
+  const history: HostToUi = {
+    type: "session/history",
+    sessionId: "s1",
+    messages: [
+      { role: "user", content: "edit a.py" },
+      { role: "assistant", content: "Sure.", toolCalls: [{ toolCallId: "t1", name: "edit_file", args: { path: "a.py" } }] },
+    ],
+  };
+  const pendingCall: HostToUi = {
+    type: "chat/toolCall",
+    sessionId: "s1",
+    toolCallId: "t1",
+    name: "edit_file",
+    args: { path: "a.py" },
+    requiresApproval: true,
+    preview: "--- a/a.py\n+++ b/a.py",
+  };
+
+  it("turnState_running_shows_stop_without_streaming_and_not_running_ends_it", () => {
+    let s = run([history]);
+    expect(s.streaming).toBeNull();
+    s = reduce(s, { type: "chat/turnState", sessionId: "s1", running: true });
+    // An empty buffer: the composer shows Stop, nothing is rendered as a reply yet.
+    expect(s.streaming).toEqual({ text: "", thinking: "" });
+    // Tokens keep streaming into it.
+    s = reduce(s, tok("more"));
+    s = reduce(s, { type: "chat/turnState", sessionId: "s1", running: true });
+    expect(s.streaming).toEqual({ text: "more", thinking: "" });
+    s = reduce(s, { type: "chat/turnState", sessionId: "s1", running: false });
+    expect(s.streaming).toBeNull();
+    expect(s.messages[s.messages.length - 1]).toEqual({ kind: "assistant", text: "more" });
+    // Another session's turn state is ignored.
+    s = reduce(s, { type: "chat/turnState", sessionId: "other", running: true });
+    expect(s.streaming).toBeNull();
+  });
+
+  it("reposted_tool_call_after_history_becomes_pending_without_duplicating_the_row", () => {
+    let s = run([history, pendingCall]);
+    const calls = s.messages.filter((m) => m.kind === "toolCall");
+    expect(calls).toEqual([
+      { kind: "toolCall", toolCallId: "t1", name: "edit_file", args: { path: "a.py" }, requiresApproval: true, preview: "--- a/a.py\n+++ b/a.py" },
+    ]);
+    expect(s.messages.map((m) => m.kind)).toEqual(["user", "assistant", "toolCall"]);
+    expect(s.pendingApprovals.get("t1")?.preview).toBe("--- a/a.py\n+++ b/a.py");
+    expect(s.streaming).toEqual({ text: "", thinking: "" });
+
+    // A call that history does not have yet is appended as usual.
+    s = reduce(s, { ...pendingCall, toolCallId: "t2" });
+    expect(s.messages.filter((m) => m.kind === "toolCall").map((m) => (m as { toolCallId: string }).toolCallId)).toEqual(["t1", "t2"]);
+  });
+});
+
 describe("pull progress lifecycle", () => {
   const progress: HostToUi = { type: "ollama/pullProgress", model: "m:1b", status: "pulling", completed: 1, total: 4 };
 
