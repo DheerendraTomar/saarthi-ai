@@ -98,14 +98,28 @@ Additions beyond the spec:
   `completion/accepted` and `completion/rejected` keep working and mean
   `accepted` / `rejected`. Each served suggestion is appended once to
   **`<workspace>/.localpilot/completions.jsonl`** when its outcome arrives:
-  `{ ts, requestId, lang, promptHash, contextTail, suggestion, lines, outcome,
-  acceptedText?, ttftMs, totalMs }` (`ts` Unix ms; `lang` lower-case, e.g.
-  `"python"`, `"other"`; `promptHash` = first 16 hex digits of SHA-256 of
-  prompt `\0` suffix; `contextTail` = at most 200 characters before the cursor
-  — no other file content is logged; `ttftMs` is `null` for a cache hit or a
-  joined generation). A suggestion with no outcome within 60 s (or once 64
-  newer ones are waiting) is logged as `rejected`; a later outcome for it is
-  ignored. The file is rotated past 10 000 lines, keeping the newest 5 000.
+  `{ ts, requestId, lang, ext?, promptHash, contextTail, suggestion, lines,
+  outcome, acceptedText?, ttftMs, totalMs, model?, maxLines?, numPredict? }`
+  - `ts` Unix ms when served; `lang` lower-case (`"python"`, …, `"other"`);
+    `ext` the file's lower-case extension.
+  - `promptHash` = first 16 hex digits of SHA-256 of prompt `\0` suffix.
+  - `contextTail` = at most 200 characters before the cursor — no other file
+    content is logged.
+  - `acceptedText` only for `accepted` / `partial`, cut to the suggestion's
+    length.
+  - `ttftMs` is `null` for a cache hit or a joined generation.
+  - `model`, `maxLines` (stop-rule line cap) and `numPredict` are the limits
+    in effect for that request.
+
+  A suggestion with no outcome within 60 s (or once 64 newer ones are
+  waiting) is logged as `rejected` and a later outcome for it is ignored; a
+  late outcome (after 60 s) is still recorded with its real outcome if
+  nothing expired it first (expiry is lazy: on the next served suggestion or
+  outcome). On `shutdown` (or stdin EOF) every suggestion still waiting is
+  logged as `rejected`. Writing happens on a background writer, never on the
+  request path. The file is rotated past 10 000 lines, keeping the newest
+  5 000. Resetting learning writes `completions.meta.json`
+  (`{ "learningResetAt": ms }`); the log itself is never truncated.
 - **One Ollama status shape everywhere: `{ ollama, detail }`**, with
   `ollama` one of `"ok" | "down" | "modelMissing"`. It is
   `InitializeResult.ollamaStatus`, the `ollama/status` result and the params
@@ -131,7 +145,7 @@ Behaviour to rely on:
   `.localpilot/` (any path component, case-insensitive), whatever the user's
   approvals. `read_file` refuses files over 1 MB on disk (the index limit).
 - The core's state lives in `<workspace>/.localpilot/` (`core.log`,
-  `sessions/`, `completions.jsonl`); it creates `.localpilot/.gitignore` (`*`) together with the log.
+  `sessions/`, `completions.jsonl`, `completions.meta.json`); it creates `.localpilot/.gitignore` (`*`) together with the log.
 - **Notifications that arrive before `initialize` has been handled are dropped**
   (logged), so send `didOpen` etc. after the `initialize` response. Requests
   other than `initialize` / `shutdown` before then fail with `-32600`; a second

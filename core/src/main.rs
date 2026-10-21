@@ -117,9 +117,12 @@ fn serve(workspace: &Path, log_level: &str) -> ExitCode {
             stop: Some(shutdown_rx),
             stopped: false,
         });
-        RpcServer::new(input, tokio::io::stdout(), handler)
+        let served = RpcServer::new(input, tokio::io::stdout(), handler.clone())
             .run()
-            .await
+            .await;
+        // Also on stdin EOF without `shutdown`: no pending outcome is lost.
+        handler.flush_completion_log().await;
+        served
     });
     let code = match outcome {
         Ok(()) => {

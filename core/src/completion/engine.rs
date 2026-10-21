@@ -263,10 +263,24 @@ impl CompletionEngine {
         };
         let key = prepared.key.clone();
         // Captured before `prepared` moves into the generation.
-        let draft = self.feedback_log().is_some().then(|| Draft {
-            lang: Lang::from_path(&uri_to_path(&params.uri)).as_str(),
-            prompt_hash: feedback::prompt_hash(&prepared.prompt.prompt, &prepared.prompt.suffix),
-            context_tail: feedback::context_tail(&key.1),
+        let draft = self.feedback_log().is_some().then(|| {
+            let path = uri_to_path(&params.uri);
+            Draft {
+                lang: Lang::from_path(&path).as_str(),
+                ext: path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_lowercase),
+                prompt_hash: feedback::prompt_hash(
+                    &prepared.prompt.prompt,
+                    &prepared.prompt.suffix,
+                ),
+                context_tail: feedback::context_tail(&key.1),
+                max_lines: match prepared.mode {
+                    StopMode::SingleLine => 1,
+                    StopMode::MultiLine => u32::try_from(stop::MAX_LINES).unwrap_or(u32::MAX),
+                },
+            }
         });
 
         let mut served_key = key.clone();
@@ -311,6 +325,7 @@ impl CompletionEngine {
                 ts: feedback::now_ms(),
                 request_id: params.request_id.clone(),
                 lang: draft.lang.to_owned(),
+                ext: draft.ext,
                 prompt_hash: draft.prompt_hash,
                 context_tail: draft.context_tail,
                 lines: feedback::line_count(&text),
@@ -319,6 +334,9 @@ impl CompletionEngine {
                 accepted_text: None,
                 ttft_ms: first_token_at.map(|t| ms(t.saturating_duration_since(started_at))),
                 total_ms: ms(started_at.elapsed()),
+                model: Some(settings.completion_model.clone()),
+                max_lines: Some(draft.max_lines),
+                num_predict: Some(settings.completion_max_tokens),
             };
             self.add_pending(record);
         }
@@ -401,11 +419,11 @@ impl CompletionEngine {
             expire(&mut pending, Instant::now(), &mut done);
             if let Some(mut p) = named {
                 p.record.outcome = outcome;
-                p.record.accepted_text = accepted_text;
+                p.record.accepted_text = kept_text(outcome, accepted_text, &p.record.suggestion);
                 done.push(p.record);
             }
         }
-        self.write_log(&done);
+        self.write_log(done);
     }
 
     /// Logs outcomes to `log` from now on.
@@ -435,21 +453,31 @@ impl CompletionEngine {
                 record,
             });
         }
-        self.write_log(&done);
+        self.write_log(done);
     }
 
-    fn write_log(&self, records: &[Record]) {
+    /// Hands `records` to the log's writer (never blocks on file I/O).
+    fn write_log(&self, records: Vec<Record>) {
         if records.is_empty() {
             return;
         }
-        let Some(log) = self.feedback_log() else {
-            return;
-        };
-        for record in records {
-            if let Err(err) = log.append(record) {
-                tracing::warn!(path = %log.path().display(), %err, "cannot write the completion log");
-                return;
+        if let Some(log) = self.feedback_log() {
+            for record in records {
+                log.submit(record);
             }
+        }
+    }
+
+    /// Logs every suggestion still awaiting an outcome as `rejected` and
+    /// waits until the log has written everything (call on shutdown).
+    pub async fn flush_pending(&self) {
+        let done: Vec<Record> = lock(&self.inner.pending)
+            .drain(..)
+            .map(|p| p.record)
+            .collect();
+        self.write_log(done);
+        if let Some(log) = self.feedback_log() {
+            log.flush().await;
         }
     }
 
@@ -907,8 +935,24 @@ fn remember_served(inner: &Inner, request_id: &str, key: Key) {
 /// prompt is handed to the generation.
 struct Draft {
     lang: &'static str,
+    ext: Option<String>,
     prompt_hash: String,
     context_tail: String,
+    max_lines: u32,
+}
+
+/// `acceptedText` as logged: only for `accepted` / `partial`, and at most as
+/// many characters as the suggestion.
+fn kept_text(outcome: LogOutcome, text: Option<String>, suggestion: &str) -> Option<String> {
+    if !matches!(outcome, LogOutcome::Accepted | LogOutcome::Partial) {
+        return None;
+    }
+    let mut text = text?;
+    let cap = suggestion.chars().count();
+    if let Some((cut, _)) = text.char_indices().nth(cap) {
+        text.truncate(cut);
+    }
+    Some(text)
 }
 
 /// Moves the pending suggestions older than [`OUTCOME_TIMEOUT`] (the
@@ -942,6 +986,7 @@ fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 mod tests {
     use std::path::PathBuf;
 
+    use super::super::feedback::FeedbackLog;
     use super::*;
     use crate::overlay::path_to_uri;
     use crate::protocol::ContentChange;
@@ -1220,72 +1265,141 @@ mod tests {
         assert_eq!(served.items[0].text, "t)");
     }
 
-    #[tokio::test]
-    async fn unanswered_outcome_expires_as_rejected() {
-        use super::super::feedback::{FeedbackLog, Outcome};
-        let f = fixture(MAIN);
+    /// `(requestId, outcome)` of everything logged so far.
+    async fn logged(log: &FeedbackLog) -> Vec<(String, LogOutcome)> {
+        log.flush().await;
+        log.records()
+            .into_iter()
+            .map(|r| (r.request_id, r.outcome))
+            .collect()
+    }
+
+    fn workspace_log(f: &Fixture) -> Arc<FeedbackLog> {
         let log = Arc::new(FeedbackLog::for_workspace(f._dir.path()));
         f.engine.set_feedback_log(log.clone());
-        let at = Position {
-            line: 3,
-            character: 11,
-        };
-        let ids = |log: &FeedbackLog| -> Vec<(String, Outcome)> {
-            log.records()
-                .into_iter()
-                .map(|r| (r.request_id, r.outcome))
-                .collect()
-        };
+        log
+    }
 
-        serve_cached(&f, "r1", at).await;
+    const AT: Position = Position {
+        line: 3,
+        character: 11,
+    };
+
+    #[tokio::test]
+    async fn unanswered_outcome_expires_as_rejected() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        let r = |id: &str, o| (id.to_owned(), o);
+
+        serve_cached(&f, "r1", AT).await;
         f.engine
             .age_pending(OUTCOME_TIMEOUT - Duration::from_secs(1));
-        serve_cached(&f, "r2", at).await;
-        assert!(ids(&log).is_empty(), "r1 has 1 s left");
+        serve_cached(&f, "r2", AT).await;
+        assert!(logged(&log).await.is_empty(), "r1 has 1 s left");
 
         f.engine.age_pending(Duration::from_secs(2));
         // r1 is now 61 s old, r2 2 s: the next outcome expires r1 first.
-        f.engine.on_outcome("r2", Outcome::Accepted, None);
+        f.engine.on_outcome("r2", LogOutcome::Accepted, None);
         assert_eq!(
-            ids(&log),
-            [
-                ("r1".to_owned(), Outcome::Rejected),
-                ("r2".to_owned(), Outcome::Accepted)
-            ]
+            logged(&log).await,
+            [r("r1", LogOutcome::Rejected), r("r2", LogOutcome::Accepted)]
         );
         let expired = &log.records()[0];
         assert_eq!(expired.accepted_text, None);
         assert_eq!(expired.suggestion, "t)");
         assert_eq!(expired.lang, "python");
+        assert_eq!(expired.ext.as_deref(), Some("py"));
+        assert_eq!(
+            expired.model.as_deref(),
+            Some(Settings::default().completion_model.as_str())
+        );
+        assert_eq!(expired.max_lines, Some(8), "blank rest of line: multi-line");
+        assert_eq!(
+            expired.num_predict,
+            Some(Settings::default().completion_max_tokens)
+        );
 
         // A late outcome for the expired request adds nothing.
-        f.engine.on_outcome("r1", Outcome::Accepted, None);
-        assert_eq!(log.records().len(), 2);
+        f.engine.on_outcome("r1", LogOutcome::Accepted, None);
+        assert_eq!(logged(&log).await.len(), 2);
 
         // Expiry also runs when the next suggestion is served.
-        serve_cached(&f, "r3", at).await;
+        serve_cached(&f, "r3", AT).await;
         f.engine.age_pending(OUTCOME_TIMEOUT);
-        serve_cached(&f, "r4", at).await;
-        assert_eq!(ids(&log)[2..], [("r3".to_owned(), Outcome::Rejected)]);
+        serve_cached(&f, "r4", AT).await;
+        assert_eq!(logged(&log).await[2..], [r("r3", LogOutcome::Rejected)]);
 
         // More unanswered suggestions than are remembered: the oldest are
         // logged as rejected rather than dropped.
         for i in 0..PENDING_MEMORY {
-            serve_cached(&f, &format!("burst{i}"), at).await;
+            serve_cached(&f, &format!("burst{i}"), AT).await;
         }
-        let records = ids(&log);
+        let records = logged(&log).await;
         assert_eq!(records.len(), 4);
-        assert_eq!(records[3], ("r4".to_owned(), Outcome::Rejected));
+        assert_eq!(records[3], r("r4", LogOutcome::Rejected));
+    }
+
+    #[tokio::test]
+    async fn accepted_text_is_capped_and_only_kept_when_accepted() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        for (id, outcome, text) in [
+            ("a", LogOutcome::Partial, "t)"),
+            ("b", LogOutcome::Accepted, "t) and much more"),
+            ("c", LogOutcome::Rejected, "t)"),
+            ("d", LogOutcome::TypedThrough, "t)"),
+        ] {
+            serve_cached(&f, id, AT).await;
+            f.engine.on_outcome(id, outcome, Some(text.to_owned()));
+        }
+        log.flush().await;
+        let kept: Vec<Option<String>> =
+            log.records().into_iter().map(|r| r.accepted_text).collect();
+        assert_eq!(
+            kept,
+            [Some("t)".to_owned()), Some("t)".to_owned()), None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn logging_never_blocks_serving_and_shutdown_flushes_pending() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        log.flush().await; // initial scan done
+        let slow = Duration::from_millis(1_000);
+        log.set_write_delay(slow);
+        let quick = Duration::from_millis(300);
+
+        serve_cached(&f, "r1", AT).await;
+        let t = Instant::now();
+        f.engine.on_outcome("r1", LogOutcome::Accepted, None);
+        assert!(t.elapsed() < quick, "outcome waited {:?}", t.elapsed());
+
+        // A serve that expires an older suggestion does not wait either.
+        serve_cached(&f, "r2", AT).await;
+        f.engine.age_pending(OUTCOME_TIMEOUT);
+        let t = Instant::now();
+        serve_cached(&f, "r3", AT).await;
+        assert!(t.elapsed() < quick, "serve waited {:?}", t.elapsed());
+        assert!(log.records().is_empty(), "the writer is still sleeping");
+
+        // Shutdown: r3 never got an outcome; it is logged and written.
+        log.set_write_delay(Duration::ZERO);
+        f.engine.flush_pending().await;
+        assert_eq!(
+            logged(&log).await,
+            [
+                ("r1".to_owned(), LogOutcome::Accepted),
+                ("r2".to_owned(), LogOutcome::Rejected),
+                ("r3".to_owned(), LogOutcome::Rejected)
+            ]
+        );
     }
 
     #[tokio::test]
     async fn no_log_when_none_is_set() {
         let f = fixture(MAIN);
-        let at = Position {
-            line: 3,
-            character: 11,
-        };
-        serve_cached(&f, "r1", at).await;
+        serve_cached(&f, "r1", AT).await;
         f.engine.on_accepted("r1");
         assert!(!f._dir.path().join(".localpilot").exists());
     }

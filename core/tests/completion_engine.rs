@@ -494,6 +494,7 @@ async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
         .unwrap()
         .as_millis() as u64;
     assert_eq!(texts(&complete(&env, "r1", at).await), ["a + b"]);
+    log.flush().await;
     assert!(
         log.records().is_empty(),
         "logged only once the outcome is known"
@@ -501,6 +502,7 @@ async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
 
     env.engine
         .on_outcome("r1", Outcome::Partial, Some("a".to_owned()));
+    log.flush().await;
     let raw = std::fs::read_to_string(log.path()).unwrap();
     assert_eq!(raw.lines().count(), 1, "{raw}");
     for leaked in ["FAR_SENTINEL", "SUFFIX_SENTINEL", "print(add", "# "] {
@@ -514,8 +516,12 @@ async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
         [
             "acceptedText",
             "contextTail",
+            "ext",
             "lang",
             "lines",
+            "maxLines",
+            "model",
+            "numPredict",
             "outcome",
             "promptHash",
             "requestId",
@@ -532,6 +538,13 @@ async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
     assert!(tail.ends_with("x\ndef add(a, b):\n    return "), "{tail:?}");
     assert_eq!(record["requestId"], "r1");
     assert_eq!(record["lang"], "python");
+    assert_eq!(record["ext"], "py");
+    assert_eq!(record["model"], "coder");
+    assert_eq!(record["maxLines"], 8, "rest of the line is blank");
+    assert_eq!(
+        record["numPredict"],
+        Settings::default().completion_max_tokens
+    );
     assert_eq!(record["suggestion"], "a + b");
     assert_eq!(record["lines"], 1);
     assert_eq!(record["outcome"], "partial");
@@ -558,11 +571,13 @@ async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
 
     // A second outcome for the same request is ignored.
     env.engine.on_outcome("r1", Outcome::Rejected, None);
+    log.flush().await;
     assert_eq!(log.records().len(), 1);
 
     // A cache hit is logged with no time to first token.
     assert_eq!(texts(&complete(&env, "r2", at).await), ["a + b"]);
     env.engine.on_accepted("r2");
+    log.flush().await;
     let hit = &log.records()[1];
     assert_eq!(hit.outcome, Outcome::Accepted);
     assert_eq!(hit.ttft_ms, None);

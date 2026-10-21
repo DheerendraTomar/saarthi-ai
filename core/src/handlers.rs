@@ -53,6 +53,8 @@ pub const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 /// Upper bound on `ollama/models` (`/api/tags` plus one `/api/show` per
 /// model); past it Ollama counts as down.
 pub const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest wait for the completion outcome log on shutdown.
+pub const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// JSON-RPC "Invalid Request": used for calls made in the wrong state.
 const INVALID_REQUEST: i64 = -32600;
@@ -255,15 +257,31 @@ impl AppHandler {
         }))
     }
 
-    fn shutdown(&self) -> Value {
+    async fn shutdown(&self) -> Value {
         tracing::info!("shutdown requested");
         if let Some(state) = self.state() {
             state.turns.cancel();
         }
+        self.flush_completion_log().await;
         if let Some(tx) = lock(&self.shutdown).take() {
             let _ = tx.send(());
         }
         json!({})
+    }
+
+    /// Logs every completion still awaiting an outcome as `rejected` and
+    /// waits (at most [`LOG_FLUSH_TIMEOUT`]) until the outcome log is
+    /// written. Called on `shutdown` and once the serve loop ends.
+    pub async fn flush_completion_log(&self) {
+        let Some(state) = self.state() else {
+            return;
+        };
+        if tokio::time::timeout(LOG_FLUSH_TIMEOUT, state.completion.flush_pending())
+            .await
+            .is_err()
+        {
+            tracing::warn!("completion log not flushed within {LOG_FLUSH_TIMEOUT:?}");
+        }
     }
 
     async fn dispatch(
@@ -415,7 +433,7 @@ impl Handler for AppHandler {
             methods::INITIALIZE => self.initialize(params, ctx).await,
             methods::SHUTDOWN => {
                 parse::<Value>(params)?;
-                Ok(self.shutdown())
+                Ok(self.shutdown().await)
             }
             _ => {
                 let state = self.require_state(method)?;

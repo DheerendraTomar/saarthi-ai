@@ -784,3 +784,31 @@ async fn accepted_rejected_notifications_map_to_outcomes() {
 
     core.shutdown().await;
 }
+
+#[tokio::test]
+async fn shutdown_logs_unanswered_suggestions_as_rejected() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder".to_owned(), "chat".to_owned()],
+        generate: vec![vec![generate_chunk("a"), generate_done()]],
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+    open_main(&mut core, &ws).await;
+    let served = core
+        .call("completion/request", complete_params(&ws, "r1"))
+        .await;
+    assert_eq!(served["items"][0]["text"], "a", "{served}");
+    core.shutdown().await; // the process has exited
+
+    let raw = std::fs::read_to_string(ws.root.join(".localpilot/completions.jsonl")).unwrap();
+    let records: Vec<Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{raw}");
+    assert_eq!(records[0]["requestId"], "r1");
+    assert_eq!(records[0]["outcome"], "rejected");
+}
