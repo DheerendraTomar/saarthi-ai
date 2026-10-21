@@ -46,6 +46,7 @@ function stats(served: number): CompletionStats {
               acceptRate: 10 / served,
               learnedMaxLines: 4,
               learnedNumPredict: 24,
+              learned: true,
               examples: 3,
             },
           },
@@ -184,8 +185,14 @@ describe("settings panel", () => {
 
     commit(screen.getByLabelText("Debounce (ms)"), "200");
     expect(bridge.sent).toContainEqual({ type: "settings/set", patch: { completionDebounceMs: 200 } });
-    commit(screen.getByLabelText("Context budget (tokens)"), "4096");
+    const context = screen.getByLabelText("Context budget (tokens)") as HTMLInputElement;
+    commit(context, "4096");
     expect(bridge.sent).toContainEqual({ type: "settings/set", patch: { completionContextTokens: 4096 } });
+    // Below the host's 256-token floor: not posted, reverts.
+    expect(context.min).toBe("256");
+    commit(context, "100");
+    expect(bridge.sent).not.toContainEqual({ type: "settings/set", patch: { completionContextTokens: 100 } });
+    expect(context.value).toBe("2048");
 
     const adaptive = screen.getByLabelText("Adaptive completions") as HTMLInputElement;
     expect(adaptive.checked).toBe(true);
@@ -208,9 +215,22 @@ describe("settings panel", () => {
 
     // Stats per language.
     const table = screen.getByRole("table", { name: "Completion stats" });
+    const headers = [...table.querySelectorAll("th")].map((c) => c.textContent);
+    expect(headers).toEqual([
+      "Language",
+      "Served",
+      "Accepted",
+      "Partial",
+      "Typed",
+      "Rejected",
+      "Accept rate (incl. partial)",
+      "Lines",
+      "Tokens",
+      "Examples",
+    ]);
     const row = within(table).getByText("python").closest("tr") as HTMLTableRowElement;
     const cells = [...row.cells].map((c) => c.textContent);
-    expect(cells).toEqual(["python", "31", "10", "32%", "4", "24", "3"]);
+    expect(cells).toEqual(["python", "31", "10", "0", "1", "20", "32%", "4 (learned)", "24 (learned)", "3"]);
     expect(screen.getByText("/w/.localpilot/completions.jsonl")).toBeTruthy();
 
     // Closing hides it.
@@ -225,12 +245,41 @@ describe("settings panel", () => {
     emit({ type: "completion/stats", stats: stats(31) });
     bridge.sent.length = 0;
 
-    fireEvent.click(screen.getByRole("button", { name: "Reset learning" }));
+    // First click only asks; the second click on the same button resets.
+    const reset = screen.getByRole("button", { name: "Reset learning" });
+    fireEvent.click(reset);
+    expect(bridge.sent).toEqual([]);
+    expect(screen.getByText("Reset learning?")).toBeTruthy();
+    expect(reset.textContent).toBe("Confirm");
+    fireEvent.click(reset);
     expect(bridge.sent).toEqual([{ type: "completion/resetLearning" }, { type: "completion/stats" }]);
 
     emit({ type: "completion/stats", stats: stats(0) });
     expect(screen.queryByText("python")).toBeNull();
     expect(screen.getByText("No completions recorded yet.")).toBeTruthy();
+    // Back to the unarmed state.
+    expect(screen.getByRole("button", { name: "Reset learning" })).toBeTruthy();
+    expect(screen.queryByText("Reset learning?")).toBeNull();
+  });
+
+  it("stats_tag_lines_and_tokens_learned_or_default", () => {
+    const { emit } = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const cellsOf = () => {
+      const table = screen.getByRole("table", { name: "Completion stats" });
+      const row = within(table).getByText("python").closest("tr") as HTMLTableRowElement;
+      return [...row.cells].slice(7, 9).map((c) => c.textContent);
+    };
+    const base = stats(31);
+    // Too few outcomes: the core reports the configured values as not learned.
+    const few = { ...base.languages.python, learned: false, learnedMaxLines: 8, learnedNumPredict: 32 };
+    emit({ type: "completion/stats", stats: { ...base, languages: { python: few } } });
+    expect(cellsOf()).toEqual(["8 (default)", "32 (default)"]);
+    // Adaptive off: defaults, whatever the core says about the language.
+    emit({ type: "completion/stats", stats: { ...base, adaptive: false } });
+    expect(cellsOf()).toEqual(["4 (default)", "24 (default)"]);
+    emit({ type: "completion/stats", stats: base });
+    expect(cellsOf()).toEqual(["4 (learned)", "24 (learned)"]);
   });
 });
 

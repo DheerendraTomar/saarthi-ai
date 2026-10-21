@@ -124,6 +124,8 @@ export interface CompletionLanguageStats {
   acceptRate: number;
   learnedMaxLines: number;
   learnedNumPredict: number;
+  /** The two limits above were learned from outcomes; `false`: the configured defaults (< 10 outcomes or adaptive off). */
+  learned: boolean;
   /** Style examples the next snippet refresh inserts. */
   examples: number;
 }

@@ -65,32 +65,72 @@ function StatsTable({ stats }: { stats: CompletionStats }) {
   const langs = Object.entries(stats.languages).sort((a, b) => b[1].served - a[1].served || a[0].localeCompare(b[0]));
   if (langs.length === 0) return <p class="muted">No completions recorded yet.</p>;
   return (
-    <table class="stats" aria-label="Completion stats">
-      <thead>
-        <tr>
-          <th scope="col">Language</th>
-          <th scope="col">Served</th>
-          <th scope="col">Accepted</th>
-          <th scope="col">Accept rate</th>
-          <th scope="col" title="Learned multi-line cap">Lines</th>
-          <th scope="col" title="Learned num_predict">Tokens</th>
-          <th scope="col" title="Style examples in the prompt">Examples</th>
-        </tr>
-      </thead>
-      <tbody>
-        {langs.map(([lang, s]) => (
-          <tr key={lang}>
-            <td>{lang}</td>
-            <td>{String(s.served)}</td>
-            <td>{String(s.accepted)}</td>
-            <td>{`${Math.round(s.acceptRate * 100)}%`}</td>
-            <td>{String(s.learnedMaxLines)}</td>
-            <td>{String(s.learnedNumPredict)}</td>
-            <td>{String(s.examples)}</td>
+    <div class="stats-scroll">
+      <table class="stats" aria-label="Completion stats">
+        <thead>
+          <tr>
+            <th scope="col">Language</th>
+            <th scope="col">Served</th>
+            <th scope="col">Accepted</th>
+            <th scope="col" title="Partly accepted (next word / line)">Partial</th>
+            <th scope="col" title="Typed through by hand">Typed</th>
+            <th scope="col">Rejected</th>
+            <th scope="col" title="(accepted + partial) / served">Accept rate (incl. partial)</th>
+            <th scope="col" title="Multi-line cap: learned, or the default">Lines</th>
+            <th scope="col" title="num_predict: learned, or the default">Tokens</th>
+            <th scope="col" title="Style examples in the prompt">Examples</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {langs.map(([lang, s]) => {
+            // Default when the core has too few outcomes, or adaptive completions are off.
+            const tag = s.learned && stats.adaptive ? "learned" : "default";
+            return (
+              <tr key={lang}>
+                <td>{lang}</td>
+                <td>{String(s.served)}</td>
+                <td>{String(s.accepted)}</td>
+                <td>{String(s.partial)}</td>
+                <td>{String(s.typedThrough)}</td>
+                <td>{String(s.rejected)}</td>
+                <td>{`${Math.round(s.acceptRate * 100)}%`}</td>
+                <td>
+                  {String(s.learnedMaxLines)} <span class="muted">({tag})</span>
+                </td>
+                <td>
+                  {String(s.learnedNumPredict)} <span class="muted">({tag})</span>
+                </td>
+                <td>{String(s.examples)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Two clicks on the same button: "Reset learning" arms it ("Reset learning?" / "Confirm"), the second resets. */
+function ResetButton({ stats, onReset }: { stats: CompletionStats | null; onReset(): void }) {
+  const [armed, setArmed] = useState(false);
+  // Fresh stats (e.g. after a reset) disarm it, so a stale confirm never lingers.
+  useEffect(() => setArmed(false), [stats]);
+  return (
+    <div class="reset-learning">
+      {armed ? <span class="muted">Reset learning? </span> : null}
+      <button
+        type="button"
+        class="secondary"
+        onClick={() => {
+          if (!armed) return setArmed(true);
+          setArmed(false);
+          onReset();
+        }}
+        onBlur={() => setArmed(false)}
+      >
+        {armed ? "Confirm" : "Reset learning"}
+      </button>
+    </div>
   );
 }
 
@@ -135,7 +175,7 @@ export function SettingsPanel({ settings, settingsSeq, stats, models, ollama, on
             id="lp-context"
             label="Context budget (tokens)"
             value={settings.completionContextTokens}
-            min={1}
+            min={256}
             seq={settingsSeq}
             onCommit={(v) => onPatch({ completionContextTokens: v })}
           />
@@ -168,9 +208,7 @@ export function SettingsPanel({ settings, settingsSeq, stats, models, ollama, on
       ) : (
         <p class="muted">Loading stats…</p>
       )}
-      <button type="button" class="secondary" onClick={onResetLearning}>
-        Reset learning
-      </button>
+      <ResetButton stats={stats} onReset={onResetLearning} />
     </section>
   );
 }

@@ -572,6 +572,19 @@ button.danger {
   align-items: center;
   gap: 6px;
 }
+.stats-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+table.stats th,
+table.stats td {
+  white-space: nowrap;
+}
+.reset-learning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 table.stats {
   width: 100%;
   border-collapse: collapse;
