@@ -1,0 +1,125 @@
+{
+  "name": "localpilot",
+  "displayName": "LocalPilot",
+  "description": "Copilot-style inline completions and agent chat, running entirely on your machine via Ollama.",
+  "version": "0.1.0",
+  "publisher": "localpilot",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "LocalPilot",
+      "properties": {
+        "localpilot.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL of the local Ollama server. LocalPilot talks to nothing else."
+        },
+        "localpilot.completionModel": {
+          "type": "string",
+          "default": "qwen2.5-coder:0.5b-base",
+          "description": "Small fill-in-the-middle model used for inline completions (qwen2.5-coder:1.5b-base is the higher-quality alternative)."
+        },
+        "localpilot.chatModel": {
+          "type": "string",
+          "default": "qwen3.8:27b-mlx",
+          "description": "Tool-calling model used for agent chat."
+        },
+        "localpilot.completionsEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline (ghost text) completions."
+        },
+        "localpilot.completionDebounceMs": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "description": "Delay after the last keystroke before a completion is requested."
+        },
+        "localpilot.completionMaxTokens": {
+          "type": "number",
+          "default": 32,
+          "minimum": 1,
+          "description": "Maximum tokens generated per inline completion."
+        },
+        "localpilot.chatThinking": {
+          "type": "string",
+          "enum": [
+            "off",
+            "on"
+          ],
+          "default": "off",
+          "description": "Let the chat model think before answering (slower)."
+        },
+        "localpilot.coreBinaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a localpilot-core binary that overrides the bundled one."
+        },
+        "localpilot.allowedCommandsAlways": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Commands approved with \"Always\"; the agent runs these without asking."
+        },
+        "localpilot.completionContextTokens": {
+          "type": "number",
+          "default": 3584,
+          "minimum": 256,
+          "description": "Total prompt budget for inline completions (prefix + suffix + related snippets)."
+        },
+        "localpilot.chatContextTokens": {
+          "type": "number",
+          "default": 24000,
+          "minimum": 1024,
+          "description": "Chat history budget before older turns are dropped."
+        },
+        "localpilot.logLevel": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "info",
+          "description": "Core log level (logs go to <workspace>/.localpilot/core.log)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "test": "vitest run",
+    "lint": "tsc --noEmit && eslint ."
+  },
+  "dependencies": {
+    "@localpilot/rpc-client": "0.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.15.0",
+    "@types/node": "20.19.2",
+    "@types/vscode": "1.100.0",
+    "esbuild": "0.21.5",
+    "eslint": "9.15.0",
+    "globals": "14.0.0",
+    "typescript": "5.6.3",
+    "typescript-eslint": "8.15.0",
+    "vitest": "2.1.5"
+  }
+}

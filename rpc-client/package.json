@@ -1,0 +1,23 @@
+{
+  "name": "@localpilot/rpc-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Transport-agnostic newline-delimited JSON-RPC 2.0 endpoint for LocalPilot clients",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "lint": "tsc --noEmit && eslint ."
+  },
+  "devDependencies": {
+    "@eslint/js": "9.15.0",
+    "eslint": "9.15.0",
+    "typescript": "5.6.3",
+    "typescript-eslint": "8.15.0",
+    "vitest": "2.1.5"
+  }
+}

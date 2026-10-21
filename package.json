@@ -2,6 +2,8 @@
   "name": "localpilot",
   "private": true,
   "workspaces": [
-    "chat-ui"
+    "chat-ui",
+    "rpc-client",
+    "vscode"
   ]
 }

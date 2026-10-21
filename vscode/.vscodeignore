@@ -1,0 +1,14 @@
+# Ship only the bundle, the bundled core binary, media and the manifest.
+src/**
+test/**
+node_modules/**
+**/*.ts
+**/*.map
+esbuild.mjs
+eslint.config.mjs
+vitest.config.ts
+tsconfig.json
+.vscode/**
+!bin/**
+!media/**
+!out/**

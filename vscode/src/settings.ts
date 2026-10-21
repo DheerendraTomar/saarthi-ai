@@ -1,0 +1,108 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import * as vscode from "vscode";
+import type { CoreCommand } from "./rpc/coreClient";
+
+/**
+ * `localpilot.*` settings. Everything except `logLevel` is forwarded verbatim
+ * as `initialize.settings` (the core ignores keys it does not know, and takes
+ * settings only at `initialize`, so a change means a core restart).
+ */
+export interface Settings {
+  ollamaUrl: string;
+  completionModel: string;
+  chatModel: string;
+  completionsEnabled: boolean;
+  completionDebounceMs: number;
+  completionMaxTokens: number;
+  chatThinking: "off" | "on";
+  coreBinaryPath: string;
+  allowedCommandsAlways: string[];
+  completionContextTokens: number;
+  chatContextTokens: number;
+  logLevel: string;
+}
+
+export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
+  ollamaUrl: "http://localhost:11434",
+  completionModel: "qwen2.5-coder:0.5b-base",
+  chatModel: "qwen3.8:27b-mlx",
+  completionsEnabled: true,
+  completionDebounceMs: 120,
+  completionMaxTokens: 32,
+  chatThinking: "off",
+  coreBinaryPath: "",
+  allowedCommandsAlways: [],
+  completionContextTokens: 3584,
+  chatContextTokens: 24000,
+  logLevel: "info",
+});
+
+export function readSettings(): Settings {
+  const cfg = vscode.workspace.getConfiguration("localpilot");
+  const out = {} as Record<keyof Settings, unknown>;
+  for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>) {
+    out[key] = cfg.get(key, DEFAULT_SETTINGS[key]);
+  }
+  return out as unknown as Settings;
+}
+
+/** Rust target triple of the bundled core for this platform, if we ship one. */
+export function targetTriple(platform: string = process.platform, arch: string = process.arch): string | undefined {
+  const table: Record<string, string> = {
+    "darwin-arm64": "aarch64-apple-darwin",
+    "darwin-x64": "x86_64-apple-darwin",
+    "linux-x64": "x86_64-unknown-linux-gnu",
+    "win32-x64": "x86_64-pc-windows-msvc",
+  };
+  return table[`${platform}-${arch}`];
+}
+
+export interface ResolveBinaryOptions {
+  /** Value of `localpilot.coreBinaryPath`; read from the configuration when omitted. */
+  coreBinaryPath?: string;
+  env?: NodeJS.ProcessEnv;
+  platform?: string;
+  arch?: string;
+  exists?: (path: string) => boolean;
+}
+
+/**
+ * How to launch the core, in priority order:
+ * 1. `LOCALPILOT_FAKE_CORE=1` → `test/fakeCore.mjs` run by this Node/Electron
+ *    runtime (`ELECTRON_RUN_AS_NODE=1`), for unit and e2e tests;
+ * 2. the `localpilot.coreBinaryPath` setting;
+ * 3. the bundled `bin/<triple>/localpilot-core`;
+ * otherwise throws an error that says how to fix it.
+ */
+export function resolveBinaryPath(extensionPath: string, opts: ResolveBinaryOptions = {}): CoreCommand {
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? existsSync;
+  if (env.LOCALPILOT_FAKE_CORE === "1") {
+    return {
+      command: process.execPath,
+      args: [join(extensionPath, "test", "fakeCore.mjs")],
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+    };
+  }
+  const override = (opts.coreBinaryPath ?? readSettings().coreBinaryPath).trim();
+  if (override) {
+    if (!exists(override)) {
+      throw new Error(
+        `LocalPilot: localpilot.coreBinaryPath points to "${override}", which does not exist. ` +
+          `Fix the path or clear the setting to use the bundled core.`,
+      );
+    }
+    return { command: override, args: [] };
+  }
+  const platform = opts.platform ?? process.platform;
+  const triple = targetTriple(platform, opts.arch ?? process.arch);
+  const exe = platform === "win32" ? "localpilot-core.exe" : "localpilot-core";
+  const bundled = triple ? join(extensionPath, "bin", triple, exe) : undefined;
+  if (bundled && exists(bundled)) return { command: bundled, args: [] };
+  throw new Error(
+    `LocalPilot: no core binary for ${platform}-${opts.arch ?? process.arch}` +
+      (bundled ? ` (looked for ${bundled})` : "") +
+      `. Build it with scripts/build-core.sh, or set localpilot.coreBinaryPath to a localpilot-core binary.`,
+  );
+}
