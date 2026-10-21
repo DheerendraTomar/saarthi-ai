@@ -65,10 +65,10 @@ describe("activate", () => {
     await registry.commands.get("localpilot.openChat")!();
     expect(registry.executed.map((e) => e.command)).toContain("localpilot.chat.focus");
 
-    // Accepting a completion reports it to the core; the core answers applyEdit/runCommand requests.
+    // Accepting a completion is a notification to the core (must not throw).
     registry.commands.get("localpilot.completionAccepted")!("7");
 
-    // The core still works after these, and deactivate stops it.
+    // deactivate stops the core.
     await deactivate();
     expect(api.client.state).toBe("stopped");
   });

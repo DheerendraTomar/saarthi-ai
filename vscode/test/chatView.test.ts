@@ -189,6 +189,40 @@ describe("ChatViewProvider", () => {
     expect(ui.posted.find((m) => m.type === "session/history")).toEqual({ type: "session/history", sessionId: "n1", messages: HISTORY });
   });
 
+  it("chatView_first_send_failing_to_create_session_still_ends_turn", async () => {
+    let crash = false;
+    const client = new FakeChatClient((method, params) => {
+      if (method === "chat/listSessions") return { sessions: [] };
+      if (method === "chat/newSession") {
+        throw crash ? Object.assign(new Error("core exited"), { name: "CoreCrashed" }) : new Error("LocalPilot core is not running");
+      }
+      return defaultResponder(method, params);
+    });
+    const provider = makeProvider(client);
+    providers.push(provider);
+    const ui = fakeWebviewView();
+    provider.resolveWebviewView(ui.view);
+
+    for (const c of [false, true]) {
+      crash = c;
+      ui.posted.length = 0;
+      ui.send({ type: "chat/send", message: "hello", attachments: [] });
+      await waitFor(() => ui.posted.some((m) => m.type === "chat/done"), 5000, "done after failed session create");
+      expect(ui.posted).toEqual([
+        { type: "chat/done", sessionId: "", stopReason: "error" },
+        { type: "ui/error", message: expect.stringMatching(/session/i) },
+      ]);
+      expect(client.of("chat/send")).toEqual([]);
+    }
+
+    // Stop with no session still unsticks the composer.
+    ui.posted.length = 0;
+    ui.send({ type: "chat/stop" });
+    await waitFor(() => ui.posted.length > 0, 5000, "stop");
+    expect(ui.posted).toEqual([{ type: "chat/done", sessionId: "", stopReason: "stopped" }]);
+    expect(client.of("chat/stop")).toEqual([]);
+  });
+
   it("chatView_forwards_editedArgs_on_approve", async () => {
     const client = new FakeChatClient(defaultResponder);
     const provider = makeProvider(client);

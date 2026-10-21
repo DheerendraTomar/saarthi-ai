@@ -183,6 +183,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           return await this.send(String(msg.message ?? ""), Array.isArray(msg.attachments) ? msg.attachments : []);
         case "chat/stop":
           if (this.current) await this.client.request("chat/stop", { sessionId: this.current });
+          // Nothing to stop in the core: still end the UI's turn so Stop always unsticks the composer.
+          else this.post({ type: "chat/done", sessionId: "", stopReason: "stopped" });
           return;
         case "chat/approve":
           return await this.approve(msg);
@@ -227,7 +229,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async send(message: string, attachments: unknown[]): Promise<void> {
     let sessionId = this.current;
     if (!sessionId) {
-      sessionId = (await this.client.request<{ sessionId: string }>("chat/newSession", {})).sessionId;
+      try {
+        sessionId = (await this.client.request<{ sessionId: string }>("chat/newSession", {})).sessionId;
+      } catch (e) {
+        // The UI is already showing a pending reply; end it (no session yet, so the UI accepts "").
+        this.post({ type: "chat/done", sessionId: this.current ?? "", stopReason: "error" });
+        this.postError(`Could not start a chat session: ${errorMessage(e)}`);
+        return;
+      }
       this.current = sessionId;
       // Announce the session before any of its turn events arrive.
       await this.postSessionList().catch(() => this.post({ type: "session/list", sessions: this.sessions, current: sessionId }));
