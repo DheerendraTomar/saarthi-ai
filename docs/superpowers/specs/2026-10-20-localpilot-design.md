@@ -191,12 +191,39 @@ Additions made during implementation (core; wire types in
 - `bench/run` is not served over RPC (`capabilities.bench: false`); `bench` is
   a CLI subcommand.
 - `ollama/pull` progress notifications are `ollama/pullProgress`.
+- `workspace/applyEdit` and `workspace/runCommand` carry the `sessionId` of
+  the chat turn that asked for them (so a multi-session client can route them).
+
+v2 additions (model selection, session management, adaptive completions; see
+`core/README.md` for the full semantics):
+
+- `ollama/models {}` → `{ models: [{ name, sizeBytes, family?, supportsInsert,
+  supportsTools }] }`: installed models in `/api/tags` order, capabilities from
+  `/api/show` (`insert` = FIM, `tools` = agent chat). Ollama unreachable →
+  `-32000`, never an empty list.
+- `chat/deleteSession { sessionId }` → `{}` (`-32602`, message starting
+  `turn running`, while that session's turn runs); `chat/clearSessions {}` →
+  `{ deleted, skipped }` (sessions with a running turn are skipped).
+- `completion/outcome { requestId, outcome: "accepted" | "partial" | "rejected"
+  | "typedThrough", acceptedText? }` (client → core notification;
+  `acceptedText` for `accepted` / `partial`). `completion/accepted` /
+  `completion/rejected` still work and mean `accepted` / `rejected`. Each served
+  suggestion's outcome is logged once to `.localpilot/completions.jsonl`
+  (unanswered after 60 s → `rejected`).
+- `completion/stats {}` → `{ languages: { [lang]: { served, accepted, partial,
+  rejected, typedThrough, acceptRate, learnedMaxLines, learnedNumPredict,
+  examples } }, logPath, adaptive }`; `completion/resetLearning {}` → `{}`
+  (forgets learned limits and examples; the log is kept).
+- Setting `adaptiveCompletions` (default `true`): per language, the newest 50
+  outcomes pick the multi-line cap and `num_predict`, and up to 3 recent
+  accepted multi-line suggestions are added to the prompt as style examples.
 
 Settings (in both IDEs, forwarded in `initialize`):
 `ollamaUrl`, `completionModel`, `chatModel`, `completionsEnabled`,
 `completionDebounceMs`, `completionMaxTokens`, `chatThinking` (off | on),
 `coreBinaryPath`, `allowedCommandsAlways` (list), `completionContextTokens`
-(completion prompt budget), `chatContextTokens` (chat history budget).
+(completion prompt budget), `chatContextTokens` (chat history budget),
+`adaptiveCompletions` (v2).
 
 ## 5. Inline completion engine
 

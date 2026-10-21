@@ -3,9 +3,11 @@
 ## 0.2.0 — 2026-10-21
 
 - Model selection: pick the chat and completion models from the models installed in Ollama (chat header, Settings panel, status bar menu, **Select Chat Model** / **Select Completion Model**), with size and capability hints and an explicit "Ollama down" state.
-- Chat session deletion: delete one session (refused while its reply runs) or clear all after a confirmation.
+- Chat session deletion: delete one session (refused while its reply runs) or clear all after a confirmation, from the chat view or with **Delete Chat Session** / **Clear All Chat Sessions**.
 - Settings panel in the chat view for the completion settings, with completion stats and **Reset learning**.
 - Adaptive completions (`localpilot.adaptiveCompletions`, default on): outcomes of shown suggestions (accepted, partial, typed through, rejected) are logged locally and used to tune completion length and add style examples. New commands **Show Completion Stats** and **Reset Completion Learning**.
+- The outcome log stays on your machine (`<workspace>/.localpilot/completions.jsonl`: at most 200 characters before the cursor, the suggestion and timings; rotated past 10 000 lines). Partial accepts are inferred from edits; the known biases are listed in the README.
+- Bundled `localpilot-core` with the v2 protocol: `ollama/models`, `chat/deleteSession`, `chat/clearSessions`, `completion/outcome`, `completion/stats`, `completion/resetLearning` and the `adaptiveCompletions` setting.
 
 ## 0.1.0 — 2026-10-21
 
