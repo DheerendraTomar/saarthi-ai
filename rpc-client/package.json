@@ -2,6 +2,7 @@
   "name": "@localpilot/rpc-client",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Transport-agnostic newline-delimited JSON-RPC 2.0 endpoint for LocalPilot clients",
   "type": "module",
   "main": "./src/index.ts",

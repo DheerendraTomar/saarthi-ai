@@ -1,6 +1,6 @@
 import { ServerConnection } from '@jupyterlab/services';
 import { RpcError } from '@localpilot/rpc-client';
-import { CoreDisconnected, InitializeResult, WsCoreClient } from '../src/client';
+import { CoreDisconnected, InitializeResult, NotificationQueue, WsCoreClient } from '../src/client';
 import { DEFAULT_SETTINGS, Settings } from '../src/settings';
 import { MockWebSocket } from './mockWebSocket';
 
@@ -66,7 +66,7 @@ describe('WsCoreClient', () => {
     client.onReconnect(reconnects);
 
     // Sent before the socket is up: the notification is queued, the request waits.
-    client.notify('textDocument/didOpen', { textDocument: { uri: 'file:///a.py', text: 'x' } });
+    client.notify('textDocument/didOpen', { uri: 'file:///a.py', version: 1, text: 'x' });
     const sessions = client.request('chat/listSessions', {});
     client.start();
 
@@ -126,7 +126,7 @@ describe('WsCoreClient', () => {
     client.onReconnect(() => {
       order.push('reconnect');
       for (const [uri, text] of docs) {
-        client!.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1, text } });
+        client!.notify('textDocument/didOpen', { uri, languageId: 'python', version: 1, text });
       }
     });
     client.start();
@@ -137,7 +137,7 @@ describe('WsCoreClient', () => {
     first.serverClose(1012, 'LocalPilot core restarted');
     expect(client.state).toBe('reconnecting');
     // Sent while disconnected: dropped (the replay brings the core up to date).
-    client.notify('textDocument/didChange', { textDocument: { uri: 'file:///x.py' } });
+    client.notify('textDocument/didChange', { uri: 'file:///x.py', version: 2, contentChanges: [{ text: 'y' }] });
 
     // Backoff 0.5 s, 1 s, 2 s, 4 s, 8 s, then capped at 10 s; failed attempts never open.
     const delays = [500, 1000, 2000, 4000, 8000, 10000, 10000];
@@ -162,7 +162,7 @@ describe('WsCoreClient', () => {
     expect(client.state).toBe('ready');
     const sent = ws.messages();
     expect(sent.map((m) => m.method)).toEqual(['initialize', 'textDocument/didOpen']);
-    expect(sent[1].params?.textDocument).toEqual({
+    expect(sent[1].params).toEqual({
       uri: 'file:///nb.ipynb.cell0.py',
       languageId: 'python',
       version: 1,
@@ -227,9 +227,115 @@ describe('WsCoreClient', () => {
     expect(disconnects).toHaveLength(2);
   });
 
+  it('disconnect_mid_turn_after_core_exited_answers_rejects_with_CoreDisconnected', async () => {
+    // The real sequence on a core exit: the bridge answers every in-flight
+    // request with -32603 "LocalPilot core exited", then closes with 1012.
+    client = makeClient();
+    const disconnects: CoreDisconnected[] = [];
+    client.onDisconnect((e) => disconnects.push(e));
+    client.start();
+    const ws = await connect();
+    const send = client.request('chat/send', { sessionId: 's1', text: 'hi' });
+    let sendError: unknown;
+    send.catch((e) => (sendError = e));
+    const other = client.request('chat/listSessions', {});
+    let otherError: unknown;
+    other.catch((e) => (otherError = e));
+    await flush();
+    const sendReq = ws.messages().find((m) => m.method === 'chat/send');
+    ws.receive({ jsonrpc: '2.0', id: sendReq?.id, error: { code: -32603, message: 'LocalPilot core exited' } });
+    await flush();
+    expect(sendError).toBeInstanceOf(CoreDisconnected);
+    expect((sendError as CoreDisconnected).code).toBe(1012);
+    expect(disconnects).toHaveLength(0); // the close has not happened yet
+
+    ws.serverClose(1012, 'LocalPilot core restarted');
+    await flush();
+    expect(otherError).toBeInstanceOf(CoreDisconnected);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0].code).toBe(1012);
+    expect(client.state).toBe('reconnecting');
+
+    // Other -32603 errors stay RpcErrors.
+    await jest.advanceTimersByTimeAsync(500);
+    const next = await connect();
+    const failing = client.request('chat/history', { sessionId: 'nope' });
+    await flush();
+    const req = next.messages().find((m) => m.method === 'chat/history');
+    next.receive({ jsonrpc: '2.0', id: req?.id, error: { code: -32603, message: 'unknown session' } });
+    await expect(failing).rejects.toBeInstanceOf(RpcError);
+  });
+
+  it('queued_notifications_are_coalesced_per_document', async () => {
+    client = makeClient();
+    client.notify('textDocument/didOpen', { uri: 'file:///a.py', version: 1, text: 'x' });
+    client.notify('textDocument/didChange', { uri: 'file:///a.py', version: 2, contentChanges: [{ text: 'xy' }] });
+    client.notify('custom/ping', { n: 1 });
+    client.notify('textDocument/didOpen', { uri: 'file:///b.py', version: 1, text: 'b' });
+    client.notify('textDocument/didClose', { uri: 'file:///b.py' });
+    const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
+    client.notify('textDocument/didChange', { uri: 'file:///c.py', version: 3, contentChanges: [{ range, text: 'i' }] });
+    client.notify('textDocument/didChange', { uri: 'file:///c.py', version: 4, contentChanges: [{ text: 'full' }] });
+    client.notify('textDocument/didSave', { uri: 'file:///a.py' });
+    client.notify('textDocument/didSave', { uri: 'file:///a.py' });
+    client.start();
+    const ws = await connect();
+    expect(ws.messages().slice(1).map((m) => [m.method, m.params])).toEqual([
+      ['textDocument/didOpen', { uri: 'file:///a.py', version: 2, text: 'xy' }],
+      ['custom/ping', { n: 1 }],
+      ['textDocument/didChange', { uri: 'file:///c.py', version: 4, contentChanges: [{ text: 'full' }] }],
+      ['textDocument/didSave', { uri: 'file:///a.py' }]
+    ]);
+  });
+
+  it('NotificationQueue keeps incremental changes in order and closes of sent documents', () => {
+    const q = new NotificationQueue();
+    const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } };
+    q.push('textDocument/didChange', { uri: 'u', version: 1, contentChanges: [{ range, text: 'a' }] });
+    q.push('textDocument/didChange', { uri: 'u', version: 2, contentChanges: [{ range, text: 'b' }] });
+    expect(q.length).toBe(2);
+    q.push('textDocument/didClose', { uri: 'u' });
+    expect(q.drain()).toEqual([['textDocument/didClose', { uri: 'u' }]]);
+  });
+
+  it('initialize_unanswered_for_30s_is_a_disconnect', async () => {
+    client = makeClient();
+    client.start();
+    const ws = MockWebSocket.last;
+    ws.open();
+    await flush();
+    await jest.advanceTimersByTimeAsync(29_999);
+    expect(ws.closedWith).toBeUndefined();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(ws.closedWith?.code).toBe(4408);
+    expect(client.state).toBe('connecting');
+    await jest.advanceTimersByTimeAsync(500);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    await connect();
+    expect(client.state).toBe('ready');
+    // A late answer on the old socket changes nothing.
+    ws.respond('initialize', INIT_RESULT);
+    await flush();
+    expect(client.state).toBe('ready');
+  });
+
+  it('whenReady forgets an aborted waiter', async () => {
+    client = makeClient();
+    client.start();
+    const waiters = (client as unknown as { waiters: Set<unknown> }).waiters;
+    const aborter = new AbortController();
+    const waiting = client.whenReady(aborter.signal);
+    expect(waiters.size).toBe(1);
+    aborter.abort();
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+    expect(waiters.size).toBe(0);
+  });
+
   it('keeps retrying initialize while the server refuses it, and reconnect() retries at once', async () => {
     client = makeClient();
-    client.notify('textDocument/didOpen', { textDocument: { uri: 'file:///a.py' } });
+    const replays = jest.fn(() => client!.notify('textDocument/didOpen', { uri: 'file:///a.py', version: 3, text: 'now' }));
+    client.onReconnect(replays);
+    client.notify('textDocument/didOpen', { uri: 'file:///a.py', version: 1, text: 'old' });
     client.start();
     const ws = MockWebSocket.last;
     ws.open();
@@ -248,6 +354,8 @@ describe('WsCoreClient', () => {
     expect(client.state).toBe('crashed');
     expect(client.lastError?.message).toContain('POST /localpilot/restart');
     await expect(client.request('chat/listSessions', {})).rejects.toThrow('POST /localpilot/restart');
+    // While crashed nothing is queued (it could grow without bound).
+    client.notify('textDocument/didChange', { uri: 'file:///a.py', version: 2, contentChanges: [{ text: 'mid' }] });
 
     // Another tab (or the server owner) may restart the core: re-ask on the same
     // socket with the usual backoff, without opening new sockets.
@@ -268,8 +376,10 @@ describe('WsCoreClient', () => {
     expect(client.state).toBe('ready');
     expect(client.lastError).toBeUndefined();
     expect(MockWebSocket.instances).toHaveLength(1);
-    // The didOpen queued before the first ready went out once ready.
+    // The queue was dropped at the crash; the first ready replays instead.
+    expect(replays).toHaveBeenCalledTimes(1);
     expect(ws.messages().map((m) => m.method)).toEqual(['initialize', 'initialize', 'initialize', 'textDocument/didOpen']);
+    expect(ws.messages()[3].params).toEqual({ uri: 'file:///a.py', version: 3, text: 'now' });
 
     // reconnect() (after this tab's POST /localpilot/restart): a fresh socket at once.
     client.reconnect();

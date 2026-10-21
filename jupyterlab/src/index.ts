@@ -1,6 +1,7 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { IStatusBar } from '@jupyterlab/statusbar';
+import { DisposableDelegate, DisposableSet } from '@lumino/disposable';
 import { WsCoreClient } from './client';
 import { PLUGIN_ID, readSettings, restartCore, watchSettings, type Settings } from './settings';
 import { StatusItem } from './status';
@@ -17,6 +18,9 @@ export { StatusItem } from './status';
  * provider (Task 4) and the chat sidebar and commands (Task 5) hang off the
  * client created here.
  */
+/** Everything the plugin set up; disposed on `deactivate` and on page unload. */
+let active: DisposableSet | undefined;
+
 const plugin: JupyterFrontEndPlugin<void> = {
   id: PLUGIN_ID,
   description: 'LocalPilot: local Ollama-backed inline completions and agent chat.',
@@ -28,13 +32,19 @@ const plugin: JupyterFrontEndPlugin<void> = {
     const pluginSettings = await registry.load(PLUGIN_ID);
     let settings: Settings = readSettings(pluginSettings);
 
+    active?.dispose();
+    const disposables = (active = new DisposableSet());
+
     const client = new WsCoreClient({ serverSettings, settings: () => settings });
     const status = new StatusItem();
     status.setCompletionsEnabled(settings.completionsEnabled);
-    client.onStatus((s) => status.setStatus(s));
-    client.onStateChanged((state) => status.setConnectionState(state, client.lastError?.message));
+    // Disposed in reverse order: subscriptions first, the client and status item last.
+    disposables.add(status);
+    disposables.add(client);
+    disposables.add(client.onStatus((s) => status.setStatus(s)));
+    disposables.add(client.onStateChanged((state) => status.setConnectionState(state, client.lastError?.message)));
 
-    watchSettings(pluginSettings, {
+    const watcher = watchSettings(pluginSettings, {
       onChange: (s) => {
         settings = s;
         status.setCompletionsEnabled(s.completionsEnabled);
@@ -49,14 +59,25 @@ const plugin: JupyterFrontEndPlugin<void> = {
         }
       }
     });
+    disposables.add(watcher);
 
-    statusBar?.registerStatusItem(`${PLUGIN_ID}:status`, {
+    const statusRegistration = statusBar?.registerStatusItem(`${PLUGIN_ID}:status`, {
       item: status,
       align: 'right',
       rank: 100
     });
+    if (statusRegistration) disposables.add(statusRegistration);
+
+    // Close the socket cleanly when the tab goes away (the server then releases this tab's documents).
+    const onUnload = () => disposables.dispose();
+    window.addEventListener('beforeunload', onUnload);
+    disposables.add(new DisposableDelegate(() => window.removeEventListener('beforeunload', onUnload)));
 
     client.start();
+  },
+  deactivate: () => {
+    active?.dispose();
+    active = undefined;
   }
 };
 

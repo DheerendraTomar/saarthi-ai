@@ -1,6 +1,6 @@
 import { URLExt } from '@jupyterlab/coreutils';
 import { ServerConnection } from '@jupyterlab/services';
-import { RpcEndpoint } from '@localpilot/rpc-client';
+import { ErrorCodes, RpcEndpoint, RpcError } from '@localpilot/rpc-client';
 import type { IDisposable } from '@lumino/disposable';
 import { coreInitSettings, type Settings } from './settings';
 
@@ -30,9 +30,13 @@ export interface InitializeResult {
 export type ConnectionState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'crashed' | 'disposed';
 
 /**
- * The WebSocket to the Jupyter server closed (`code` 1012: the server's core
- * restarted). Every request pending at that moment is rejected with it, and
- * `onDisconnect` listeners receive it; it is never an `RpcError`.
+ * "The core went away": the one error type for that, whichever way it shows.
+ * - When the server's core exits, the bridge first answers every in-flight
+ *   request with -32603 "LocalPilot core exited" and then closes the socket
+ *   with 1012. Those answers are mapped to `CoreDisconnected(1012, …)`.
+ * - Any other close (network, server stop, `initialize` timeout) rejects what
+ *   is still pending with `CoreDisconnected(code, reason)`.
+ * `onDisconnect` listeners receive one per closed socket. It is never an `RpcError`.
  */
 export class CoreDisconnected extends Error {
   override name = 'CoreDisconnected';
@@ -53,6 +57,8 @@ export interface WsCoreClientOptions {
   initialBackoffMs?: number;
   /** Reconnect delay cap (default 10 000 ms). */
   maxBackoffMs?: number;
+  /** An unanswered `initialize` counts as a dead connection after this (default 30 000 ms). */
+  initializeTimeoutMs?: number;
   onLog?: (message: string) => void;
 }
 
@@ -96,21 +102,99 @@ class Listeners<T> {
   }
 }
 
-interface Deferred<T> {
-  promise: Promise<T>;
+interface Waiter<T> {
   resolve: (value: T) => void;
   reject: (error: unknown) => void;
 }
 
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  promise.catch(() => undefined); // nobody may be waiting
-  return { promise, resolve, reject };
+/** The bridge's answer to requests in flight when the core exits (just before its 1012 close). */
+const CORE_EXITED = 'LocalPilot core exited';
+
+/** Maps the bridge's "core exited" error answer to `CoreDisconnected`; other errors pass through. */
+export function toCoreDisconnected(error: unknown): unknown {
+  if (error instanceof RpcError && error.code === ErrorCodes.InternalError && error.message.startsWith(CORE_EXITED)) {
+    return new CoreDisconnected(1012, error.message);
+  }
+  return error;
+}
+
+const DOCUMENT_PREFIX = 'textDocument/';
+
+function docUri(params: unknown): string | undefined {
+  const uri = (params as { uri?: unknown } | null | undefined)?.uri;
+  return typeof uri === 'string' ? uri : undefined;
+}
+
+function isFullText(params: unknown): boolean {
+  const changes = (params as { contentChanges?: Array<{ range?: unknown }> }).contentChanges;
+  return Array.isArray(changes) && changes.length > 0 && changes[changes.length - 1].range == null;
+}
+
+/**
+ * Notifications sent before the first connection, in order, keeping at most
+ * what the core needs per document (`textDocument/*`, keyed on `params.uri`):
+ * - `didOpen` replaces everything queued for its uri;
+ * - a full-text `didChange` is folded into a queued `didOpen` (text, version),
+ *   or replaces a queued full-text `didChange`; incremental ones are appended;
+ * - `didClose` drops everything queued for its uri, and is itself dropped
+ *   when the `didOpen` was still queued;
+ * - `didSave` replaces a queued `didSave`.
+ * Other notifications are kept in order.
+ */
+export class NotificationQueue {
+  private items: Array<[string, unknown]> = [];
+
+  get length(): number {
+    return this.items.length;
+  }
+
+  push(method: string, params: unknown): void {
+    const uri = method.startsWith(DOCUMENT_PREFIX) ? docUri(params) : undefined;
+    if (uri === undefined) {
+      this.items.push([method, params]);
+      return;
+    }
+    const forUri = (m?: string) => (item: [string, unknown]) =>
+      item[0].startsWith(DOCUMENT_PREFIX) && docUri(item[1]) === uri && (m === undefined || item[0] === m);
+    switch (method) {
+      case 'textDocument/didOpen':
+        this.remove(forUri());
+        break;
+      case 'textDocument/didChange': {
+        if (!isFullText(params)) break;
+        const open = this.items.find(forUri('textDocument/didOpen'));
+        if (open) {
+          const changes = (params as { contentChanges: Array<{ text: string }> }).contentChanges;
+          const version = (params as { version?: unknown }).version;
+          open[1] = { ...(open[1] as object), text: changes[changes.length - 1].text, ...(version !== undefined ? { version } : {}) };
+          return;
+        }
+        this.remove(forUri('textDocument/didChange'));
+        break;
+      }
+      case 'textDocument/didClose': {
+        const hadOpen = this.items.some(forUri('textDocument/didOpen'));
+        this.remove(forUri());
+        if (hadOpen) return;
+        break;
+      }
+      case 'textDocument/didSave':
+        this.remove(forUri('textDocument/didSave'));
+        break;
+    }
+    this.items.push([method, params]);
+  }
+
+  /** Empties the queue and returns what it held, in order. */
+  drain(): Array<[string, unknown]> {
+    const items = this.items;
+    this.items = [];
+    return items;
+  }
+
+  private remove(pred: (item: [string, unknown]) => boolean): void {
+    this.items = this.items.filter((item) => !pred(item));
+  }
 }
 
 function abortError(): Error {
@@ -119,6 +203,7 @@ function abortError(): Error {
   return err;
 }
 
+const QUEUE_STATES: ReadonlyArray<ConnectionState> = ['idle', 'connecting'];
 const RETRY_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnecting', 'crashed'];
 
 /**
@@ -139,8 +224,14 @@ const RETRY_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnectin
  * - `request()` waits while (re)connecting (honouring its `AbortSignal`) and
  *   rejects at once when `crashed` (with the server's `RpcError`; check
  *   `state` to tell "core down" from other errors) or disposed.
- * - `notify()` before the first `ready` is queued and flushed right after
- *   `initialize`; while reconnecting it is dropped (`onReconnect` replays state).
+ * - `notify()` before the first `ready` (`idle`/`connecting`) is queued, with
+ *   `textDocument/*` coalesced per uri (`NotificationQueue`), and flushed right
+ *   after `initialize`. Otherwise, while not ready (`reconnecting`, `crashed`)
+ *   it is dropped, and `onReconnect` fires on the next `ready` so the
+ *   subscriber replays its state. A crash before the first `ready` drops the
+ *   queue and switches to that replay too.
+ * - An `initialize` unanswered for 30 s counts as a dead socket: it is closed
+ *   and the client retries with backoff.
  */
 export class WsCoreClient implements IDisposable {
   readonly url: string;
@@ -149,6 +240,7 @@ export class WsCoreClient implements IDisposable {
   private readonly log: (message: string) => void;
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
+  private readonly initializeTimeoutMs: number;
 
   private _state: ConnectionState = 'idle';
   private ws?: WebSocket;
@@ -156,8 +248,11 @@ export class WsCoreClient implements IDisposable {
   private everReady = false;
   private attempt = 0;
   private timer?: ReturnType<typeof setTimeout>;
-  private queued: Array<[string, unknown]> = [];
-  private ready = deferred<InitializeResult>();
+  /** A crash before the first ready: the queue was dropped, so the first ready replays. */
+  private replayPending = false;
+  private readonly queued = new NotificationQueue();
+  private readonly waiters = new Set<Waiter<InitializeResult>>();
+  private initTimer?: ReturnType<typeof setTimeout>;
   private _initializeResult?: InitializeResult;
   private _lastError?: Error;
 
@@ -172,6 +267,7 @@ export class WsCoreClient implements IDisposable {
     this.log = options.onLog ?? ((m) => console.warn(`LocalPilot: ${m}`));
     this.initialBackoffMs = options.initialBackoffMs ?? 500;
     this.maxBackoffMs = options.maxBackoffMs ?? 10_000;
+    this.initializeTimeoutMs = options.initializeTimeoutMs ?? 30_000;
     this.reconnectListeners = new Listeners(this.log);
     this.statusListeners = new Listeners(this.log);
     this.disconnectListeners = new Listeners(this.log);
@@ -224,32 +320,40 @@ export class WsCoreClient implements IDisposable {
     if (this._state === 'ready' && this._initializeResult) return Promise.resolve(this._initializeResult);
     if (this._state === 'disposed') return Promise.reject(new Error('LocalPilot client disposed'));
     if (this._state === 'crashed') return Promise.reject(this._lastError ?? new Error('LocalPilot core is not running'));
-    if (!signal) return this.ready.promise;
-    if (signal.aborted) return Promise.reject(abortError());
+    if (signal?.aborted) return Promise.reject(abortError());
     return new Promise<InitializeResult>((resolve, reject) => {
-      const onAbort = () => reject(abortError());
-      signal.addEventListener('abort', onAbort, { once: true });
-      this.ready.promise.then(
-        (r) => {
-          signal.removeEventListener('abort', onAbort);
+      const onAbort = () => {
+        this.waiters.delete(waiter);
+        reject(abortError());
+      };
+      const waiter: Waiter<InitializeResult> = {
+        resolve: (r) => {
+          signal?.removeEventListener('abort', onAbort);
           resolve(r);
         },
-        (e) => {
-          signal.removeEventListener('abort', onAbort);
+        reject: (e) => {
+          signal?.removeEventListener('abort', onAbort);
           reject(e);
         }
-      );
+      };
+      this.waiters.add(waiter);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
   /**
    * Sends a request once the client is ready. Rejects with `CoreDisconnected`
-   * if the socket closes before the answer, with an `RpcError` when the core
-   * (or the server) answers with an error, and with an `AbortError` on `signal`.
+   * if the core goes away before the answer (the bridge's "core exited" answer
+   * or a socket close), with an `RpcError` when the core (or the server)
+   * answers with another error, and with an `AbortError` on `signal`.
    */
   async request<T = unknown>(method: string, params?: unknown, signal?: AbortSignal): Promise<T> {
     if (this._state !== 'ready') await this.whenReady(signal);
-    return this.endpoint.request<T>(method, params, signal);
+    try {
+      return await this.endpoint.request<T>(method, params, signal);
+    } catch (e) {
+      throw toCoreDisconnected(e);
+    }
   }
 
   /** Fire-and-forget; see the class comment for what happens while not ready. */
@@ -260,8 +364,8 @@ export class WsCoreClient implements IDisposable {
       } catch (e) {
         this.log(`dropped ${method}: ${e instanceof Error ? e.message : String(e)}`);
       }
-    } else if (!this.everReady && this._state !== 'disposed') {
-      this.queued.push([method, params]);
+    } else if (!this.everReady && !this.replayPending && QUEUE_STATES.includes(this._state)) {
+      this.queued.push(method, params);
     }
   }
 
@@ -276,9 +380,11 @@ export class WsCoreClient implements IDisposable {
   }
 
   /**
-   * Fires after every successful re-`initialize` (not the first): the server's
-   * core may be new, with an empty overlay, so re-send `didOpen` for every
-   * synced document here. Runs before waiting requests are released.
+   * Fires after every successful re-`initialize`, i.e. every `ready` except
+   * the first one, unless notifications were dropped before it (a crash before
+   * the first `ready`): the server's core may be new, with an empty overlay,
+   * so re-send `didOpen` for every synced document here. Runs before waiting
+   * requests are released.
    */
   onReconnect(listener: () => void): IDisposable {
     return this.reconnectListeners.add(listener);
@@ -307,10 +413,11 @@ export class WsCoreClient implements IDisposable {
     this.clearTimer();
     const error = new CoreDisconnected(1000, 'LocalPilot client disposed');
     if (this.ws) this.dropSocket(this.ws, 1000, 'disposed');
+    this.clearInitTimer();
     this.endpoint.rejectAll(error);
     this.endpoint.dispose();
-    this.ready.reject(error);
-    this.queued = [];
+    this.settleWaiters((w) => w.reject(error));
+    this.queued.drain();
     this.setState('disposed');
     this.reconnectListeners.clear();
     this.statusListeners.clear();
@@ -347,36 +454,50 @@ export class WsCoreClient implements IDisposable {
 
   private initialize(ws: WebSocket): void {
     const settings = coreInitSettings(this.options.settings());
+    this.clearInitTimer();
+    this.initTimer = setTimeout(() => {
+      this.initTimer = undefined;
+      if (this.ws !== ws) return;
+      this.log(`initialize unanswered after ${this.initializeTimeoutMs} ms; reconnecting`);
+      this.dropSocket(ws, 4408, 'initialize timed out');
+      this.setState(this.everReady ? 'reconnecting' : 'connecting');
+      this.scheduleReconnect();
+    }, this.initializeTimeoutMs);
     this.endpoint.request<InitializeResult>('initialize', { settings }).then(
       (result) => {
         if (this.ws !== ws || this._state === 'disposed') return;
-        const reconnected = this.everReady;
+        this.clearInitTimer();
+        const replay = this.everReady || this.replayPending;
         this.everReady = true;
+        this.replayPending = false;
         this.attempt = 0;
         this._lastError = undefined;
         this._initializeResult = result;
         this._state = 'ready';
-        const queued = this.queued;
-        this.queued = [];
-        for (const [method, params] of queued) this.notify(method, params);
+        for (const [method, params] of this.queued.drain()) this.notify(method, params);
         if (result.ollamaStatus) this.statusListeners.emit(result.ollamaStatus);
-        if (reconnected) this.reconnectListeners.emit();
-        this.ready.resolve(result);
+        if (replay) this.reconnectListeners.emit();
+        this.settleWaiters((w) => w.resolve(result));
         this.stateListeners.emit('ready');
       },
-      (err: unknown) => {
-        // A close rejects initialize too; handleClose has dealt with that.
+      (raw: unknown) => {
+        const err = toCoreDisconnected(raw);
+        // A close rejects initialize too, and "core exited" precedes a close;
+        // handleClose deals with both.
         if (this.ws !== ws || this._state === 'disposed' || err instanceof CoreDisconnected) return;
+        this.clearInitTimer();
         // The server refused: its core is crashed or cannot start. Somebody may
         // restart it (another tab, a settings change, the server owner), and the
-        // server closes no socket then, so keep asking on this one.
+        // server closes no socket then, so keep asking on this one. What was
+        // queued is dropped (it could grow without bound); the first ready replays.
         const first = this._state !== 'crashed';
         this._lastError = err instanceof Error ? err : new Error(String(err));
         if (first) this.log(`initialize refused: ${this._lastError.message}`);
-        const waiting = this.ready;
-        this.ready = deferred();
+        if (!this.everReady) this.replayPending = true;
+        this.queued.drain();
         this.setState('crashed');
-        waiting.reject(this._lastError);
+        const error = this._lastError;
+        this.settleWaiters((w) => w.reject(error));
         this.scheduleReconnect();
       }
     );
@@ -408,10 +529,21 @@ export class WsCoreClient implements IDisposable {
   private detach(code: number, reason: string): CoreDisconnected {
     this.ws = undefined;
     this.opened = false;
+    this.clearInitTimer();
     const error = new CoreDisconnected(code, reason);
-    if (this._state === 'ready') this.ready = deferred();
     this.endpoint.rejectAll(error);
     return error;
+  }
+
+  private settleWaiters(settle: (waiter: Waiter<InitializeResult>) => void): void {
+    const waiters = [...this.waiters];
+    this.waiters.clear();
+    for (const w of waiters) settle(w);
+  }
+
+  private clearInitTimer(): void {
+    if (this.initTimer !== undefined) clearTimeout(this.initTimer);
+    this.initTimer = undefined;
   }
 
   private scheduleReconnect(): void {
