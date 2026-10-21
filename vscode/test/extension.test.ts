@@ -3,9 +3,10 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as vscode from "vscode";
 import { activate, deactivate, RESTART_DEBOUNCE_MS, type LocalPilotApi } from "../src/extension";
+import { CoreClient } from "../src/rpc/coreClient";
 import { waitFor } from "./helpers/webview";
 import { configValues, editorEvents, registry, resetMock, Uri, workspace, workspaceConfigKeys, type MockStatusBarItem } from "./mocks/vscode";
 
@@ -171,5 +172,41 @@ describe("activate", () => {
     expect(activate(context as unknown as vscode.ExtensionContext)).toBeUndefined();
     expect(item().command).toBeUndefined();
     expect(registry.commands.size).toBe(0);
+  });
+
+  it("core_always_gets_completions_enabled_and_client_gates", async () => {
+    const starts = vi.spyOn(CoreClient.prototype, "start");
+    const restarts = vi.spyOn(CoreClient.prototype, "restart");
+    try {
+      configValues["localpilot.completionsEnabled"] = false;
+      const api = start();
+      await api.ready;
+      // The user setting is off, but the core is told completions are on: gating is client-side.
+      expect(starts.mock.calls[0][0].completionsEnabled).toBe(true);
+      const states: string[] = [];
+      api.client.onDidChangeState((s) => states.push(s));
+
+      // Toggle on: no restart, and the running core serves completions.
+      await registry.commands.get("localpilot.toggleCompletions")!();
+      editorEvents.configuration.fire(configChange);
+      await sleep(RESTART_DEBOUNCE_MS + 200);
+      expect(states).toEqual([]);
+      const result = await api.client.request<{ items: Array<{ text: string }> }>("completion/request", {
+        uri: Uri.file(join(dir, "a.py")).toString(),
+        position: { line: 0, character: 0 },
+        requestId: "1",
+      });
+      expect(result.items.map((i) => i.text)).toEqual(["fake()"]);
+
+      // A core-relevant change restarts, still with completionsEnabled forced on.
+      configValues["localpilot.completionsEnabled"] = false;
+      configValues["localpilot.completionMaxTokens"] = 20;
+      editorEvents.configuration.fire(configChange);
+      await waitFor(() => restarts.mock.calls.length === 1 && api.client.state === "ready" && states.includes("ready"), 5000, "restart");
+      expect(restarts.mock.calls[0][0]).toMatchObject({ completionsEnabled: true, completionMaxTokens: 20 });
+    } finally {
+      starts.mockRestore();
+      restarts.mockRestore();
+    }
   });
 });

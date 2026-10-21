@@ -83,8 +83,9 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
     }
     coreOptions.logLevel = settings.logLevel;
     try {
-      if (started) await client.restart(settings);
-      else await client.start(settings);
+      const forCore = coreInitSettings(settings);
+      if (started) await client.restart(forCore);
+      else await client.start(forCore);
       started = true;
     } catch (e) {
       started = true;
@@ -186,7 +187,16 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
   return { client, inline, chatView, statusBar, ready };
 }
 
-/** Settings the client applies itself; changing only these does not restart the core. */
+/**
+ * The settings sent in `initialize`. Completions are always enabled in the core
+ * (it would otherwise answer empty until restarted); the InlineProvider gates
+ * them on the user's `completionsEnabled`, so toggling needs no restart.
+ */
+export function coreInitSettings(s: Settings): Settings {
+  return { ...s, completionsEnabled: true };
+}
+
+/** Settings the client applies itself (the core never reads completionDebounceMs and always gets completionsEnabled: true); changing only these does not restart the core. */
 const CLIENT_ONLY_SETTINGS: ReadonlyArray<keyof Settings> = ["completionsEnabled", "completionDebounceMs"];
 
 export function sameCoreSettings(a: Settings, b: Settings): boolean {
