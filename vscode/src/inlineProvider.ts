@@ -3,7 +3,7 @@ import { syncUri, type WireRange } from "./documentSync";
 import type { CancellationTokenLike, CoreClient } from "./rpc/coreClient";
 import type { Settings } from "./settings";
 
-/** Command attached to every item; VS Code runs it when the user accepts the ghost text. Task 6 registers it to `reportAccepted`. */
+/** Command attached to every item; VS Code runs it when the user accepts the ghost text (registered in commands.ts → `reportAccepted`). */
 export const ACCEPT_COMMAND = "localpilot.completionAccepted";
 
 /** The part of `CoreClient` that completions use (a fake in tests). */

@@ -113,11 +113,35 @@ describe("fakeCore", () => {
     expect((await f.call("chat/send", send)).result).toEqual({});
   });
 
+  it("stop_ends_only_the_given_sessions_turn_and_new_session_ids_are_unique_across_cores", async () => {
+    const f = fake();
+    await f.initialize();
+    const send = (sessionId: string) => f.call("chat/send", { sessionId, message: "hi", attachments: [] });
+    await send("a");
+    await send("b");
+    await f.waitFor((m) => m.method === "chat/toolCall" && m.params?.sessionId === "a");
+    const callB = (await f.waitFor((m) => m.method === "chat/toolCall" && m.params?.sessionId === "b")).params!;
+
+    await f.call("chat/stop", { sessionId: "a" });
+    expect((await f.waitFor((m) => m.method === "chat/done" && m.params?.sessionId === "a")).params?.stopReason).toBe("stopped");
+    // b still waits for its approval.
+    expect(f.msgs.some((m) => m.method === "chat/done" && m.params?.sessionId === "b")).toBe(false);
+    await f.call("chat/approve", { sessionId: "b", toolCallId: callB.toolCallId, decision: "deny" });
+    expect((await f.waitFor((m) => m.method === "chat/done" && m.params?.sessionId === "b")).params?.stopReason).toBe("done");
+
+    // A restarted core (a new process) never hands out an id the previous one did.
+    const g = fake();
+    await g.initialize();
+    const id1 = ((await f.call("chat/newSession")).result as { sessionId: string }).sessionId;
+    const id2 = ((await g.call("chat/newSession")).result as { sessionId: string }).sessionId;
+    expect(id1).not.toBe(id2);
+  });
+
   it("sessions_list_and_history_reflect_the_scripted_turn", async () => {
     const f = fake();
     await f.initialize();
     const { sessionId } = (await f.call("chat/newSession")).result as { sessionId: string };
-    expect(sessionId).toMatch(/^fake-session-\d+$/);
+    expect(sessionId).toMatch(/^fake-session-\d+-\d+$/);
     await f.call("chat/send", { sessionId, message: "add a call", attachments: [] });
     const call = (await f.waitFor((m) => m.method === "chat/toolCall")).params!;
     await f.call("chat/approve", { sessionId, toolCallId: call.toolCallId, decision: "once" });

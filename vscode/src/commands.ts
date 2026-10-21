@@ -109,6 +109,8 @@ export async function pullModel(deps: CommandDeps, model?: string): Promise<void
       },
     );
     void vscode.window.showInformationMessage(`LocalPilot: ${target} is ready.`);
+    // Clears a "model missing" warning right away (the core's next probe could be 30 s off).
+    await checkStatus(deps).catch(() => {});
   } catch (e) {
     void vscode.window.showErrorMessage(`LocalPilot: pulling ${target} failed: ${errorMessage(e)}`);
   } finally {

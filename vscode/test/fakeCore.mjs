@@ -26,8 +26,9 @@
 //                          `workspace/applyEdit` request (id -1, -2, …) and reports its `applied`;
 //                          on deny skips the edit; then chat/toolResult and chat/done { stopReason: "done" }.
 //                          A second chat/send while that session's turn runs → -32602.
-//   chat/approve        → {}            chat/stop → {} (ends a waiting turn with stopReason "stopped")
-//   chat/newSession     → { sessionId: "fake-session-<n>" }
+//   chat/approve        → {}            chat/stop { sessionId } → {} (ends that session's waiting turn with
+//                          stopReason "stopped"; other sessions keep waiting)
+//   chat/newSession     → { sessionId: "fake-session-<pid>-<n>" } (unique across restarted fakes too)
 //   chat/listSessions   → { sessions: [{ sessionId, title, updatedAtMs }] } — a seeded "fake-session" plus
 //                          every session created or chatted in, most recent first
 //   chat/history        → { sessionId, messages } — the scripted turns of that session (user, assistant
@@ -69,7 +70,7 @@ let initialized = false;
 let requestCount = 0;
 let nextServerId = -1;
 const serverPending = new Map(); // id → resolve
-const approvals = new Map(); // toolCallId → resolve(decision)
+const approvals = new Map(); // toolCallId → { sessionId, resolve(decision) }
 const running = new Set(); // sessionIds with a turn in progress
 let sessionCounter = 0;
 let toolCallCounter = 0;
@@ -122,7 +123,7 @@ async function chatTurn(sessionId, message) {
     requiresApproval: true,
     preview: "--- a/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+fake()\n",
   });
-  const decision = await new Promise((resolve) => approvals.set(toolCallId, resolve));
+  const decision = await new Promise((resolve) => approvals.set(toolCallId, { sessionId, resolve }));
   if (decision === "stopped") {
     session.messages.push({ role: "tool", toolCallId, content: "stopped" });
     notify("chat/done", { sessionId, stopReason: "stopped" });
@@ -186,16 +187,20 @@ async function handleRequest(msg) {
     }
     case "chat/approve": {
       respond(id, {});
-      const resolve = approvals.get(params?.toolCallId);
+      const waiting = approvals.get(params?.toolCallId);
       approvals.delete(params?.toolCallId);
-      return resolve?.(params?.decision);
+      return waiting?.resolve(params?.decision);
     }
     case "chat/stop":
       respond(id, {});
-      for (const resolve of approvals.values()) resolve("stopped");
-      return approvals.clear();
+      for (const [toolCallId, waiting] of approvals) {
+        if (waiting.sessionId !== params?.sessionId) continue;
+        approvals.delete(toolCallId);
+        waiting.resolve("stopped");
+      }
+      return;
     case "chat/newSession": {
-      const sessionId = `fake-session-${++sessionCounter}`;
+      const sessionId = `fake-session-${process.pid}-${++sessionCounter}`;
       touchSession(sessionId, "New chat");
       return respond(id, { sessionId });
     }

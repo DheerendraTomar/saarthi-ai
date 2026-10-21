@@ -7,7 +7,7 @@ export const STATUS_MENU_COMMAND = "localpilot.statusMenu";
 /**
  * The "LocalPilot" status-bar item. What it shows, most important first:
  * a running pull, a stopped core, Ollama down / model missing, completions
- * paused, otherwise all good. Clicking it opens the LocalPilot quick pick.
+ * paused (by the user, or while a chat reply is generating), otherwise all good. Clicking it opens the LocalPilot quick pick.
  */
 export class StatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
@@ -16,6 +16,7 @@ export class StatusBar implements vscode.Disposable {
   private coreError?: string;
   private pullPercent?: number;
   private completionsEnabled = true;
+  private chatActive = false;
 
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -59,6 +60,12 @@ export class StatusBar implements vscode.Disposable {
     this.render();
   }
 
+  /** A chat turn is running: the core answers completions with nothing until it ends (spec §5(10)). */
+  setChatActive(active: boolean): void {
+    this.chatActive = active;
+    this.render();
+  }
+
   dispose(): void {
     this.item.dispose();
   }
@@ -86,6 +93,9 @@ export class StatusBar implements vscode.Disposable {
     } else if (!this.completionsEnabled) {
       text = "$(debug-pause) completions paused";
       tooltip = "LocalPilot inline completions are paused. Click to resume.";
+    } else if (this.chatActive) {
+      text = "$(debug-pause) completions paused during chat";
+      tooltip = "LocalPilot: inline completions resume when the chat reply finishes (chat and completions share the GPU).";
     } else if (this.coreState === "starting") {
       tooltip = "LocalPilot: starting…";
     }

@@ -24,6 +24,8 @@ const HISTORY = [{ role: "user", content: "earlier question" }];
 const startOllamaCalls: number[] = [];
 const pulls: string[] = [];
 
+const chatActivity: boolean[] = [];
+
 function makeProvider(client: unknown) {
   return new ChatViewProvider(client as ConstructorParameters<typeof ChatViewProvider>[0], {
     extensionUri: Uri.file("/ext") as never,
@@ -31,6 +33,7 @@ function makeProvider(client: unknown) {
     html: () => TEMPLATE,
     startOllama: () => void startOllamaCalls.push(1),
     pullModel: async (model) => void pulls.push(model),
+    onChatActiveChanged: (active) => void chatActivity.push(active),
   });
 }
 
@@ -57,6 +60,7 @@ beforeEach(() => {
   workspace.workspaceFolders = [{ uri: Uri.file(ROOT), name: "proj", index: 0 }];
   startOllamaCalls.length = 0;
   pulls.length = 0;
+  chatActivity.length = 0;
 });
 
 afterEach(async () => {
@@ -95,10 +99,11 @@ describe("ChatViewProvider", () => {
 
     // ui/ready → session list first, then the current session's history, then the status.
     ui.send({ type: "ui/ready" });
-    await waitFor(() => ui.posted.length >= 3, 5000, "ready replies");
-    expect(ui.posted.slice(0, 3)).toEqual([
+    await waitFor(() => ui.posted.length >= 4, 5000, "ready replies");
+    expect(ui.posted.slice(0, 4)).toEqual([
       { type: "session/list", sessions: SESSIONS, current: "s2" },
       { type: "session/history", sessionId: "s2", messages: HISTORY },
+      { type: "chat/turnState", sessionId: "s2", running: false },
       { type: "status", ollama: "ok", detail: "Ollama is running" },
     ]);
     expect(client.of("chat/history")).toEqual([{ sessionId: "s2" }]);
@@ -273,7 +278,8 @@ describe("ChatViewProvider", () => {
     ui.send({ type: "chat/send", message: "edit it", attachments: [] });
     await waitFor(() => ui.posted.some((m) => m.type === "chat/toolCall"), 5000, "tool call");
     const call = ui.posted.find((m) => m.type === "chat/toolCall")!;
-    expect(types(ui.posted.filter((m) => String(m.type).startsWith("chat/")))).toEqual(["chat/token", "chat/token", "chat/toolCall"]);
+    // (The turn state came with the history on ui/ready.)
+    expect(types(ui.posted.filter((m) => String(m.type).startsWith("chat/")))).toEqual(["chat/turnState", "chat/token", "chat/token", "chat/toolCall"]);
 
     ui.send({ type: "chat/approve", toolCallId: call.toolCallId, decision: "once" });
     await waitFor(() => ui.posted.some((m) => m.type === "chat/done"), 5000, "synthesized done");
@@ -293,5 +299,130 @@ describe("ChatViewProvider", () => {
       requestId: "1",
     });
     expect(completion.items[0].text).toBe("fake()");
+  });
+
+  it("chatView_reposts_pending_approvals_after_history", async () => {
+    const client = new FakeChatClient(defaultResponder);
+    const provider = makeProvider(client);
+    providers.push(provider);
+    const ui = fakeWebviewView();
+    provider.resolveWebviewView(ui.view);
+    ui.send({ type: "ui/ready" });
+    await waitFor(() => provider.currentSessionId === "s2", 5000, "ready");
+
+    ui.send({ type: "chat/send", message: "edit and run", attachments: [] });
+    await waitFor(() => client.of("chat/send").length === 1, 5000, "send");
+    const edit = { sessionId: "s2", toolCallId: "t1", name: "edit_file", args: { path: "a.py" }, requiresApproval: true, preview: "--- a" };
+    const run = { sessionId: "s2", toolCallId: "t2", name: "run_command", args: { command: "ls" }, requiresApproval: true, preview: "ls" };
+    client.emit("chat/toolCall", { sessionId: "s2", toolCallId: "t0", name: "read_file", args: { path: "a.py" }, requiresApproval: false });
+    client.emit("chat/toolCall", edit);
+    client.emit("chat/toolCall", run);
+
+    // Away and back: the history replay is followed by the calls still awaiting a decision and the turn state.
+    const switchTo = async (sessionId: string) => {
+      ui.posted.length = 0;
+      ui.send({ type: "chat/switchSession", sessionId });
+      await waitFor(() => ui.posted.some((m) => m.type === "chat/turnState"), 5000, `switch to ${sessionId}`);
+      return ui.posted.slice();
+    };
+    expect(await switchTo("s1")).toEqual([
+      { type: "session/list", sessions: SESSIONS, current: "s1" },
+      { type: "session/history", sessionId: "s1", messages: HISTORY },
+      { type: "chat/turnState", sessionId: "s1", running: false },
+    ]);
+    expect(await switchTo("s2")).toEqual([
+      { type: "session/list", sessions: SESSIONS, current: "s2" },
+      { type: "session/history", sessionId: "s2", messages: HISTORY },
+      { type: "chat/toolCall", ...edit },
+      { type: "chat/toolCall", ...run },
+      { type: "chat/turnState", sessionId: "s2", running: true },
+    ]);
+
+    // Decided (approve forwarded) or finished (toolResult) calls are no longer re-posted.
+    ui.send({ type: "chat/approve", toolCallId: "t1", decision: "once" });
+    await waitFor(() => client.of("chat/approve").length === 1, 5000, "approve");
+    expect(client.of("chat/approve")).toEqual([{ sessionId: "s2", toolCallId: "t1", decision: "once" }]);
+    let posted = await switchTo("s2");
+    expect(posted.filter((m) => m.type === "chat/toolCall")).toEqual([{ type: "chat/toolCall", ...run }]);
+    client.emit("chat/toolResult", { sessionId: "s2", toolCallId: "t2", ok: false, summary: "denied" });
+    posted = await switchTo("s2");
+    expect(posted.filter((m) => m.type === "chat/toolCall")).toEqual([]);
+    expect(posted[posted.length - 1]).toEqual({ type: "chat/turnState", sessionId: "s2", running: true });
+
+    // The turn ends: nothing pending, not running.
+    client.emit("chat/toolCall", { ...run, toolCallId: "t3" });
+    client.emit("chat/done", { sessionId: "s2", stopReason: "done" });
+    posted = await switchTo("s2");
+    expect(posted.filter((m) => m.type === "chat/toolCall")).toEqual([]);
+    expect(posted[posted.length - 1]).toEqual({ type: "chat/turnState", sessionId: "s2", running: false });
+  });
+
+  it("chatView_stop_targets_the_running_session", async () => {
+    const client = new FakeChatClient(defaultResponder);
+    const provider = makeProvider(client);
+    providers.push(provider);
+    const ui = fakeWebviewView();
+    provider.resolveWebviewView(ui.view);
+    ui.send({ type: "ui/ready" });
+    await waitFor(() => provider.currentSessionId === "s2", 5000, "ready");
+
+    ui.send({ type: "chat/send", message: "long job", attachments: [] });
+    await waitFor(() => client.of("chat/send").length === 1, 5000, "send");
+    expect(chatActivity).toEqual([true]);
+    ui.send({ type: "chat/switchSession", sessionId: "s1" });
+    await waitFor(() => provider.currentSessionId === "s1", 5000, "switch");
+
+    // s1 has no turn; the running one is s2's.
+    ui.send({ type: "chat/stop" });
+    await waitFor(() => client.of("chat/stop").length === 1, 5000, "stop");
+    expect(client.of("chat/stop")).toEqual([{ sessionId: "s2" }]);
+
+    // With both running, Stop stops the session on screen.
+    ui.send({ type: "chat/send", message: "another", attachments: [] });
+    await waitFor(() => client.of("chat/send").length === 2, 5000, "send 2");
+    ui.send({ type: "chat/stop" });
+    await waitFor(() => client.of("chat/stop").length === 2, 5000, "stop 2");
+    expect(client.of("chat/stop")[1]).toEqual({ sessionId: "s1" });
+
+    // Completions resume (status bar) only when the last turn ends.
+    client.emit("chat/done", { sessionId: "s1", stopReason: "stopped" });
+    expect(chatActivity).toEqual([true]);
+    client.emit("chat/done", { sessionId: "s2", stopReason: "stopped" });
+    expect(chatActivity).toEqual([true, false]);
+  });
+
+  it("chatView_forwards_only_attachments_lp_syncs", async () => {
+    const client = new FakeChatClient(defaultResponder);
+    const provider = makeProvider(client);
+    providers.push(provider);
+    const ui = fakeWebviewView();
+    provider.resolveWebviewView(ui.view);
+    ui.send({ type: "ui/ready" });
+    await waitFor(() => provider.currentSessionId === "s2", 5000, "ready");
+
+    const sel = { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } };
+    ui.send({
+      type: "chat/send",
+      message: "look",
+      attachments: [
+        { uri: "file:///work/proj/a.py", range: sel },
+        { uri: "file:///work/proj/nb.ipynb.cell0.py" },
+        { uri: "file:///etc/passwd" }, // outside the workspace
+        { uri: "file:///work/proj-2/b.py" }, // a sibling, not inside
+        { uri: "untitled:Untitled-1" },
+        { uri: "::bad" },
+        { uri: 42 },
+        "file:///work/proj/c.py",
+        { uri: "file:///work/proj/d.py", range: { start: "x" } }, // malformed range: dropped, file kept
+      ],
+    });
+    await waitFor(() => client.of("chat/send").length === 1, 5000, "send");
+    expect(client.of("chat/send")).toEqual([
+      {
+        sessionId: "s2",
+        message: "look",
+        attachments: [{ uri: "file:///work/proj/a.py", range: sel }, { uri: "file:///work/proj/nb.ipynb.cell0.py" }, { uri: "file:///work/proj/d.py" }],
+      },
+    ]);
   });
 });

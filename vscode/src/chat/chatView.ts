@@ -29,6 +29,8 @@ export interface ChatViewDeps {
   html: () => string;
   startOllama: () => void;
   pullModel: (model: string) => Promise<void>;
+  /** Called when the first chat turn starts (true) and when the last one ends (false). */
+  onChatActiveChanged?: (active: boolean) => void;
 }
 
 type Msg = Record<string, unknown> & { type: string };
@@ -71,6 +73,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private readonly activeTurns = new Set<string>();
   /** Which session a tool call belongs to, for `chat/approve`. */
   private readonly toolCallSessions = new Map<string, string>();
+  /**
+   * Per session, the `chat/toolCall` params of calls the core is still waiting
+   * to have decided; re-sent after that session's `session/history`, which does
+   * not show them as awaiting approval.
+   */
+  private readonly pendingCalls = new Map<string, Map<string, Record<string, unknown>>>();
   private lastActiveFile = "";
   private readonly subscriptions: vscode.Disposable[] = [];
   private viewSubscriptions: vscode.Disposable[] = [];
@@ -150,9 +158,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (method === "status") this.status = p as unknown as StatusNotification;
     if (method === "chat/toolCall" && typeof p.toolCallId === "string" && typeof p.sessionId === "string") {
       this.toolCallSessions.set(p.toolCallId, p.sessionId);
+      if (p.requiresApproval === true) {
+        let pending = this.pendingCalls.get(p.sessionId);
+        if (!pending) this.pendingCalls.set(p.sessionId, (pending = new Map()));
+        pending.set(p.toolCallId, { ...p });
+      }
+    }
+    if (method === "chat/toolResult" && typeof p.toolCallId === "string" && typeof p.sessionId === "string") {
+      this.pendingCalls.get(p.sessionId)?.delete(p.toolCallId);
     }
     if (method === "chat/done" && typeof p.sessionId === "string") {
-      this.activeTurns.delete(p.sessionId);
+      this.endTurn(p.sessionId);
+      this.pendingCalls.delete(p.sessionId);
       for (const [id, sid] of this.toolCallSessions) if (sid === p.sessionId) this.toolCallSessions.delete(id);
     }
     this.post({ ...p, type: method });
@@ -166,6 +183,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const sessions = [...this.activeTurns];
     this.activeTurns.clear();
     this.toolCallSessions.clear();
+    this.pendingCalls.clear();
+    this.deps.onChatActiveChanged?.(false);
     for (const sessionId of sessions) this.post({ type: "chat/done", sessionId, stopReason: "error" });
     this.postError(message);
   }
@@ -180,12 +199,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         case "ui/ready":
           return await this.onReady();
         case "chat/send":
-          return await this.send(String(msg.message ?? ""), Array.isArray(msg.attachments) ? msg.attachments : []);
-        case "chat/stop":
-          if (this.current) await this.client.request("chat/stop", { sessionId: this.current });
+          return await this.send(String(msg.message ?? ""), this.validAttachments(msg.attachments));
+        case "chat/stop": {
+          // The turn on screen, else the one that is running elsewhere (Stop shows only while one runs).
+          const target = this.current && this.activeTurns.has(this.current) ? this.current : ([...this.activeTurns].pop() ?? this.current);
+          if (target) await this.client.request("chat/stop", { sessionId: target });
           // Nothing to stop in the core: still end the UI's turn so Stop always unsticks the composer.
           else this.post({ type: "chat/done", sessionId: "", stopReason: "stopped" });
           return;
+        }
         case "chat/approve":
           return await this.approve(msg);
         case "chat/newSession":
@@ -241,7 +263,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // Announce the session before any of its turn events arrive.
       await this.postSessionList().catch(() => this.post({ type: "session/list", sessions: this.sessions, current: sessionId }));
     }
-    this.activeTurns.add(sessionId);
+    this.startTurn(sessionId);
     try {
       await this.client.request("chat/send", { sessionId, message, attachments });
     } catch (e) {
@@ -251,7 +273,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         return;
       }
       if (isCrash(e)) return; // reported by the state handler
-      if (this.activeTurns.delete(sessionId)) this.post({ type: "chat/done", sessionId, stopReason: "error" });
+      if (this.endTurn(sessionId)) this.post({ type: "chat/done", sessionId, stopReason: "error" });
       this.postError(`Could not send the message: ${errorMessage(e)}`);
     }
   }
@@ -264,6 +286,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // editedArgs is already the complete args object (the core replaces args wholesale).
     if (msg.editedArgs !== undefined) params.editedArgs = msg.editedArgs;
     await this.client.request("chat/approve", params);
+    // Decided (and the core took it): never offer it again after a history replay.
+    this.pendingCalls.get(sessionId)?.delete(toolCallId);
   }
 
   private async switchSession(sessionId: string): Promise<void> {
@@ -285,6 +309,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const result = await this.client.request<{ sessionId: string; messages: unknown[] }>("chat/history", { sessionId });
     if (this.current !== sessionId) return; // switched again meanwhile
     this.post({ type: "session/history", sessionId, messages: result.messages });
+    // History shows tool calls as settled: re-offer those still awaiting a decision,
+    // and tell the UI whether this session's turn is still running (Stop).
+    for (const call of this.pendingCalls.get(sessionId)?.values() ?? []) this.post({ ...call, type: "chat/toolCall" });
+    this.post({ type: "chat/turnState", sessionId, running: this.activeTurns.has(sessionId) });
+  }
+
+  private startTurn(sessionId: string): void {
+    const wasIdle = this.activeTurns.size === 0;
+    this.activeTurns.add(sessionId);
+    if (wasIdle) this.deps.onChatActiveChanged?.(true);
+  }
+
+  /** Forgets `sessionId`'s turn; true if it was running. */
+  private endTurn(sessionId: string): boolean {
+    if (!this.activeTurns.delete(sessionId)) return false;
+    if (this.activeTurns.size === 0) this.deps.onChatActiveChanged?.(false);
+    return true;
+  }
+
+  /**
+   * Attachments from the webview, kept only if they name a document the core
+   * syncs (a `file:` path inside the workspace, or a notebook cell's virtual
+   * path); a malformed range is dropped, the attachment kept.
+   */
+  private validAttachments(raw: unknown): Array<{ uri: string; range?: unknown }> {
+    if (!Array.isArray(raw)) return [];
+    const out: Array<{ uri: string; range?: unknown }> = [];
+    for (const a of raw) {
+      if (typeof a !== "object" || a === null || typeof (a as { uri?: unknown }).uri !== "string") continue;
+      const { uri, range } = a as { uri: string; range?: unknown };
+      let parsed: vscode.Uri;
+      try {
+        parsed = vscode.Uri.parse(uri, true);
+      } catch {
+        continue;
+      }
+      if (!syncUri({ uri: parsed } as vscode.TextDocument, this.deps.root)) continue;
+      out.push(isRange(range) ? { uri, range } : { uri });
+    }
+    return out;
   }
 
   private postActiveFile(force = false): void {
@@ -319,6 +383,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private post(msg: Msg): void {
     void this.view?.webview.postMessage(msg);
   }
+}
+
+const isPosition = (p: unknown): boolean =>
+  typeof p === "object" && p !== null && Number.isInteger((p as { line?: unknown }).line) && Number.isInteger((p as { character?: unknown }).character);
+
+function isRange(r: unknown): boolean {
+  return typeof r === "object" && r !== null && isPosition((r as { start?: unknown }).start) && isPosition((r as { end?: unknown }).end);
 }
 
 function escapeHtml(s: string): string {

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { OUTPUT_TAIL_BYTES, runCommand } from "../src/chat/runCommand";
+import { COMMAND_TIMEOUT_MS, OUTPUT_TAIL_BYTES, runCommand } from "../src/chat/runCommand";
 import { resetMock, window, type MockOutputChannel } from "./mocks/vscode";
 import type * as vscode from "vscode";
 
@@ -83,5 +83,11 @@ describe("runCommand", () => {
     expect(result.stdout).toBe("started\n");
     expect(result.stderr).toMatch(/timed out/);
     expect(out.text).toMatch(/timed out/);
+  });
+
+  it("default_timeout_is_shorter_than_the_cores_client_request_timeout", () => {
+    // core/src/rpc/server.rs CLIENT_REQUEST_TIMEOUT is 10 minutes: the command must be
+    // killed (and its result reported) before the core gives up on the request.
+    expect(COMMAND_TIMEOUT_MS).toBe(9 * 60 * 1000);
   });
 });

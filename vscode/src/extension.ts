@@ -141,6 +141,8 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
     html: () => readFileSync(join(context.extensionPath, "media", "chat.html"), "utf8"),
     startOllama: () => startOllama(deps),
     pullModel: (model) => pullModel(deps, model),
+    // The core pauses completions while chat generates (spec §5(10)); show it.
+    onChatActiveChanged: (active) => statusBar.setChatActive(active),
   });
 
   // Core → client requests (the core sends them only after the user approved in the chat).

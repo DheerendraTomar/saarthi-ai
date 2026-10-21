@@ -4,9 +4,13 @@ import * as vscode from "vscode";
 import type { CoreCommand } from "./rpc/coreClient";
 
 /**
- * `localpilot.*` settings. Everything except `logLevel` is forwarded verbatim
- * as `initialize.settings` (the core ignores keys it does not know, and takes
- * settings only at `initialize`, so a change means a core restart).
+ * `localpilot.*` settings, sent as `initialize.settings` (the core ignores keys
+ * it does not know and reads settings only at `initialize`). Two exceptions:
+ * `completionsEnabled` is always sent as true (`coreInitSettings`; the
+ * InlineProvider gates completions itself, so toggling needs no restart), and
+ * `completionsEnabled` / `completionDebounceMs` are client-only, so changing just
+ * those does not restart the core (`sameCoreSettings`). `logLevel` and
+ * `coreBinaryPath` configure how the core process is launched.
  */
 export interface Settings {
   ollamaUrl: string;

@@ -7,7 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as vscode from "vscode";
 import { activate, deactivate, RESTART_DEBOUNCE_MS, type LocalPilotApi } from "../src/extension";
 import { CoreClient } from "../src/rpc/coreClient";
-import { waitFor } from "./helpers/webview";
+import { pullModel, type CommandDeps } from "../src/commands";
+import { DEFAULT_SETTINGS } from "../src/settings";
+import { StatusBar } from "../src/statusBar";
+import { fakeWebviewView, FakeChatClient, waitFor } from "./helpers/webview";
 import { configValues, editorEvents, registry, resetMock, Uri, workspace, workspaceConfigKeys, type MockStatusBarItem } from "./mocks/vscode";
 
 const extensionPath = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -208,5 +211,48 @@ describe("activate", () => {
       starts.mockRestore();
       restarts.mockRestore();
     }
+  });
+
+  it("status_bar_shows_completions_paused_while_a_chat_turn_runs", async () => {
+    const api = start();
+    await api.ready;
+    await waitFor(() => item().text === "$(sparkle) LocalPilot", 5000, "ok");
+    const ui = fakeWebviewView();
+    api.chatView.resolveWebviewView(ui.view);
+    ui.send({ type: "chat/send", message: "edit it", attachments: [] });
+    // The fake core's turn waits on the approval: chat is generating meanwhile.
+    const call = await (async () => {
+      await waitFor(() => ui.posted.some((m) => m.type === "chat/toolCall"), 5000, "tool call");
+      return ui.posted.find((m) => m.type === "chat/toolCall")!;
+    })();
+    expect(item().text).toBe("$(debug-pause) completions paused during chat");
+    ui.send({ type: "chat/approve", toolCallId: call.toolCallId, decision: "deny" });
+    await waitFor(() => ui.posted.some((m) => m.type === "chat/done"), 5000, "done");
+    expect(item().text).toBe("$(sparkle) LocalPilot");
+  });
+
+  it("successful_pull_rechecks_ollama_status", async () => {
+    const statusBar = new StatusBar();
+    const client = new FakeChatClient((method) => (method === "ollama/status" ? { ollama: "ok", detail: "Ollama is running" } : {}));
+    const statuses: unknown[] = [];
+    const deps = {
+      client,
+      statusBar,
+      settings: () => ({ ...DEFAULT_SETTINGS }),
+      onStatus: (s: unknown) => void statuses.push(s),
+    } as unknown as CommandDeps;
+    await pullModel(deps, "m:1b");
+    expect(client.requests.map((r) => r.method)).toEqual(["ollama/pull", "ollama/status"]);
+    expect(statuses).toEqual([{ ollama: "ok", detail: "Ollama is running" }]);
+
+    // A failed pull does not claim anything new about Ollama.
+    client.requests.length = 0;
+    client.respond = (method) => {
+      if (method === "ollama/pull") throw new Error("no space left");
+      return {};
+    };
+    await pullModel(deps, "m:1b");
+    expect(client.requests.map((r) => r.method)).toEqual(["ollama/pull"]);
+    expect(registry.messages).toContainEqual({ level: "error", message: "LocalPilot: pulling m:1b failed: no space left" });
   });
 });

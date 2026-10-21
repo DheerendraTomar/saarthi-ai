@@ -71,6 +71,32 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "localpilot.openChat",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.newSession",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.startOllama",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.pullModel",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.toggleCompletions",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "localpilot.restartCore",
+          "when": "workspaceFolderCount > 0"
+        }
+      ],
       "view/title": [
         {
           "command": "localpilot.newSession",

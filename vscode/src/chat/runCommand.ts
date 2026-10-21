@@ -14,7 +14,7 @@ export interface RunCommandResult {
 }
 
 export interface RunCommandOptions {
-  /** Hard limit before the command is killed (default 10 minutes). */
+  /** Hard limit before the command is killed (default `COMMAND_TIMEOUT_MS`, 9 minutes). */
   timeoutMs?: number;
   /** cwd when the core sends none (the workspace root). */
   defaultCwd?: string;
@@ -22,7 +22,12 @@ export interface RunCommandOptions {
 
 /** Characters of each stream returned to the core (the tail; the start is dropped). */
 export const OUTPUT_TAIL_BYTES = 16 * 1024;
-export const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * 9 minutes: shorter than the core's 10-minute limit on client requests
+ * (CLIENT_REQUEST_TIMEOUT in core/src/rpc/server.rs), so a hung command is
+ * killed and its output reported before the core gives up on the request.
+ */
+export const COMMAND_TIMEOUT_MS = 9 * 60 * 1000;
 const TRUNCATED = "[… output truncated; last 16 KB shown]\n";
 
 /** Keeps the last `limit` characters of a stream. */

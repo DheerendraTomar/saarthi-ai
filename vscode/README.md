@@ -96,14 +96,16 @@ Walk this after installing a new build (folder open, Ollama models pulled):
 
 - **Logs**: the core logs to `<workspace>/.localpilot/core.log` (set
   `localpilot.logLevel` to `debug` for more); the extension logs to the **LocalPilot**
-  output channel. Add `.localpilot/` to your `.gitignore`.
+  output channel. The core keeps `.localpilot/` out of git itself (it writes a
+  `.localpilot/.gitignore`).
 - **"Ollama down"**: Ollama isn't answering at `localpilot.ollamaUrl`. Start it
   (`ollama serve`, the Ollama app, or **LocalPilot: Start Ollama**), then pick
   **Retry** from the status bar menu. Check `curl http://localhost:11434/api/tags`.
 - **"Model missing" / no ghost text**: pull the configured model
   (`ollama pull qwen2.5-coder:0.5b-base` or **LocalPilot: Pull Model**) and check
   `ollama list`. Completions also pause while `localpilot.completionsEnabled` is
-  off (status bar).
+  off, and while a chat reply is generating (status bar: "completions paused
+  during chat").
 - **Core failed to start / crashed**: see the error message and the log above;
   **LocalPilot: Restart Core** starts it again. "no core binary" means the `.vsix`
   was built for another platform: build it on this machine or set
