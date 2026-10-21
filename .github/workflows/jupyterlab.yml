@@ -32,6 +32,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: package script syntax
+        run: bash -n scripts/package-jupyterlab.sh
       - name: npm ci (repo root)
         run: npm ci
       - name: build chat-ui (embedded into the labextension)

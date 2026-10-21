@@ -5,7 +5,8 @@
 # Usage: bash scripts/package-jupyterlab.sh   (run `npm ci` once first on a clean checkout)
 #        SKIP_CORE_BUILD=1 bash scripts/package-jupyterlab.sh
 #          # reuse dist/core/<triple>/localpilot-core instead of running build-core.sh
-# Needs Node 20+ (jlpm comes with JupyterLab) and `uv` or `python -m build`.
+# Needs Rust, Node 20+, JupyterLab 4.5 in the current Python env (provides jlpm),
+# and `uv` or `python -m build`.
 # Prints the wheel path on the last line.
 #
 # The wheel is tagged py3-none-any but bundles only this machine's core binary,
@@ -15,6 +16,9 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
+
+# 0. Preflight: jlpm and `jupyter labextension build` come from JupyterLab.
+command -v jlpm >/dev/null || { echo "package-jupyterlab: jlpm not found: install JupyterLab 4.5 in this Python env first (pip install \"jupyterlab>=4.5,<5\")" >&2; exit 1; }
 
 # 1. Release core binary (build-core.sh prints the path it wrote on its last line).
 if [ "${SKIP_CORE_BUILD:-}" = "1" ]; then

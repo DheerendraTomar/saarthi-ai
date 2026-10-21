@@ -33,6 +33,7 @@ opens the chat. Settings, the manual smoke checklist and troubleshooting are in
 ## Quick start (JupyterLab, macOS arm64)
 
 ```sh
+pip install "jupyterlab>=4.5,<5"         # JupyterLab 4.5 in this Python env (provides jlpm)
 npm ci
 bash scripts/package-jupyterlab.sh       # → dist/localpilot_jupyter-0.1.0-py3-none-any.whl
 pip install --force-reinstall dist/localpilot_jupyter-0.1.0-py3-none-any.whl

@@ -14,9 +14,12 @@ halves:
 
 LocalPilot is not on PyPI; build the wheel from this repo and install it into the
 Python environment that runs JupyterLab (JupyterLab 4.5, jupyter_server 2.x).
-Requires Rust (stable), Node 20+ and npm, and `uv` (or `pip install build`).
+Requires Rust (stable), Node 20+ and npm, `uv` (or `pip install build`), and
+JupyterLab 4.5 installed in the current Python env (it provides `jlpm`, which the
+script needs).
 
 ```sh
+pip install "jupyterlab>=4.5,<5"           # provides jlpm
 npm ci                                     # once, from the repo root
 bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.1.0-py3-none-any.whl
 pip install --force-reinstall dist/localpilot_jupyter-0.1.0-py3-none-any.whl
@@ -143,7 +146,7 @@ Walk this after installing a new build (`jupyter lab` restarted, models pulled):
   tab's socket with code **1012**. Tabs reconnect with backoff, re-initialize and
   re-send their open documents; a streaming chat reply ends with an error, but the
   session and its history stay.
-- **Core crashed**: after 3 crashes within a minute the server stops restarting it
+- **Core crashed**: after 3 automatic restarts within a minute the server stops restarting it
   (`"core": "crashed"`). Fix the cause (see the log), then **Restart LocalPilot
   Core**.
 - **"LocalPilot core binary not found"**: the wheel has no core for this platform.
