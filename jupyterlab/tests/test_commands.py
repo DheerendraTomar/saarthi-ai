@@ -6,7 +6,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from localpilot_jupyter.commands import OUTPUT_TAIL_CHARS, run_command
+from localpilot_jupyter.commands import COMMAND_TIMEOUT_S, OUTPUT_TAIL_CHARS, run_command
 
 
 async def test_runs_in_confined_cwd_and_reports_exit_code(tmp_path: Path) -> None:
@@ -82,3 +82,9 @@ async def test_timeout_kills_the_process_group(tmp_path: Path) -> None:
     from .conftest import eventually
 
     await eventually(gone, what="grandchild killed")
+
+
+def test_default_timeout_is_shorter_than_the_cores_request_timeout() -> None:
+    # The core gives up on a client request after 10 minutes (CLIENT_REQUEST_TIMEOUT);
+    # the command is killed and reported first, as in VS Code.
+    assert COMMAND_TIMEOUT_S == 9 * 60

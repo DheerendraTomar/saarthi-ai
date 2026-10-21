@@ -91,6 +91,7 @@ class CoreProcess:
         self._stopping = False
         self._refused_gen = 0
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._launch_task: Optional[asyncio.Task[Any]] = None
         self._watchers: dict[int, asyncio.Task[Any]] = {}
         self._listeners: list[Callable[[str], None]] = []
         self._state_listeners: list[Callable[[str], None]] = []
@@ -137,10 +138,10 @@ class CoreProcess:
         """Launches the core (if not running) and sends `initialize`; returns its (cached) result.
 
         While starting or ready this only waits for the current launch; `settings`
-        are used only if none are stored yet. From stopped or crashed it launches
+        are stored only if none are stored yet and they are non-empty. From stopped or crashed it launches
         anew with a fresh restart budget. Raises CoreCrashed / CoreStopped.
         """
-        if self.settings is None and settings is not None:
+        if self.settings is None and settings:
             self.settings = settings
         if self.state in ("starting", "ready") and self._ready is not None:
             return await asyncio.shield(self._ready)
@@ -149,7 +150,7 @@ class CoreProcess:
         self._new_ready_future()
         ready = self._ready
         assert ready is not None
-        await self._launch()
+        self._launch_task = self._spawn_task(self._launch())
         return await asyncio.shield(ready)
 
     async def restart(self, settings: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -161,8 +162,13 @@ class CoreProcess:
 
     async def stop(self) -> None:
         """`shutdown`, stdin EOF, up to `shutdown_timeout` for a clean exit, then kill."""
-        proc = self._proc
         self._stopping = True
+        launch = self._launch_task
+        if launch is not None and not launch.done():
+            # A launch in flight (first start or an automatic restart) checks `_stopping`
+            # after spawning and kills its process; wait for it so nothing is left behind.
+            await asyncio.wait([launch])
+        proc = self._proc
         if proc is None:
             self._fail_ready(CoreStopped("LocalPilot core stopped"))
             self._set_state("stopped")
@@ -251,7 +257,13 @@ class CoreProcess:
             self._fail_ready(CoreCrashed(f"LocalPilot core could not be started ({self.binary}): {err}"))
             return
         if gen != self._generation or self._stopping:  # stopped while spawning
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            self._fail_ready(CoreStopped("LocalPilot core stopped"))
+            return
         self._proc = proc
         self._watchers[gen] = self._spawn_task(self._watch(proc, gen))
         assert proc.stdin is not None
@@ -384,4 +396,4 @@ class CoreProcess:
             self.max_restarts_per_minute,
         )
         self._new_ready_future()
-        self._spawn_task(self._launch())
+        self._launch_task = self._spawn_task(self._launch())

@@ -9,10 +9,15 @@ Tab → core
 - Other requests: the id is rewritten to the string `"<tab>:<json id>"` and forwarded;
   the core's response is routed back to that tab with its original id restored.
   While the core is stopped/crashed they fail at once with -32603.
+- `completion/request|cancel|accepted|rejected`: `params.requestId` is rewritten to
+  `"<tab>:<requestId>"`, so two tabs' request ids never collide in the core.
 - `chat/send` records `sessionId → tab` (ownership). Other `chat/*` requests naming a
-  session whose owner is gone adopt it. `chat/approve` (not `deny`) marks that tool call
-  as the next to execute (used to route `workspace/applyEdit`).
-- Notifications are forwarded (queued by the core while starting).
+  session whose owner is gone adopt it; a `chat/history` that adopts a session is
+  followed (after its response) by a replay of that session's pending `chat/toolCall`.
+- Document sync is refcounted per (uri, tab): `didOpen` is forwarded only for the first
+  tab opening a uri, `didChange`/`didSave` always, `didClose` only when the last tab
+  closes it; a closing tab's documents get a synthesized `didClose`.
+- Other notifications are forwarded (queued by the core while starting).
 - Responses to core→client requests are forwarded only by the tab the request went to.
 
 Core → tabs
@@ -21,10 +26,11 @@ Core → tabs
   owner is disconnected (until a tab adopts the session); broadcast for unknown sessions.
   All other notifications are broadcast.
 - `workspace/runCommand` is answered by the server (`commands.run_command` in the
-  server root). `workspace/applyEdit` (its params carry no sessionId) goes to the owner of
-  the session whose tool call was most recently approved/auto-approved and has no
-  `chat/toolResult` yet; else to the most recently connected tab; no tab → -32603.
-  Other core→client requests → -32601.
+  server root). `workspace/applyEdit` goes exactly to the tab owning `params.sessionId`;
+  if that owner is gone (or the session is unknown / missing) the core gets -32603
+  "owning tab disconnected" — never a stranger tab. Other core→client requests → -32601.
+- The last `chat/toolCall` awaiting approval is kept per session (cleared by its
+  `chat/toolResult`, the session's `chat/done`, or a `chat/approve` for it).
 
 Lifecycle
 - A tab closing answers every core→client request pending on it with -32603.
@@ -47,6 +53,10 @@ from .core_process import CoreCrashed, CoreNotRunning, CoreProcess, CoreStopped
 INTERNAL_ERROR = -32603
 METHOD_NOT_FOUND = -32601
 PARSE_ERROR = -32700
+#: Methods whose `params.requestId` is namespaced per tab.
+REQUEST_ID_METHODS = frozenset(
+    {"completion/request", "completion/cancel", "completion/accepted", "completion/rejected"}
+)
 #: WebSocket close code "Service Restart".
 CLOSE_RESTART = 1012
 
@@ -90,10 +100,12 @@ class Bridge:
         self._pending_core: dict[str, str] = {}
         # chat session → owning tab id
         self._owners: dict[str, str] = {}
-        # tool calls announced and not finished: toolCallId → sessionId
-        self._open_calls: dict[str, str] = {}
-        # toolCallIds approved / auto-approved, oldest first
-        self._activated: list[str] = []
+        # session → (toolCallId, raw chat/toolCall line) still awaiting approval
+        self._pending_calls: dict[str, tuple[str, str]] = {}
+        # forwarded chat/history id → session whose pending call is replayed after the response
+        self._replay_after: dict[str, str] = {}
+        # document uri → tabs that have it open
+        self._docs: dict[str, set[str]] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------ core
@@ -138,6 +150,12 @@ class Bridge:
             return
         for key in [k for k, (tab, _) in self._pending_client.items() if tab == tab_id]:
             del self._pending_client[key]
+            self._replay_after.pop(key, None)
+        for uri in [u for u, holders in self._docs.items() if tab_id in holders]:
+            self._docs[uri].discard(tab_id)
+            if not self._docs[uri]:
+                del self._docs[uri]
+                self._send_core(json.dumps({"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {"uri": uri}}))
         for key in [k for k, tab in self._pending_core.items() if tab == tab_id]:
             del self._pending_core[key]
             self._send_core(_error(json.loads(key), INTERNAL_ERROR, "the JupyterLab tab handling this request was closed"))
@@ -189,8 +207,14 @@ class Bridge:
             return
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         if not has_id:
-            if method != "exit":
-                self._send_core(line)
+            if method == "exit":
+                return
+            if method.startswith("textDocument/") and not self._track_document(tab_id, method, params):
+                return
+            if method in REQUEST_ID_METHODS:
+                self._namespace_request_id(tab_id, msg)
+                line = json.dumps(msg)
+            self._send_core(line)
             return
         id_value = msg["id"]
         if method == "initialize":
@@ -199,8 +223,11 @@ class Bridge:
         if method == "shutdown":
             self._send_tab(tab_id, _result(id_value, {}))
             return
+        replay_session: Optional[str] = None
         if method.startswith("chat/"):
-            self._track_chat_request(tab_id, method, params)
+            replay_session = self._track_chat_request(tab_id, method, params)
+        if method in REQUEST_ID_METHODS:
+            self._namespace_request_id(tab_id, msg)
 
         core = self.core
         if core is None or core.state not in ("starting", "ready"):
@@ -211,9 +238,12 @@ class Bridge:
             return
         forwarded = f"{tab_id}:{_key(id_value)}"
         self._pending_client[forwarded] = (tab_id, id_value)
+        if replay_session is not None:
+            self._replay_after[forwarded] = replay_session
         msg["id"] = forwarded
         if not self._send_core(json.dumps(msg)):
             self._pending_client.pop(forwarded, None)
+            self._replay_after.pop(forwarded, None)
             self._send_tab(tab_id, _error(id_value, INTERNAL_ERROR, "LocalPilot core is not running"))
 
     async def _initialize(self, tab_id: str, id_value: Any, params: dict[str, Any]) -> None:
@@ -236,18 +266,49 @@ class Bridge:
             return
         self._send_tab(tab_id, _result(id_value, core.initialize_result or result))
 
-    def _track_chat_request(self, tab_id: str, method: str, params: dict[str, Any]) -> None:
+    def _track_chat_request(self, tab_id: str, method: str, params: dict[str, Any]) -> Optional[str]:
+        """Records session ownership; returns the session whose pending tool call should be
+        replayed to this tab after the response (a `chat/history` adopting it)."""
         session = params.get("sessionId")
-        if isinstance(session, str):
-            owner = self._owners.get(session)
-            if method == "chat/send" or owner is None or owner not in self.tabs:
-                self._owners[session] = tab_id
-        if method == "chat/approve" and params.get("decision") != "deny":
-            call = params.get("toolCallId")
-            if isinstance(call, str):
-                if isinstance(session, str) and call not in self._open_calls:
-                    self._open_calls[call] = session
-                self._activate(call)
+        if not isinstance(session, str):
+            return None
+        owner = self._owners.get(session)
+        adopting = owner is not None and owner not in self.tabs
+        if method == "chat/send" or owner is None or adopting:
+            self._owners[session] = tab_id
+        if method == "chat/approve":
+            pending = self._pending_calls.get(session)
+            if pending is not None and pending[0] == params.get("toolCallId"):
+                del self._pending_calls[session]
+        if method == "chat/history" and adopting and session in self._pending_calls:
+            return session
+        return None
+
+    @staticmethod
+    def _namespace_request_id(tab_id: str, msg: dict[str, Any]) -> None:
+        params = msg.get("params")
+        if isinstance(params, dict) and isinstance(params.get("requestId"), (str, int)):
+            params["requestId"] = f"{tab_id}:{params['requestId']}"
+
+    def _track_document(self, tab_id: str, method: str, params: dict[str, Any]) -> bool:
+        """Refcounts open documents per tab; returns whether to forward the notification."""
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            return True
+        holders = self._docs.get(uri)
+        if method == "textDocument/didOpen":
+            first = not holders
+            self._docs.setdefault(uri, set()).add(tab_id)
+            return first
+        if method == "textDocument/didClose":
+            if holders is None:
+                return True  # not tracked (opened before a restart): let the core decide
+            holders.discard(tab_id)
+            if holders:
+                return False
+            del self._docs[uri]
+            return True
+        return True
 
     def _response_from_tab(self, tab_id: str, msg: dict[str, Any], line: str) -> None:
         key = _key(msg["id"])
@@ -280,6 +341,9 @@ class Bridge:
         tab_id, original = self._pending_client.pop(forwarded)
         msg["id"] = original
         self._send_tab(tab_id, json.dumps(msg))
+        session = self._replay_after.pop(forwarded, None)
+        if session is not None and self._owners.get(session) == tab_id and session in self._pending_calls:
+            self._send_tab(tab_id, self._pending_calls[session][1])
 
     def _notification_from_core(self, method: str, msg: dict[str, Any], line: str) -> None:
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
@@ -288,15 +352,14 @@ class Bridge:
             return
         session = params.get("sessionId")
         call = params.get("toolCallId")
-        if method == "chat/toolCall" and isinstance(call, str) and isinstance(session, str):
-            self._open_calls[call] = session
-            if not params.get("requiresApproval"):
-                self._activate(call)
-        elif method == "chat/toolResult" and isinstance(call, str):
-            self._finish_call(call)
-        elif method == "chat/done" and isinstance(session, str):
-            for done in [c for c, s in self._open_calls.items() if s == session]:
-                self._finish_call(done)
+        if isinstance(session, str):
+            pending = self._pending_calls.get(session)
+            if method == "chat/toolCall" and isinstance(call, str) and params.get("requiresApproval"):
+                self._pending_calls[session] = (call, line)
+            elif method == "chat/done" or (
+                method == "chat/toolResult" and pending is not None and pending[0] == call
+            ):
+                self._pending_calls.pop(session, None)
         owner = self._owners.get(session) if isinstance(session, str) else None
         if owner is None:
             self._broadcast(line)
@@ -311,9 +374,13 @@ class Bridge:
             params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
             self._spawn(self._run_command(id_value, params))
         elif method == "workspace/applyEdit":
-            tab_id = self._apply_edit_target()
-            if tab_id is None:
-                self._send_core(_error(id_value, INTERNAL_ERROR, "no JupyterLab tab is connected to apply the edit"))
+            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            session = params.get("sessionId")
+            tab_id = self._owners.get(session) if isinstance(session, str) else None
+            if tab_id is None or tab_id not in self.tabs:
+                self._send_core(
+                    _error(id_value, INTERNAL_ERROR, f"owning tab disconnected (session {session!r}); edit not applied")
+                )
                 return
             self._pending_core[_key(id_value)] = tab_id
             self._send_tab(tab_id, line)
@@ -323,24 +390,6 @@ class Bridge:
     async def _run_command(self, id_value: Any, params: dict[str, Any]) -> None:
         result = await run_command(params, self.root_dir)
         self._send_core(_result(id_value, result))
-
-    def _activate(self, call: str) -> None:
-        if call in self._activated:
-            self._activated.remove(call)
-        self._activated.append(call)
-
-    def _finish_call(self, call: str) -> None:
-        self._open_calls.pop(call, None)
-        if call in self._activated:
-            self._activated.remove(call)
-
-    def _apply_edit_target(self) -> Optional[str]:
-        for call in reversed(self._activated):
-            session = self._open_calls.get(call)
-            owner = self._owners.get(session) if session is not None else None
-            if owner is not None and owner in self.tabs:
-                return owner
-        return next(reversed(self.tabs), None)
 
     def _broadcast(self, line: str) -> None:
         for tab_id in list(self.tabs):
@@ -353,8 +402,10 @@ class Bridge:
         for tab_id, original in pending.values():
             self._send_tab(tab_id, _error(original, INTERNAL_ERROR, "LocalPilot core exited"))
         self._pending_core.clear()
-        self._open_calls.clear()
-        self._activated.clear()
+        self._replay_after.clear()
+        self._pending_calls.clear()
+        # The next core starts with an empty overlay; tabs re-send didOpen after reconnecting.
+        self._docs.clear()
         if not was_ready:
             return
         for tab_id, conn in list(self.tabs.items()):

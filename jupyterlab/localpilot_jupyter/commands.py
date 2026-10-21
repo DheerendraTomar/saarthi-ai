@@ -17,8 +17,10 @@ from typing import Any, Optional
 
 #: Characters of each stream returned to the core (the tail; the start is dropped).
 OUTPUT_TAIL_CHARS = 16 * 1024
-#: Hard limit before the command is killed (controller ruling: 10 minutes).
-COMMAND_TIMEOUT_S = 10 * 60
+#: Hard limit before the command is killed: 9 minutes, shorter than the core's
+#: 10-minute limit on client requests (CLIENT_REQUEST_TIMEOUT in core/src/rpc/server.rs),
+#: so a hung command is killed and its output reported before the core gives up (as in VS Code).
+COMMAND_TIMEOUT_S = 9 * 60
 TRUNCATED = "[… output truncated; last 16 KB shown]\n"
 _READ_CHUNK = 64 * 1024
 

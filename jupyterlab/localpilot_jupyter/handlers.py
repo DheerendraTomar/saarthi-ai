@@ -8,6 +8,7 @@ from typing import Any, Optional
 from jupyter_server.auth.decorator import ws_authenticated
 from jupyter_server.base.handlers import APIHandler, JupyterHandler
 from jupyter_server.base.websocket import WebSocketMixin
+from jupyter_server.utils import ensure_async
 from tornado import web, websocket
 
 from .bridge import Bridge
@@ -17,6 +18,20 @@ SETTINGS_KEY = "localpilot"
 
 def _bridge(handler: web.RequestHandler) -> Bridge:
     return handler.settings[SETTINGS_KEY]
+
+
+#: The agent runs shell commands and edits files through these endpoints, so they need the
+#: same permission as a terminal.
+AUTH_ACTION = "execute"
+AUTH_RESOURCE = "terminals"
+
+
+async def _authorize(handler: JupyterHandler) -> None:
+    allowed = await ensure_async(
+        handler.authorizer.is_authorized(handler, handler.current_user, AUTH_ACTION, AUTH_RESOURCE)
+    )
+    if not allowed:
+        raise web.HTTPError(403, f"LocalPilot needs '{AUTH_ACTION}' permission on '{AUTH_RESOURCE}'")
 
 
 class StatusHandler(APIHandler):
@@ -32,6 +47,7 @@ class RestartHandler(APIHandler):
 
     @web.authenticated
     async def post(self) -> None:
+        await _authorize(self)
         settings: Optional[dict[str, Any]] = None
         if self.request.body:
             try:
@@ -71,6 +87,7 @@ class RpcWebSocket(WebSocketMixin, websocket.WebSocketHandler, JupyterHandler): 
 
     @ws_authenticated
     async def get(self, *args: Any, **kwargs: Any) -> None:
+        await _authorize(self)
         await super().get(*args, **kwargs)
 
     def open(self, *args: Any, **kwargs: Any) -> None:

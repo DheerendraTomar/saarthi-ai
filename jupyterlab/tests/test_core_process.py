@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from localpilot_jupyter.core_process import CoreCrashed, CoreNotRunning, CoreProcess
+from localpilot_jupyter.core_process import CoreCrashed, CoreNotRunning, CoreProcess, CoreStopped
 
 from .conftest import TIMEOUT, eventually
 
@@ -126,3 +126,31 @@ async def test_restart_uses_new_settings(fake_core_binary: Path, workspace: Path
         assert core.launches == 2
     finally:
         await core.stop()
+
+
+async def test_empty_first_settings_are_not_stored(fake_core_binary: Path, workspace: Path) -> None:
+    core = make_core(fake_core_binary, workspace)
+    try:
+        await asyncio.wait_for(core.start({}), TIMEOUT)
+        assert core.settings is None
+        await core.start({"completionModel": "m"})  # a later client with real settings
+        assert core.settings == {"completionModel": "m"}
+        assert core.launches == 1
+    finally:
+        await core.stop()
+
+
+async def test_stop_while_spawning_leaves_nothing_running(fake_core_binary: Path, workspace: Path) -> None:
+    core = make_core(fake_core_binary, workspace)
+    exits: list[bool] = []
+    core.add_exit_listener(exits.append)
+    starting = asyncio.ensure_future(core.start({}))
+    await asyncio.sleep(0)  # one loop turn: start() has scheduled the launch, nothing is spawned yet
+    assert core._launch_task is not None and not core._launch_task.done()
+    await asyncio.wait_for(core.stop(), TIMEOUT)
+    with pytest.raises(CoreStopped):
+        await asyncio.wait_for(starting, TIMEOUT)
+    assert core.state == "stopped"
+    await eventually(lambda: not core._tasks, what="launch/watch tasks finished")
+    assert core._proc is None and core.state == "stopped"
+    assert exits == []  # the process killed during launch was never registered or watched

@@ -122,6 +122,61 @@ async def test_apply_edit_routed_to_owning_tab(open_tab: Callable[[], Any]) -> N
     assert not [m for m in b.inbox if mentions_session(m, session_a)], b.inbox
 
 
+async def test_two_tabs_concurrent_turns_each_get_their_own_apply_edit(open_tab: Callable[[], Any]) -> None:
+    a, b = await open_tab(), await open_tab()
+    await init(a)
+    await init(b)
+    session_a, call_a = await start_turn(a, 10)
+    session_b, call_b = await start_turn(b, 10)
+    # Both approvals are in before either edit is requested; b approves last.
+    await a.send({"id": 20, "method": "chat/approve", "params": {"sessionId": session_a, "toolCallId": call_a, "decision": "once"}})
+    await b.send({"id": 20, "method": "chat/approve", "params": {"sessionId": session_b, "toolCallId": call_b, "decision": "once"}})
+    for tab, session in ((a, session_a), (b, session_b)):
+        edit = await tab.next(lambda m: m.get("method") == "workspace/applyEdit")
+        assert edit["params"]["sessionId"] == session
+        await tab.send({"id": edit["id"], "result": {"applied": True}})
+    for tab, session in ((a, session_a), (b, session_b)):
+        assert (await tab.notification("chat/toolResult", sessionId=session))["params"]["ok"] is True
+        assert (await tab.notification("chat/done", sessionId=session))["params"]["stopReason"] == "done"
+    for tab, other in ((a, session_b), (b, session_a)):
+        assert not [m for m in tab.inbox if mentions_session(m, other)], tab.inbox
+
+
+async def test_completion_cancel_from_another_tab_does_not_cancel(
+    open_tab: Callable[[], Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DELAY_MS", "200")
+    a, b = await open_tab(), await open_tab()
+    await init(a)
+    await init(b)
+    request = completion(2, line=5)
+    request["params"]["requestId"] = "r1"
+    await a.send(request)
+    await b.send({"method": "completion/cancel", "params": {"requestId": "r1"}})
+    reply = await a.next(is_response(2))
+    assert reply["result"]["items"][0]["text"] == "fake()"
+
+
+async def test_websocket_and_restart_need_terminal_execute_permission(
+    jp_fetch: Callable[..., Any], jp_ws_fetch: Callable[..., Any], jp_serverapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[tuple[str, str]] = []
+
+    def is_authorized(handler: Any, user: Any, action: str, resource: str) -> bool:
+        asked.append((action, resource))
+        return resource != "terminals"
+
+    monkeypatch.setattr(jp_serverapp.web_app.settings["authorizer"], "is_authorized", is_authorized)
+    with pytest.raises(HTTPClientError) as err:
+        await jp_ws_fetch("localpilot", "rpc")
+    assert err.value.code == 403
+    with pytest.raises(HTTPClientError) as err:
+        await jp_fetch("localpilot", "restart", method="POST", body="{}")
+    assert err.value.code == 403
+    assert asked.count(("execute", "terminals")) == 2
+    assert (await jp_fetch("localpilot", "status")).code == 200
+
+
 async def test_notifications_are_broadcast_and_shutdown_is_not_forwarded(
     open_tab: Callable[[], Any], localpilot: Bridge
 ) -> None:
@@ -337,15 +392,50 @@ async def test_chat_notifications_follow_session_ownership(bridge: Bridge, stub:
     assert deltas(b)[-1] == "s1"
 
 
+def apply_edit(id: int, session: Any) -> dict:
+    params: dict = {"ops": [], "save": True}
+    if session is not None:
+        params["sessionId"] = session
+    return {"id": id, "method": "workspace/applyEdit", "params": params}
+
+
+async def chat_send(bridge: Bridge, tab_id: str, session: str, id: int = 2) -> None:
+    await send(bridge, tab_id, {"id": id, "method": "chat/send", "params": {"sessionId": session, "message": "hi"}})
+
+
+async def test_apply_edit_routed_by_session_id(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1")
+    await chat_send(bridge, b_id, "s2")
+    # b approved last, yet each edit goes to the tab owning its session.
+    stub.emit(apply_edit(-1, "s1"))
+    stub.emit(apply_edit(-2, "s2"))
+    assert [m["id"] for m in a.received if m.get("method") == "workspace/applyEdit"] == [-1]
+    assert [m["id"] for m in b.received if m.get("method") == "workspace/applyEdit"] == [-2]
+
+
+async def test_apply_edit_for_a_gone_owner_is_refused_never_sent_to_a_stranger(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1")
+    bridge.unregister(a_id)
+    stub.emit(apply_edit(-1, "s1"))
+    stub.emit(apply_edit(-2, "never-sent"))
+    stub.emit(apply_edit(-3, None))
+    for id in (-1, -2, -3):
+        reply = next(m for m in stub.sent if m.get("id") == id)
+        assert reply["error"]["code"] == -32603, reply
+    assert "owning tab disconnected" in next(m for m in stub.sent if m.get("id") == -1)["error"]["message"]
+    assert not [m for m in b.received if m.get("method") == "workspace/applyEdit"]
+
+
 async def test_pending_core_request_answered_with_error_when_tab_closes(bridge: Bridge, stub: StubCore) -> None:
     a_id, a = await connect(bridge)
     b_id, b = await connect(bridge)
-    await send(bridge, a_id, {"id": 2, "method": "chat/send", "params": {"sessionId": "s1", "message": "hi"}})
-    stub.emit({"method": "chat/toolCall", "params": {"sessionId": "s1", "toolCallId": "tc1", "name": "edit_file", "requiresApproval": True}})
-    await send(bridge, a_id, {"id": 3, "method": "chat/approve", "params": {"sessionId": "s1", "toolCallId": "tc1", "decision": "once"}})
-    stub.emit({"id": -1, "method": "workspace/applyEdit", "params": {"ops": [], "save": True}})
+    await chat_send(bridge, a_id, "s1")
+    stub.emit(apply_edit(-1, "s1"))
     assert a.received[-1]["method"] == "workspace/applyEdit"
-    assert not [m for m in b.received if m.get("method") == "workspace/applyEdit"]
 
     bridge.unregister(a_id)
     error = next(m for m in stub.sent if m.get("id") == -1)
@@ -355,10 +445,82 @@ async def test_pending_core_request_answered_with_error_when_tab_closes(bridge: 
     assert len([m for m in stub.sent if m.get("id") == -1]) == 1
 
 
+async def test_completion_request_ids_are_namespaced_per_tab(bridge: Bridge, stub: StubCore) -> None:
+    a_id, _ = await connect(bridge)
+    b_id, _ = await connect(bridge)
+    await send(bridge, a_id, {"id": 2, "method": "completion/request", "params": {"uri": "file:///a.py", "position": {"line": 0, "character": 0}, "requestId": "r1"}})
+    for method in ("completion/cancel", "completion/accepted", "completion/rejected"):
+        await send(bridge, b_id, {"method": method, "params": {"requestId": "r1"}})
+    sent = {(m["method"], m["params"]["requestId"]) for m in stub.sent if m.get("method", "").startswith("completion/")}
+    assert sent == {
+        ("completion/request", f"{a_id}:r1"),
+        ("completion/cancel", f"{b_id}:r1"),
+        ("completion/accepted", f"{b_id}:r1"),
+        ("completion/rejected", f"{b_id}:r1"),
+    }
+
+
+async def test_documents_are_refcounted_per_tab(bridge: Bridge, stub: StubCore) -> None:
+    a_id, _ = await connect(bridge)
+    b_id, _ = await connect(bridge)
+
+    def doc(method: str, uri: str) -> dict:
+        params: dict = {"uri": uri}
+        if method == "textDocument/didOpen":
+            params.update(languageId="python", version=1, text="x")
+        if method == "textDocument/didChange":
+            params.update(version=2, contentChanges=[{"text": "y"}])
+        return {"method": method, "params": params}
+
+    def doc_traffic() -> list[tuple[str, str]]:
+        return [(m["method"].split("/")[1], m["params"]["uri"]) for m in stub.sent if m.get("method", "").startswith("textDocument/")]
+
+    await send(bridge, a_id, doc("textDocument/didOpen", "file:///u.py"))
+    await send(bridge, b_id, doc("textDocument/didOpen", "file:///u.py"))
+    await send(bridge, b_id, doc("textDocument/didChange", "file:///u.py"))
+    await send(bridge, a_id, doc("textDocument/didSave", "file:///u.py"))
+    await send(bridge, a_id, doc("textDocument/didClose", "file:///u.py"))  # b still has it open
+    await send(bridge, a_id, doc("textDocument/didOpen", "file:///v.py"))
+    assert doc_traffic() == [("didOpen", "file:///u.py"), ("didChange", "file:///u.py"), ("didSave", "file:///u.py"), ("didOpen", "file:///v.py")]
+
+    bridge.unregister(b_id)  # last holder of u
+    bridge.unregister(a_id)  # last holder of v
+    assert doc_traffic()[4:] == [("didClose", "file:///u.py"), ("didClose", "file:///v.py")]
+
+
+async def test_pending_tool_call_replayed_to_the_tab_that_adopts_the_session(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1")
+    call = {"method": "chat/toolCall", "params": {"sessionId": "s1", "toolCallId": "tc1", "name": "edit_file", "requiresApproval": True}}
+    stub.emit(call)
+    assert a.received[-1]["params"]["toolCallId"] == "tc1"
+    bridge.unregister(a_id)
+    later = {"method": "chat/toolCall", "params": {**call["params"], "toolCallId": "tc2"}}
+    stub.emit(later)  # dropped while orphaned, but kept as the session's pending call
+    assert not [m for m in b.received if m.get("method") == "chat/toolCall"]
+
+    await send(bridge, b_id, {"id": 5, "method": "chat/history", "params": {"sessionId": "s1"}})
+    forwarded = next(m for m in stub.sent if m.get("method") == "chat/history")
+    stub.emit({"id": forwarded["id"], "result": {"sessionId": "s1", "messages": []}})
+    # history first, then the call still awaiting approval
+    assert [m.get("id", m.get("method")) for m in b.received] == [5, "chat/toolCall"]
+    assert b.received[-1]["params"]["toolCallId"] == "tc2"
+
+    stub.emit({"method": "chat/toolResult", "params": {"sessionId": "s1", "toolCallId": "tc2", "ok": True}})
+    bridge.unregister(b_id)
+    c_id, c = await connect(bridge)
+    await send(bridge, c_id, {"id": 6, "method": "chat/history", "params": {"sessionId": "s1"}})
+    forwarded = [m for m in stub.sent if m.get("method") == "chat/history"][-1]
+    stub.emit({"id": forwarded["id"], "result": {"sessionId": "s1", "messages": []}})
+    assert [m.get("id", m.get("method")) for m in c.received] == [6]  # nothing pending any more
+
+
 async def test_apply_edit_without_any_tab_is_refused(bridge: Bridge, stub: StubCore) -> None:
     a_id, _ = await connect(bridge)
+    await chat_send(bridge, a_id, "s1")
     bridge.unregister(a_id)
-    stub.emit({"id": -2, "method": "workspace/applyEdit", "params": {"ops": [], "save": True}})
+    stub.emit(apply_edit(-2, "s1"))
     assert next(m for m in stub.sent if m.get("id") == -2)["error"]["code"] == -32603
 
 
