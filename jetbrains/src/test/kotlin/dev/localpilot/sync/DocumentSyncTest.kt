@@ -4,12 +4,17 @@ import com.intellij.ide.scratch.ScratchRootType
 import com.intellij.lang.Language
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.Document
+import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.roots.ModuleRootManager
+import com.intellij.openapi.roots.ProjectFileIndex
 import com.intellij.openapi.util.io.FileUtil
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.testFramework.LightVirtualFile
+import com.intellij.testFramework.PlatformTestUtil
 import com.intellij.testFramework.PsiTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.util.DocumentUtil
@@ -25,6 +30,8 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
+import java.nio.file.Path
 
 /** Records what the sync would send to the core; `state` simulates core restarts. */
 class RecordingSink(initial: CoreState = CoreState.READY) : DocumentSink {
@@ -44,13 +51,17 @@ class DocumentSyncTest : BasePlatformTestCase() {
     private lateinit var sink: RecordingSink
     private lateinit var scope: CoroutineScope
     private lateinit var sync: DocumentSyncListener
+    /** The light project's content root (`temp:///src` → `/src`) stands in for the project base path. */
+    private lateinit var workspace: Path
+    private val tempDirs = mutableListOf<File>()
 
     override fun setUp() {
         super.setUp()
         sink = RecordingSink()
         // Unconfined: every `state.value = …` runs the collector synchronously, so no transition is conflated away.
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-        sync = DocumentSyncListener(project, sink, scope, testRootDisposable)
+        workspace = Path.of(ModuleRootManager.getInstance(module).contentRoots.single().path)
+        sync = DocumentSyncListener(project, sink, scope, testRootDisposable, workspace)
         sync.install()
         sink.take()
     }
@@ -58,6 +69,7 @@ class DocumentSyncTest : BasePlatformTestCase() {
     override fun tearDown() {
         try {
             scope.cancel()
+            for (dir in tempDirs) FileUtil.delete(dir)
         } catch (e: Throwable) {
             addSuppressedException(e)
         } finally {
@@ -65,8 +77,21 @@ class DocumentSyncTest : BasePlatformTestCase() {
         }
     }
 
+    private fun tempDir(prefix: String): File = FileUtil.createTempDirectory(prefix, null).also { tempDirs += it }
+
     private fun edit(document: Document, block: Document.() -> Unit) =
         WriteCommandAction.runWriteCommandAction(project) { document.block() }
+
+    /** Replay serialises each document in its own (suspending) read action: wait for [count] calls to arrive. */
+    private fun awaitCalls(count: Int): List<Pair<String, JsonObject>> {
+        PlatformTestUtil.waitWithEventsDispatching(
+            "expected $count calls",
+            { synchronized(sink.calls) { sink.calls.size >= count } },
+            10,
+        )
+        PlatformTestUtil.dispatchAllEventsInIdeEventQueue()
+        return sink.take()
+    }
 
     private fun docOf(file: VirtualFile): Document = FileDocumentManager.getInstance().getDocument(file)!!
 
@@ -138,7 +163,7 @@ class DocumentSyncTest : BasePlatformTestCase() {
         }
 
         // A real local file outside the project (the content root is temp:///src).
-        val outsideIo = FileUtil.createTempDirectory("localpilot-outside", null).resolve("o.py").apply { writeText("o = 1\n") }
+        val outsideIo = tempDir("localpilot-outside").resolve("o.py").apply { writeText("o = 1\n") }
         val outside = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(outsideIo.toPath())!!
         myFixture.openFileInEditor(outside)
         edit(docOf(outside)) { insertString(0, "#") }
@@ -152,9 +177,9 @@ class DocumentSyncTest : BasePlatformTestCase() {
         val nb = myFixture.addFileToProject("nb.ipynb", "{\"cells\": []}\n").virtualFile
         myFixture.openFileInEditor(nb)
 
-        assertFalse(isSyncableFile(project, scratch))
-        assertFalse(isSyncableFile(project, light))
-        assertFalse(isSyncableFile(project, outside))
+        assertFalse(isSyncableFile(project, scratch, workspace))
+        assertFalse(isSyncableFile(project, light, workspace))
+        assertFalse(isSyncableFile(project, outside, workspace))
         assertTrue(isNotebookFile(nb))
         assertEquals(emptyList<Pair<String, JsonObject>>(), sink.take())
 
@@ -204,7 +229,7 @@ class DocumentSyncTest : BasePlatformTestCase() {
         sink.state.value = CoreState.STARTING
         assertEquals(emptyList<Pair<String, JsonObject>>(), sink.take())
         sink.state.value = CoreState.READY
-        val replay = sink.take()
+        val replay = awaitCalls(2)
         assertEquals(listOf("textDocument/didOpen", "textDocument/didOpen"), replay.map { it.first })
         val byUri = replay.associate { it.second["uri"]!!.jsonPrimitive.content to it.second }
         val ra = byUri.getValue(documentUri(a))
@@ -222,7 +247,7 @@ class DocumentSyncTest : BasePlatformTestCase() {
         // A second restart replays again.
         sink.state.value = CoreState.STARTING
         sink.state.value = CoreState.READY
-        assertEquals(2, sink.take().size)
+        assertEquals(2, awaitCalls(2).size)
     }
 
     fun test_bulk_update_sends_whole_text() {
@@ -271,5 +296,101 @@ class DocumentSyncTest : BasePlatformTestCase() {
         assertEquals("shellscript", id("a.sh"))
         assertEquals("plaintext", id("notes.txt"))
         assertEquals("zig", id("a.ZIG"))
+    }
+
+    fun test_rename_closes_old_uri_and_opens_new() {
+        val file = myFixture.configureByText("old.py", "x = 1\n").virtualFile
+        val oldUri = documentUri(file)
+        val document = docOf(file)
+        edit(document) { insertString(0, "#") } // version 2
+        sink.take()
+
+        WriteCommandAction.runWriteCommandAction(project) { file.rename(this, "new.kt") }
+        val newUri = documentUri(file)
+        assertTrue(newUri, newUri.endsWith("/new.kt"))
+        val calls = sink.take()
+        assertEquals(listOf("textDocument/didClose", "textDocument/didOpen"), calls.map { it.first })
+        assertEquals(oldUri, calls[0].second["uri"]!!.jsonPrimitive.content)
+        val open = calls[1].second
+        assertEquals(newUri, open["uri"]!!.jsonPrimitive.content)
+        assertEquals("kotlin", open["languageId"]!!.jsonPrimitive.content)
+        // A new uri is a new document in the core: its version restarts at 1.
+        assertEquals(1, open["version"]!!.jsonPrimitive.int)
+        assertEquals("#x = 1\n", open["text"]!!.jsonPrimitive.content)
+        assertEquals(1, sync.versionOf(file))
+
+        edit(document) { insertString(0, "#") }
+        val change = sink.take().single()
+        assertEquals("textDocument/didChange", change.first)
+        assertEquals(newUri, change.second["uri"]!!.jsonPrimitive.content)
+        assertEquals(2, change.second["version"]!!.jsonPrimitive.int)
+
+        // Renaming its parent directory moves the uri too.
+        val dirFile = myFixture.addFileToProject("pkg/d.py", "d = 1\n").virtualFile
+        myFixture.openFileInEditor(dirFile)
+        val dirOldUri = documentUri(dirFile)
+        sink.take()
+        WriteCommandAction.runWriteCommandAction(project) { dirFile.parent.rename(this, "pkg2") }
+        val dirCalls = sink.take()
+        assertEquals(listOf("textDocument/didClose", "textDocument/didOpen"), dirCalls.map { it.first })
+        assertEquals(dirOldUri, dirCalls[0].second["uri"]!!.jsonPrimitive.content)
+        assertTrue(dirCalls[1].second["uri"]!!.jsonPrimitive.content.endsWith("/pkg2/d.py"))
+    }
+
+    fun test_move_out_of_content_closes() {
+        val file = myFixture.configureByText("m.py", "m = 1\n").virtualFile
+        val oldUri = documentUri(file)
+        sink.take()
+        val srcRoot = file.parent
+        val outside = WriteCommandAction.runWriteCommandAction<VirtualFile>(project) {
+            VfsUtil.createDirectoryIfMissing(srcRoot.parent, "localpilot-outside-content")
+        }
+        try {
+            WriteCommandAction.runWriteCommandAction(project) { file.move(this, outside) }
+            assertTrue(FileEditorManager.getInstance(project).isFileOpen(file))
+            val calls = sink.take()
+            assertEquals(listOf("textDocument/didClose"), calls.map { it.first })
+            assertEquals(oldUri, calls.single().second["uri"]!!.jsonPrimitive.content)
+            assertNull(sync.versionOf(file))
+            edit(docOf(file)) { insertString(0, "#") }
+            assertEquals(emptyList<Pair<String, JsonObject>>(), sink.take())
+        } finally {
+            FileEditorManager.getInstance(project).closeFile(file)
+            WriteCommandAction.runWriteCommandAction(project) { outside.delete(this) }
+        }
+    }
+
+    fun test_content_root_outside_workspace_is_not_synced() {
+        val dir = tempDir("localpilot-extra-root")
+        File(dir, "extra.py").writeText("e = 1\n")
+        val root = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(dir.toPath())!!
+        PsiTestUtil.addContentRoot(module, root)
+        try {
+            val file = root.findChild("extra.py")!!
+            assertTrue(ProjectFileIndex.getInstance(project).isInContent(file))
+            assertFalse(isSyncableFile(project, file, workspace))
+            myFixture.openFileInEditor(file)
+            edit(docOf(file)) { insertString(0, "#") }
+            assertNull(sync.versionOf(file))
+            assertEquals(emptyList<Pair<String, JsonObject>>(), sink.take())
+            FileEditorManager.getInstance(project).closeFile(file)
+        } finally {
+            PsiTestUtil.removeContentEntry(module, root)
+        }
+    }
+
+    fun test_setting_notebook_sync_opens_already_open_notebooks() {
+        val nb = myFixture.addFileToProject("open.ipynb", "{\"cells\": []}\n").virtualFile
+        myFixture.openFileInEditor(nb)
+        val opened = mutableListOf<VirtualFile>()
+        sync.notebookSync = object : NotebookSync {
+            override fun opened(file: VirtualFile, document: Document) { opened += file }
+            override fun changed(file: VirtualFile, event: DocumentEvent) = Unit
+            override fun saved(file: VirtualFile) = Unit
+            override fun closed(file: VirtualFile) = Unit
+            override fun replay() = Unit
+        }
+        assertEquals(listOf(nb), opened)
+        assertEquals(emptyList<Pair<String, JsonObject>>(), sink.take())
     }
 }

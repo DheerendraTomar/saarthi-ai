@@ -2,6 +2,7 @@ package dev.localpilot.sync
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.readAction
 import com.intellij.openapi.application.runReadActionBlocking
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
@@ -17,6 +18,11 @@ import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.newvfs.BulkFileListener
+import com.intellij.openapi.vfs.newvfs.events.VFileEvent
+import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent
+import com.intellij.openapi.vfs.newvfs.events.VFilePropertyChangeEvent
 import dev.localpilot.rpc.CoreProcess
 import dev.localpilot.rpc.CoreState
 import dev.localpilot.rpc.LocalPilotCore
@@ -28,6 +34,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.nio.file.Path
 
 /** Where document notifications go: the core in production, a recorder in tests. */
 interface DocumentSink {
@@ -80,6 +87,8 @@ class DocumentSyncListener(
     private val sink: DocumentSink,
     private val scope: CoroutineScope,
     private val parent: Disposable,
+    /** The core's `workspaceRoot`; only files strictly inside it are synced (see [isProjectFile]). */
+    private val workspace: Path? = workspaceOf(project),
 ) {
     private class Entry(val file: VirtualFile, val document: Document, val uri: String, val languageId: String) {
         /** 0 until first opened in the core. */
@@ -92,11 +101,22 @@ class DocumentSyncListener(
     private val lock = Any()
     private val byFile = HashMap<VirtualFile, Entry>()
     private val byDocument = HashMap<Document, Entry>()
-    private val notebooks = HashMap<Document, VirtualFile>()
+    /** Open notebooks: document → (file, the uri it was opened under, to detect renames/moves). */
+    private val notebooks = HashMap<Document, Pair<VirtualFile, String>>()
     @Volatile private var disposed = false
+    @Volatile private var installed = false
 
-    /** Set by Task 4 before [install]; null → notebooks are not synced. */
-    @Volatile var notebookSync: NotebookSync? = null
+    /**
+     * Set by Task 4 (ideally before [install]). Setting it after [install] hands every notebook that is already
+     * open to [NotebookSync.opened], so no open notebook is missed; null → notebooks are not synced.
+     */
+    @Volatile
+    var notebookSync: NotebookSync? = null
+        set(value) {
+            field = value
+            if (value == null || !installed || disposed) return
+            for (file in FileEditorManager.getInstance(project).openFiles) if (isNotebookFile(file)) fileOpened(file)
+        }
 
     /** The version last sent for [file], or null if the core does not have it open. */
     fun versionOf(file: VirtualFile): Int? = synchronized(lock) { byFile[file]?.takeIf { it.open }?.version }
@@ -128,7 +148,19 @@ class DocumentSyncListener(
                 override fun beforeDocumentSaving(document: Document) = documentSaving(document)
             },
         )
+        project.messageBus.connect(parent).subscribe(
+            VirtualFileManager.VFS_CHANGES,
+            object : BulkFileListener {
+                override fun after(events: List<VFileEvent>) {
+                    val relocated = events.any {
+                        it is VFileMoveEvent || (it is VFilePropertyChangeEvent && it.propertyName == VirtualFile.PROP_NAME)
+                    }
+                    if (relocated) filesRelocated()
+                }
+            },
+        )
         val initial = sink.state.value
+        installed = true
         for (file in FileEditorManager.getInstance(project).openFiles) fileOpened(file)
         val job = scope.launch {
             var previous = initial
@@ -142,12 +174,12 @@ class DocumentSyncListener(
 
     /** A file was opened in an editor of this project (or was already open at [install]). */
     fun fileOpened(file: VirtualFile) {
-        if (disposed || !isProjectFile(project, file)) return
+        if (disposed || !isProjectFile(project, file, workspace)) return
         runReadActionBlocking {
             val document = FileDocumentManager.getInstance().getDocument(file) ?: return@runReadActionBlocking
             if (isNotebookFile(file)) {
                 val nb = notebookSync ?: return@runReadActionBlocking
-                val isNew = synchronized(lock) { notebooks.put(document, file) == null }
+                val isNew = synchronized(lock) { notebooks.put(document, file to documentUri(file)) == null }
                 if (isNew) nb.opened(file, document)
                 return@runReadActionBlocking
             }
@@ -170,7 +202,7 @@ class DocumentSyncListener(
     /** The last editor of [file] in this project was closed. */
     fun fileClosed(file: VirtualFile) {
         val notebook = synchronized(lock) {
-            val doc = notebooks.entries.firstOrNull { it.value == file }?.key
+            val doc = notebooks.entries.firstOrNull { it.value.first == file }?.key
             if (doc != null) notebooks.remove(doc)
             doc != null
         }
@@ -185,10 +217,29 @@ class DocumentSyncListener(
         }
     }
 
+    /**
+     * After a VFS rename/move (of a file or of a directory above it): every open file whose uri changed is closed
+     * under its old uri and, if it is still open in an editor, re-gated and opened under the new one — as a new
+     * document, so its version restarts at 1. A file moved out of the project/workspace simply stays closed.
+     */
+    private fun filesRelocated() {
+        if (disposed) return
+        val relocated = synchronized(lock) {
+            byFile.values.filter { it.file.isValid && documentUri(it.file) != it.uri }.map { it.file } +
+                notebooks.values.filter { (file, uri) -> file.isValid && documentUri(file) != uri }.map { it.first }
+        }
+        if (relocated.isEmpty()) return
+        val editors = FileEditorManager.getInstance(project)
+        for (file in relocated) {
+            fileClosed(file)
+            if (editors.isFileOpen(file)) fileOpened(file)
+        }
+    }
+
     private fun documentChanged(event: DocumentEvent) {
         if (disposed) return
         val document = event.document
-        val notebookFile = synchronized(lock) { notebooks[document] }
+        val notebookFile = synchronized(lock) { notebooks[document]?.first }
         if (notebookFile != null) {
             notebookSync?.changed(notebookFile, event)
             return
@@ -199,8 +250,7 @@ class DocumentSyncListener(
                 entry.bulkDirty = true
                 return
             }
-            val change = if (event.isWholeTextReplaced) wholeText(document) else incrementalChange(event)
-            sendChange(entry, change)
+            sendChange(entry) { if (event.isWholeTextReplaced) wholeText(document) else incrementalChange(event) }
         }
     }
 
@@ -210,12 +260,15 @@ class DocumentSyncListener(
             val entry = byDocument[document] ?: return
             if (!entry.bulkDirty) return
             entry.bulkDirty = false
-            sendChange(entry, wholeText(document))
+            sendChange(entry) { wholeText(document) }
         }
     }
 
-    /** Must hold [lock]. A change that crosses [MAX_SYNC_CHARS] closes or (re)opens the document instead. */
-    private fun sendChange(entry: Entry, change: JsonObject) {
+    /**
+     * Must hold [lock]. A change that crosses [MAX_SYNC_CHARS] closes or (re)opens the document instead; [change]
+     * is only built for a document the core has open (no work for an oversized one).
+     */
+    private fun sendChange(entry: Entry, change: () -> JsonObject) {
         val tooBig = entry.document.textLength > MAX_SYNC_CHARS
         when {
             entry.open && tooBig -> {
@@ -228,7 +281,7 @@ class DocumentSyncListener(
                 sink.notify(DID_CHANGE, buildJsonObject {
                     put("uri", entry.uri)
                     put("version", entry.version)
-                    put("contentChanges", buildJsonArray { add(change) })
+                    put("contentChanges", buildJsonArray { add(change()) })
                 })
             }
             !tooBig -> {
@@ -241,7 +294,7 @@ class DocumentSyncListener(
 
     private fun documentSaving(document: Document) {
         if (disposed) return
-        val notebookFile = synchronized(lock) { notebooks[document] }
+        val notebookFile = synchronized(lock) { notebooks[document]?.first }
         if (notebookFile != null) {
             notebookSync?.saved(notebookFile)
             return
@@ -252,15 +305,21 @@ class DocumentSyncListener(
         }
     }
 
-    /** Re-sends `didOpen` (current text, current version) for everything tracked. */
-    fun replay() {
+    /**
+     * Re-sends `didOpen` (current text, current version) for everything tracked. The entries are snapshotted under
+     * [lock]; each document is then serialised and sent in its own cancellable read action (so a pending write
+     * action — typing — waits for at most one document), skipping entries closed in the meantime.
+     */
+    suspend fun replay() {
         if (disposed) return
-        runReadActionBlocking {
-            synchronized(lock) {
-                for (entry in byFile.values) if (entry.open) sendOpen(entry)
+        val entries = synchronized(lock) { byFile.values.toList() }
+        for (entry in entries) {
+            readAction {
+                synchronized(lock) { if (!disposed && byFile[entry.file] === entry && entry.open) sendOpen(entry) }
             }
-            if (synchronized(lock) { notebooks.isNotEmpty() }) notebookSync?.replay()
         }
+        val nb = notebookSync ?: return
+        if (synchronized(lock) { notebooks.isNotEmpty() }) readAction { nb.replay() }
     }
 
     /** Must hold [lock] and a read action. */
@@ -329,6 +388,7 @@ class DocumentSyncService(private val project: Project, private val cs: Coroutin
         CoreDocumentSink(LocalPilotCore.getInstance(project).process),
         cs,
         this,
+        LocalPilotCore.getInstance(project).workspace,
     ).also {
         listener = it
         it.install()

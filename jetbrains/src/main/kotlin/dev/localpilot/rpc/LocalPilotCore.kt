@@ -14,6 +14,7 @@ import dev.localpilot.settings.LocalPilotSettingsListener
 import dev.localpilot.settings.coreInitSettings
 import dev.localpilot.settings.resolveBinaryPath
 import dev.localpilot.settings.sameCoreSettings
+import dev.localpilot.sync.workspaceOf
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -34,7 +35,7 @@ class LocalPilotCore(private val project: Project, private val cs: CoroutineScop
     private val settings = LocalPilotSettings.getInstance()
 
     /** The project folder; null for a project without one → the core is never launched (start() fails, state CRASHED). */
-    val workspace: Path? = project.basePath?.let { Path.of(it) }
+    val workspace: Path? = workspaceOf(project)
 
     /** Settings-change restarts, conflated: a burst of changes (or changes during a restart) yields one more restart. */
     private val restartRequests = Channel<Unit>(Channel.CONFLATED)
