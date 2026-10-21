@@ -1,14 +1,15 @@
-# Ship only the bundle, the bundled core binary, media and the manifest.
+# Everything not listed here ships in the .vsix: bin/, media/, out/extension.js,
+# package.json, README.md, CHANGELOG.md.
 src/**
 test/**
+out-test/**
 node_modules/**
-**/*.ts
-**/*.map
+.vscode-test/**
+.gitignore
 esbuild.mjs
 eslint.config.mjs
-vitest.config.ts
 tsconfig.json
+vitest.config.ts
+**/*.map
+**/*.ts
 .vscode/**
-!bin/**
-!media/**
-!out/**
