@@ -134,8 +134,9 @@ function isFullText(params: unknown): boolean {
  * Notifications sent before the first connection, in order, keeping at most
  * what the core needs per document (`textDocument/*`, keyed on `params.uri`):
  * - `didOpen` replaces everything queued for its uri;
- * - a full-text `didChange` is folded into a queued `didOpen` (text, version),
- *   or replaces a queued full-text `didChange`; incremental ones are appended;
+ * - a full-text `didChange` drops every queued `didChange` for its uri and is
+ *   folded into a queued `didOpen` (text, version) or else appended;
+ *   incremental ones are appended;
  * - `didClose` drops everything queued for its uri, and is itself dropped
  *   when the `didOpen` was still queued;
  * - `didSave` replaces a queued `didSave`.
@@ -162,6 +163,8 @@ export class NotificationQueue {
         break;
       case 'textDocument/didChange': {
         if (!isFullText(params)) break;
+        // A full text supersedes every queued change for the uri.
+        this.remove(forUri('textDocument/didChange'));
         const open = this.items.find(forUri('textDocument/didOpen'));
         if (open) {
           const changes = (params as { contentChanges: Array<{ text: string }> }).contentChanges;
@@ -169,7 +172,6 @@ export class NotificationQueue {
           open[1] = { ...(open[1] as object), text: changes[changes.length - 1].text, ...(version !== undefined ? { version } : {}) };
           return;
         }
-        this.remove(forUri('textDocument/didChange'));
         break;
       }
       case 'textDocument/didClose': {

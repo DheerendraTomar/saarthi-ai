@@ -1,7 +1,7 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { IStatusBar } from '@jupyterlab/statusbar';
-import { DisposableDelegate, DisposableSet } from '@lumino/disposable';
+import { DisposableSet } from '@lumino/disposable';
 import { WsCoreClient } from './client';
 import { PLUGIN_ID, readSettings, restartCore, watchSettings, type Settings } from './settings';
 import { StatusItem } from './status';
@@ -18,7 +18,7 @@ export { StatusItem } from './status';
  * provider (Task 4) and the chat sidebar and commands (Task 5) hang off the
  * client created here.
  */
-/** Everything the plugin set up; disposed on `deactivate` and on page unload. */
+/** Everything the plugin set up; disposed on `deactivate`. */
 let active: DisposableSet | undefined;
 
 const plugin: JupyterFrontEndPlugin<void> = {
@@ -33,33 +33,34 @@ const plugin: JupyterFrontEndPlugin<void> = {
     let settings: Settings = readSettings(pluginSettings);
 
     active?.dispose();
+    // Lumino's DisposableSet disposes in insertion order: subscriptions, the
+    // watcher and the status-bar registration go in first, the client and the
+    // status item last.
     const disposables = (active = new DisposableSet());
 
     const client = new WsCoreClient({ serverSettings, settings: () => settings });
     const status = new StatusItem();
     status.setCompletionsEnabled(settings.completionsEnabled);
-    // Disposed in reverse order: subscriptions first, the client and status item last.
-    disposables.add(status);
-    disposables.add(client);
     disposables.add(client.onStatus((s) => status.setStatus(s)));
     disposables.add(client.onStateChanged((state) => status.setConnectionState(state, client.lastError?.message)));
 
-    const watcher = watchSettings(pluginSettings, {
-      onChange: (s) => {
-        settings = s;
-        status.setCompletionsEnabled(s.completionsEnabled);
-      },
-      restart: async (s) => {
-        try {
-          await restartCore(serverSettings, s);
-        } finally {
-          // A running core's exit closes our socket (1012) and the client
-          // reconnects by itself; a crashed one never had a socket to close.
-          if (client.state === 'crashed') client.reconnect();
+    disposables.add(
+      watchSettings(pluginSettings, {
+        onChange: (s) => {
+          settings = s;
+          status.setCompletionsEnabled(s.completionsEnabled);
+        },
+        restart: async (s) => {
+          try {
+            await restartCore(serverSettings, s);
+          } finally {
+            // A running core's exit closes our socket (1012) and the client
+            // reconnects by itself; a crashed one never had a socket to close.
+            if (client.state === 'crashed') client.reconnect();
+          }
         }
-      }
-    });
-    disposables.add(watcher);
+      })
+    );
 
     const statusRegistration = statusBar?.registerStatusItem(`${PLUGIN_ID}:status`, {
       item: status,
@@ -68,10 +69,11 @@ const plugin: JupyterFrontEndPlugin<void> = {
     });
     if (statusRegistration) disposables.add(statusRegistration);
 
-    // Close the socket cleanly when the tab goes away (the server then releases this tab's documents).
-    const onUnload = () => disposables.dispose();
-    window.addEventListener('beforeunload', onUnload);
-    disposables.add(new DisposableDelegate(() => window.removeEventListener('beforeunload', onUnload)));
+    // No beforeunload disposal: it fires before the user can choose "Stay"
+    // (JupyterLab prompts on unsaved work). On a real unload the browser closes
+    // the socket and the server's tab-close cleanup releases this tab's state.
+    disposables.add(client);
+    disposables.add(status);
 
     client.start();
   },

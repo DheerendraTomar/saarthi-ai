@@ -296,6 +296,11 @@ describe('WsCoreClient', () => {
     expect(q.length).toBe(2);
     q.push('textDocument/didClose', { uri: 'u' });
     expect(q.drain()).toEqual([['textDocument/didClose', { uri: 'u' }]]);
+    // A full text folded into a queued didOpen also supersedes queued incremental changes.
+    q.push('textDocument/didOpen', { uri: 'v', version: 1, text: 'a' });
+    q.push('textDocument/didChange', { uri: 'v', version: 2, contentChanges: [{ range, text: 'b' }] });
+    q.push('textDocument/didChange', { uri: 'v', version: 3, contentChanges: [{ text: 'full' }] });
+    expect(q.drain()).toEqual([['textDocument/didOpen', { uri: 'v', version: 3, text: 'full' }]]);
   });
 
   it('initialize_unanswered_for_30s_is_a_disconnect', async () => {
