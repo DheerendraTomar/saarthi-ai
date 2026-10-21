@@ -699,3 +699,88 @@ async fn session_deletion_over_stdio() {
 
     core.shutdown().await;
 }
+
+#[tokio::test]
+async fn accepted_rejected_notifications_map_to_outcomes() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder".to_owned(), "chat".to_owned()],
+        generate: vec![vec![
+            generate_chunk("a"),
+            generate_chunk(" + b"),
+            generate_done(),
+        ]],
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+    open_main(&mut core, &ws).await;
+    for id in ["r1", "r2", "r3", "r4"] {
+        let served = core
+            .call("completion/request", complete_params(&ws, id))
+            .await;
+        assert_eq!(served["items"][0]["text"], "a + b", "{served}");
+    }
+
+    core.notify("completion/accepted", json!({"requestId": "r1"}))
+        .await;
+    core.notify("completion/rejected", json!({"requestId": "r2"}))
+        .await;
+    // Invalid outcome and unknown request: ignored, nothing logged.
+    core.notify(
+        "completion/outcome",
+        json!({"requestId": "r3", "outcome": "maybe"}),
+    )
+    .await;
+    core.notify(
+        "completion/outcome",
+        json!({"requestId": "nope", "outcome": "accepted"}),
+    )
+    .await;
+    core.notify(
+        "completion/outcome",
+        json!({"requestId": "r3", "outcome": "partial", "acceptedText": "a"}),
+    )
+    .await;
+    core.notify(
+        "completion/outcome",
+        json!({"requestId": "r4", "outcome": "typedThrough"}),
+    )
+    .await;
+
+    let log = ws.root.join(".localpilot/completions.jsonl");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let records: Vec<Value> = loop {
+        let raw = std::fs::read_to_string(&log).unwrap_or_default();
+        if raw.lines().count() >= 4 || tokio::time::Instant::now() > deadline {
+            break raw
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let got: Vec<(&str, &str, Option<&str>)> = records
+        .iter()
+        .map(|r| {
+            (
+                r["requestId"].as_str().unwrap(),
+                r["outcome"].as_str().unwrap(),
+                r["acceptedText"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("r1", "accepted", None),
+            ("r2", "rejected", None),
+            ("r3", "partial", Some("a")),
+            ("r4", "typedThrough", None),
+        ]
+    );
+    assert!(records.iter().all(|r| r["lang"] == "python"));
+
+    core.shutdown().await;
+}

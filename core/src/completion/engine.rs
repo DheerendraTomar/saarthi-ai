@@ -19,6 +19,14 @@
 //! identical `(uri, prefix, suffix)` request joins the running generation.
 //! The HTTP stream is dropped when the [`Trimmer`] stops, when the last
 //! waiting requester is cancelled (or dropped), or when completions pause.
+//!
+//! **Outcome log.** With a [`FeedbackLog`] set, every served suggestion is
+//! kept as a pending [`Record`] until `completion/outcome` (or
+//! `completion/accepted|rejected`) names it, then appended with that
+//! outcome. A pending record with no outcome after [`OUTCOME_TIMEOUT`] (or
+//! pushed out by [`PENDING_MEMORY`] newer ones) is appended as `rejected`;
+//! expiry is checked lazily whenever a suggestion is served or an outcome
+//! arrives. Log I/O happens after every engine lock is released.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -31,6 +39,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::cache::{self, CompletionCache};
+use super::feedback::{self, FeedbackLog, Outcome as LogOutcome, Record};
 use super::prompt::{self, FimPrompt, WINDOW_BUDGET};
 use super::stop::{self, StopMode, Trimmer};
 use crate::index::related::{self, Snippet};
@@ -52,6 +61,11 @@ pub const MAX_DOCUMENT_BYTES: usize = 1 << 20;
 pub const SNIPPET_WINDOW_LINES: usize = 40;
 /// Served request ids remembered for `completion/accepted|rejected`.
 const SERVED_MEMORY: usize = 64;
+/// A served suggestion with no outcome after this long is logged `rejected`.
+pub const OUTCOME_TIMEOUT: Duration = Duration::from_secs(60);
+/// At most this many suggestions await an outcome; older ones are logged
+/// `rejected`.
+pub const PENDING_MEMORY: usize = 64;
 
 /// `(uri, prefix, suffix)` exactly as sent to the model.
 type Key = (String, String, String);
@@ -80,10 +94,20 @@ struct Inner {
     requests: Mutex<HashMap<String, CancellationToken>>,
     /// Recently served request ids and their cache keys, oldest first.
     served: Mutex<VecDeque<(String, Key)>>,
+    /// Where outcomes are logged; `None` logs nothing.
+    feedback: Mutex<Option<Arc<FeedbackLog>>>,
+    /// Served suggestions awaiting their outcome, oldest first.
+    pending: Mutex<VecDeque<Pending>>,
     last_status: Mutex<Option<OllamaStatus>>,
     snippet_refreshes: AtomicUsize,
     next_refresh: AtomicU64,
     next_flight: AtomicU64,
+}
+
+/// A logged-to-be suggestion; `record.outcome` is filled in on outcome.
+struct Pending {
+    served_at: Instant,
+    record: Record,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +200,8 @@ impl CompletionEngine {
                 inflight: Mutex::new(HashMap::new()),
                 requests: Mutex::new(HashMap::new()),
                 served: Mutex::new(VecDeque::new()),
+                feedback: Mutex::new(None),
+                pending: Mutex::new(VecDeque::new()),
                 last_status: Mutex::new(None),
                 snippet_refreshes: AtomicUsize::new(0),
                 next_refresh: AtomicU64::new(0),
@@ -221,6 +247,8 @@ impl CompletionEngine {
         cancel: CancellationToken,
         timing: Option<Arc<TimingSink>>,
     ) -> Result<CompletionResult, RpcError> {
+        let started_at = Instant::now();
+        let timing = timing.unwrap_or_default();
         let inner = &self.inner;
         let settings = inner.settings.clone();
         if !settings.completions_enabled || self.is_paused() {
@@ -234,6 +262,12 @@ impl CompletionEngine {
             return Ok(CompletionResult::default());
         };
         let key = prepared.key.clone();
+        // Captured before `prepared` moves into the generation.
+        let draft = self.feedback_log().is_some().then(|| Draft {
+            lang: Lang::from_path(&uri_to_path(&params.uri)).as_str(),
+            prompt_hash: feedback::prompt_hash(&prepared.prompt.prompt, &prepared.prompt.suffix),
+            context_tail: feedback::context_tail(&key.1),
+        });
 
         let mut served_key = key.clone();
         let cached = self
@@ -247,7 +281,9 @@ impl CompletionEngine {
                 hit.text
             }
             None => {
-                let Some(mut waiter) = join_or_start(inner, prepared, &settings, timing) else {
+                let Some(mut waiter) =
+                    join_or_start(inner, prepared, &settings, Some(timing.clone()))
+                else {
                     return Ok(CompletionResult::default());
                 };
                 let outcome = tokio::select! {
@@ -268,6 +304,24 @@ impl CompletionEngine {
             return Ok(CompletionResult::default());
         }
         remember_served(inner, &params.request_id, served_key);
+        if let Some(draft) = draft {
+            let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+            let first_token_at = *lock(&timing.first_token_at);
+            let record = Record {
+                ts: feedback::now_ms(),
+                request_id: params.request_id.clone(),
+                lang: draft.lang.to_owned(),
+                prompt_hash: draft.prompt_hash,
+                context_tail: draft.context_tail,
+                lines: feedback::line_count(&text),
+                suggestion: text.clone(),
+                outcome: LogOutcome::Rejected,
+                accepted_text: None,
+                ttft_ms: first_token_at.map(|t| ms(t.saturating_duration_since(started_at))),
+                total_ms: ms(started_at.elapsed()),
+            };
+            self.add_pending(record);
+        }
         let at = params.position;
         Ok(CompletionResult {
             items: vec![CompletionItem {
@@ -313,16 +367,97 @@ impl CompletionEngine {
         lock(&self.inner.last_status).clone()
     }
 
-    /// The suggestion served for `request_id` was accepted.
+    /// The suggestion served for `request_id` was accepted
+    /// (`completion/accepted`).
     pub fn on_accepted(&self, request_id: &str) {
-        take_served(&self.inner, request_id);
+        self.on_outcome(request_id, LogOutcome::Accepted, None);
     }
 
-    /// The suggestion served for `request_id` was dismissed: forget it so it
-    /// is not offered again from the cache.
+    /// The suggestion served for `request_id` was dismissed
+    /// (`completion/rejected`).
     pub fn on_rejected(&self, request_id: &str) {
-        if let Some((uri, prefix, suffix)) = take_served(&self.inner, request_id) {
+        self.on_outcome(request_id, LogOutcome::Rejected, None);
+    }
+
+    /// `completion/outcome`: logs the pending suggestion of `request_id`
+    /// with `outcome` (no-op if it is unknown, already logged or expired).
+    /// A rejected suggestion is also dropped from the cache so it is not
+    /// offered again.
+    pub fn on_outcome(&self, request_id: &str, outcome: LogOutcome, accepted_text: Option<String>) {
+        let taken = take_served(&self.inner, request_id);
+        if outcome == LogOutcome::Rejected
+            && let Some((uri, prefix, suffix)) = taken
+        {
             lock(&self.inner.cache).remove(&uri, &prefix, &suffix);
+        }
+        let mut done = Vec::new();
+        {
+            let mut pending = lock(&self.inner.pending);
+            // The named one first, so a late answer is not expired away.
+            let named = pending
+                .iter()
+                .position(|p| p.record.request_id == request_id)
+                .and_then(|at| pending.remove(at));
+            expire(&mut pending, Instant::now(), &mut done);
+            if let Some(mut p) = named {
+                p.record.outcome = outcome;
+                p.record.accepted_text = accepted_text;
+                done.push(p.record);
+            }
+        }
+        self.write_log(&done);
+    }
+
+    /// Logs outcomes to `log` from now on.
+    pub fn set_feedback_log(&self, log: Arc<FeedbackLog>) {
+        *lock(&self.inner.feedback) = Some(log);
+    }
+
+    /// The outcome log, if one is set.
+    pub fn feedback_log(&self) -> Option<Arc<FeedbackLog>> {
+        lock(&self.inner.feedback).clone()
+    }
+
+    /// Queues `record` until its outcome arrives, logging expired ones.
+    fn add_pending(&self, record: Record) {
+        let mut done = Vec::new();
+        {
+            let mut pending = lock(&self.inner.pending);
+            let now = Instant::now();
+            expire(&mut pending, now, &mut done);
+            if pending.len() == PENDING_MEMORY
+                && let Some(oldest) = pending.pop_front()
+            {
+                done.push(oldest.record);
+            }
+            pending.push_back(Pending {
+                served_at: now,
+                record,
+            });
+        }
+        self.write_log(&done);
+    }
+
+    fn write_log(&self, records: &[Record]) {
+        if records.is_empty() {
+            return;
+        }
+        let Some(log) = self.feedback_log() else {
+            return;
+        };
+        for record in records {
+            if let Err(err) = log.append(record) {
+                tracing::warn!(path = %log.path().display(), %err, "cannot write the completion log");
+                return;
+            }
+        }
+    }
+
+    /// Makes every pending suggestion `by` older.
+    #[cfg(test)]
+    fn age_pending(&self, by: Duration) {
+        for p in lock(&self.inner.pending).iter_mut() {
+            p.served_at -= by;
         }
     }
 
@@ -768,6 +903,27 @@ fn remember_served(inner: &Inner, request_id: &str, key: Key) {
     served.push_back((request_id.to_owned(), key));
 }
 
+/// What a pending [`Record`] needs from the prompt, taken before the
+/// prompt is handed to the generation.
+struct Draft {
+    lang: &'static str,
+    prompt_hash: String,
+    context_tail: String,
+}
+
+/// Moves the pending suggestions older than [`OUTCOME_TIMEOUT`] (the
+/// oldest are at the front) to `done`, as `rejected`.
+fn expire(pending: &mut VecDeque<Pending>, now: Instant, done: &mut Vec<Record>) {
+    while pending
+        .front()
+        .is_some_and(|p| now.saturating_duration_since(p.served_at) >= OUTCOME_TIMEOUT)
+    {
+        if let Some(p) = pending.pop_front() {
+            done.push(p.record); // already `Rejected`
+        }
+    }
+}
+
 fn take_served(inner: &Inner, request_id: &str) -> Option<Key> {
     let mut served = lock(&inner.served);
     let at = served.iter().position(|(id, _)| id == request_id)?;
@@ -1045,6 +1201,93 @@ mod tests {
         assert_eq!(cold.snippet_block(), "");
         f.engine.wait_snippets_settled(&f.uri).await;
         assert_eq!(f.engine.snippet_refresh_count(), 3);
+    }
+
+    /// Serves `request_id` from a primed cache entry (no model call).
+    async fn serve_cached(f: &Fixture, request_id: &str, at: Position) {
+        let p = f.engine.prepare(&f.uri, at).await.unwrap();
+        lock(&f.engine.inner.cache).put(&p.key.0, &p.key.1, &p.key.2, "t)");
+        let params = CompletionRequestParams {
+            uri: f.uri.clone(),
+            position: at,
+            request_id: request_id.to_owned(),
+        };
+        let served = f
+            .engine
+            .request(params, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(served.items[0].text, "t)");
+    }
+
+    #[tokio::test]
+    async fn unanswered_outcome_expires_as_rejected() {
+        use super::super::feedback::{FeedbackLog, Outcome};
+        let f = fixture(MAIN);
+        let log = Arc::new(FeedbackLog::for_workspace(f._dir.path()));
+        f.engine.set_feedback_log(log.clone());
+        let at = Position {
+            line: 3,
+            character: 11,
+        };
+        let ids = |log: &FeedbackLog| -> Vec<(String, Outcome)> {
+            log.records()
+                .into_iter()
+                .map(|r| (r.request_id, r.outcome))
+                .collect()
+        };
+
+        serve_cached(&f, "r1", at).await;
+        f.engine
+            .age_pending(OUTCOME_TIMEOUT - Duration::from_secs(1));
+        serve_cached(&f, "r2", at).await;
+        assert!(ids(&log).is_empty(), "r1 has 1 s left");
+
+        f.engine.age_pending(Duration::from_secs(2));
+        // r1 is now 61 s old, r2 2 s: the next outcome expires r1 first.
+        f.engine.on_outcome("r2", Outcome::Accepted, None);
+        assert_eq!(
+            ids(&log),
+            [
+                ("r1".to_owned(), Outcome::Rejected),
+                ("r2".to_owned(), Outcome::Accepted)
+            ]
+        );
+        let expired = &log.records()[0];
+        assert_eq!(expired.accepted_text, None);
+        assert_eq!(expired.suggestion, "t)");
+        assert_eq!(expired.lang, "python");
+
+        // A late outcome for the expired request adds nothing.
+        f.engine.on_outcome("r1", Outcome::Accepted, None);
+        assert_eq!(log.records().len(), 2);
+
+        // Expiry also runs when the next suggestion is served.
+        serve_cached(&f, "r3", at).await;
+        f.engine.age_pending(OUTCOME_TIMEOUT);
+        serve_cached(&f, "r4", at).await;
+        assert_eq!(ids(&log)[2..], [("r3".to_owned(), Outcome::Rejected)]);
+
+        // More unanswered suggestions than are remembered: the oldest are
+        // logged as rejected rather than dropped.
+        for i in 0..PENDING_MEMORY {
+            serve_cached(&f, &format!("burst{i}"), at).await;
+        }
+        let records = ids(&log);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[3], ("r4".to_owned(), Outcome::Rejected));
+    }
+
+    #[tokio::test]
+    async fn no_log_when_none_is_set() {
+        let f = fixture(MAIN);
+        let at = Position {
+            line: 3,
+            character: 11,
+        };
+        serve_cached(&f, "r1", at).await;
+        f.engine.on_accepted("r1");
+        assert!(!f._dir.path().join(".localpilot").exists());
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 
 pub mod cache;
 pub mod engine;
+pub mod feedback;
 pub mod prompt;
 pub mod stop;
 

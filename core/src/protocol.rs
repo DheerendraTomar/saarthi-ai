@@ -53,6 +53,7 @@ pub mod methods {
     pub const COMPLETION_CANCEL: &str = "completion/cancel";
     pub const COMPLETION_ACCEPTED: &str = "completion/accepted";
     pub const COMPLETION_REJECTED: &str = "completion/rejected";
+    pub const COMPLETION_OUTCOME: &str = "completion/outcome";
 
     // Core → client notifications.
     pub const CHAT_TOKEN: &str = "chat/token";
@@ -234,6 +235,28 @@ pub struct CompletionAcceptedParams {
 #[serde(rename_all = "camelCase")]
 pub struct CompletionRejectedParams {
     pub request_id: String,
+}
+
+/// What the user did with a served suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompletionOutcome {
+    Accepted,
+    Partial,
+    Rejected,
+    TypedThrough,
+}
+
+/// `completion/outcome`: the richer form of `completion/accepted` /
+/// `completion/rejected`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionOutcomeParams {
+    pub request_id: String,
+    pub outcome: CompletionOutcome,
+    /// The part of the suggestion the user kept (e.g. for `partial`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_text: Option<String>,
 }
 
 // ---------------------------------------------------------------- chat requests
@@ -594,6 +617,7 @@ mod tests {
         assert_eq!(methods::COMPLETION_CANCEL, "completion/cancel");
         assert_eq!(methods::COMPLETION_ACCEPTED, "completion/accepted");
         assert_eq!(methods::COMPLETION_REJECTED, "completion/rejected");
+        assert_eq!(methods::COMPLETION_OUTCOME, "completion/outcome");
         assert_eq!(methods::CHAT_SEND, "chat/send");
         assert_eq!(methods::CHAT_STOP, "chat/stop");
         assert_eq!(methods::CHAT_APPROVE, "chat/approve");
@@ -786,6 +810,23 @@ mod tests {
             }
         );
         assert_eq!(p.request_id, "r1");
+
+        let p: CompletionOutcomeParams = serde_json::from_value(json!({
+            "requestId": "r1", "outcome": "partial", "acceptedText": "a +"
+        }))
+        .unwrap();
+        assert_eq!(p.outcome, CompletionOutcome::Partial);
+        assert_eq!(p.accepted_text.as_deref(), Some("a +"));
+        let p: CompletionOutcomeParams =
+            serde_json::from_value(json!({"requestId": "r2", "outcome": "typedThrough"})).unwrap();
+        assert_eq!(p.outcome, CompletionOutcome::TypedThrough);
+        assert_eq!(p.accepted_text, None);
+        assert!(
+            serde_json::from_value::<CompletionOutcomeParams>(
+                json!({"requestId": "r3", "outcome": "maybe"})
+            )
+            .is_err()
+        );
 
         let p: ChatSendParams = serde_json::from_value(json!({
             "sessionId": "s", "message": "hi",

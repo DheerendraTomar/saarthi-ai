@@ -52,6 +52,20 @@ impl Lang {
             _ => Lang::Other,
         }
     }
+
+    /// Stable lower-case name (the key of the completion outcome log).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lang::Python => "python",
+            Lang::JavaScript => "javascript",
+            Lang::TypeScript => "typescript",
+            Lang::Rust => "rust",
+            Lang::Go => "go",
+            Lang::Java => "java",
+            Lang::Kotlin => "kotlin",
+            Lang::Other => "other",
+        }
+    }
 }
 
 /// Common keywords across the supported languages; never reported as

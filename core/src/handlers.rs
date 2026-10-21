@@ -28,16 +28,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentRunner, TurnReservation};
 use crate::completion::CompletionEngine;
+use crate::completion::feedback::FeedbackLog;
 use crate::index::{WorkspaceIndex, watcher};
 use crate::ollama::{OllamaClient, OllamaError, OllamaState, OllamaStatus, PullProgress};
 use crate::overlay::{DocumentStore, normalize_path, uri_to_path};
 use crate::protocol::{
     Capabilities, ChatApproveParams, ChatDeleteSessionParams, ChatDone, ChatHistoryParams,
     ChatListSessionsResult, ChatNewSessionResult, ChatSendParams, ChatSendResult, ChatStopParams,
-    CompletionAcceptedParams, CompletionCancelParams, CompletionRejectedParams,
-    CompletionRequestParams, DidChangeParams, DidCloseParams, DidOpenParams, DidSaveParams,
-    IndexReady, IndexStatus, InitializeParams, InitializeResult, OllamaModelsResult,
-    OllamaPullParams, OllamaPullProgress, OllamaPullResult, StopReason, methods,
+    CompletionAcceptedParams, CompletionCancelParams, CompletionOutcomeParams,
+    CompletionRejectedParams, CompletionRequestParams, DidChangeParams, DidCloseParams,
+    DidOpenParams, DidSaveParams, IndexReady, IndexStatus, InitializeParams, InitializeResult,
+    OllamaModelsResult, OllamaPullParams, OllamaPullProgress, OllamaPullResult, StopReason,
+    methods,
 };
 use crate::rpc::{Ctx, Handler, RpcError};
 use crate::settings::Settings;
@@ -213,6 +215,7 @@ impl AppHandler {
             index.clone(),
             settings.clone(),
         ));
+        completion.set_feedback_log(Arc::new(FeedbackLog::for_workspace(&client)));
         let agent = Arc::new(AgentRunner::new(
             ollama.clone(),
             store.clone(),
@@ -388,6 +391,11 @@ impl AppHandler {
                 .map(|p| state.completion.on_accepted(&p.request_id)),
             methods::COMPLETION_REJECTED => parse::<CompletionRejectedParams>(params)
                 .map(|p| state.completion.on_rejected(&p.request_id)),
+            methods::COMPLETION_OUTCOME => parse::<CompletionOutcomeParams>(params).map(|p| {
+                state
+                    .completion
+                    .on_outcome(&p.request_id, p.outcome, p.accepted_text)
+            }),
             _ => {
                 tracing::warn!(method, "ignoring unknown notification");
                 return;

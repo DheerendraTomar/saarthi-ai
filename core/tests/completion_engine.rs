@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use localpilot_core::completion::CompletionEngine;
+use localpilot_core::completion::feedback::{self, FeedbackLog, Outcome};
 use localpilot_core::index::WorkspaceIndex;
 use localpilot_core::ollama::{OllamaClient, OllamaState};
 use localpilot_core::overlay::{DocumentStore, path_to_uri};
@@ -32,6 +33,7 @@ struct Env {
     engine: Arc<CompletionEngine>,
     store: Arc<RwLock<DocumentStore>>,
     uri: String,
+    root: PathBuf,
     _dir: TempDir,
 }
 
@@ -50,6 +52,7 @@ async fn setup_full(script: Script, text: &str, tweak: impl FnOnce(&mut Settings
     let dir = tempfile::tempdir().unwrap();
     let root: PathBuf = dir.path().canonicalize().unwrap();
     let path = root.join("main.py");
+    let root_out = root.clone();
     std::fs::write(&path, text).unwrap();
     let uri = path_to_uri(&path);
     let mut store = DocumentStore::new(root.clone());
@@ -74,6 +77,7 @@ async fn setup_full(script: Script, text: &str, tweak: impl FnOnce(&mut Settings
         engine,
         store,
         uri,
+        root: root_out,
         _dir: dir,
     }
 }
@@ -468,4 +472,99 @@ async fn request_timed_stamps_send_first_chunk_and_done_in_order() {
         .await;
     assert!(hit.prepared_at.is_none() && hit.first_token_at.is_none());
     assert!(hit.started_at <= hit.done_at);
+}
+
+#[tokio::test]
+async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
+    // Far more than 200 characters before the cursor, with sentinels both
+    // far above the cursor and after it: neither may reach the log.
+    let text = format!(
+        "# FAR_SENTINEL {}\ndef add(a, b):\n    return \n\nprint(add(1, 2))  # SUFFIX_SENTINEL\n",
+        "x".repeat(300)
+    );
+    let env = setup_with(add_script(), &text).await;
+    let log = Arc::new(FeedbackLog::for_workspace(&env.root));
+    env.engine.set_feedback_log(log.clone());
+    let at = Position {
+        line: 2,
+        character: 11,
+    };
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(texts(&complete(&env, "r1", at).await), ["a + b"]);
+    assert!(
+        log.records().is_empty(),
+        "logged only once the outcome is known"
+    );
+
+    env.engine
+        .on_outcome("r1", Outcome::Partial, Some("a".to_owned()));
+    let raw = std::fs::read_to_string(log.path()).unwrap();
+    assert_eq!(raw.lines().count(), 1, "{raw}");
+    for leaked in ["FAR_SENTINEL", "SUFFIX_SENTINEL", "print(add", "# "] {
+        assert!(!raw.contains(leaked), "{leaked:?} leaked into {raw}");
+    }
+    let record: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    let mut keys: Vec<&String> = record.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "acceptedText",
+            "contextTail",
+            "lang",
+            "lines",
+            "outcome",
+            "promptHash",
+            "requestId",
+            "suggestion",
+            "totalMs",
+            "ts",
+            "ttftMs"
+        ],
+        "{record}"
+    );
+    let tail = record["contextTail"].as_str().unwrap();
+    assert!(tail.chars().count() <= feedback::CONTEXT_TAIL_CHARS);
+    assert_eq!(tail.chars().count(), feedback::CONTEXT_TAIL_CHARS);
+    assert!(tail.ends_with("x\ndef add(a, b):\n    return "), "{tail:?}");
+    assert_eq!(record["requestId"], "r1");
+    assert_eq!(record["lang"], "python");
+    assert_eq!(record["suggestion"], "a + b");
+    assert_eq!(record["lines"], 1);
+    assert_eq!(record["outcome"], "partial");
+    assert_eq!(record["acceptedText"], "a");
+    let body = &generate_bodies(&env.mock)[0];
+    assert_eq!(
+        record["promptHash"],
+        feedback::prompt_hash(
+            body["prompt"].as_str().unwrap(),
+            body["suffix"].as_str().unwrap()
+        )
+    );
+    let ttft = record["ttftMs"].as_u64().expect("generation started here");
+    assert!(ttft <= record["totalMs"].as_u64().unwrap());
+    assert!(record["ts"].as_u64().unwrap() >= before);
+
+    // Nothing else is written to the state dir.
+    let mut files: Vec<String> = std::fs::read_dir(env.root.join(".localpilot"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, [".gitignore", "completions.jsonl"]);
+
+    // A second outcome for the same request is ignored.
+    env.engine.on_outcome("r1", Outcome::Rejected, None);
+    assert_eq!(log.records().len(), 1);
+
+    // A cache hit is logged with no time to first token.
+    assert_eq!(texts(&complete(&env, "r2", at).await), ["a + b"]);
+    env.engine.on_accepted("r2");
+    let hit = &log.records()[1];
+    assert_eq!(hit.outcome, Outcome::Accepted);
+    assert_eq!(hit.ttft_ms, None);
+    assert_eq!(hit.accepted_text, None);
 }
