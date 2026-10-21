@@ -14,5 +14,6 @@
         <applicationConfigurable parentId="tools" id="dev.localpilot.settings" displayName="LocalPilot"
                                  instance="dev.localpilot.settings.LocalPilotConfigurable"/>
         <notificationGroup id="LocalPilot" displayType="BALLOON"/>
+        <postStartupActivity implementation="dev.localpilot.sync.LocalPilotStartup"/>
     </extensions>
 </idea-plugin>
