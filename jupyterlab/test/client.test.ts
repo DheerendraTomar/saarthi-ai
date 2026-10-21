@@ -1,0 +1,272 @@
+import { ServerConnection } from '@jupyterlab/services';
+import { RpcError } from '@localpilot/rpc-client';
+import { CoreDisconnected, InitializeResult, WsCoreClient } from '../src/client';
+import { DEFAULT_SETTINGS, Settings } from '../src/settings';
+import { MockWebSocket } from './mockWebSocket';
+
+const INIT_RESULT: InitializeResult = {
+  capabilities: { completion: true, chat: true, bench: false },
+  ollamaStatus: { ollama: 'ok', detail: 'ollama 0.12 at http://localhost:11434' },
+  indexStatus: 'building'
+};
+
+function serverSettings(overrides: Partial<ServerConnection.ISettings> = {}): ServerConnection.ISettings {
+  return ServerConnection.makeSettings({
+    baseUrl: 'http://localhost:8888/base/',
+    wsUrl: 'ws://localhost:8888/base/',
+    token: 'secret token',
+    appendToken: true,
+    WebSocket: MockWebSocket as unknown as typeof WebSocket,
+    ...overrides
+  });
+}
+
+const logs: string[] = [];
+
+function makeClient(settings: Partial<Settings> = {}): WsCoreClient {
+  const s: Settings = { ...DEFAULT_SETTINGS, ...settings };
+  return new WsCoreClient({ serverSettings: serverSettings(), settings: () => s, onLog: (m) => logs.push(m) });
+}
+
+/** Lets pending promise callbacks run (no timers advance). */
+async function flush(): Promise<void> {
+  await jest.advanceTimersByTimeAsync(0);
+}
+
+/** Opens the current socket and answers its initialize. */
+async function connect(result: InitializeResult = INIT_RESULT): Promise<MockWebSocket> {
+  const ws = MockWebSocket.last;
+  ws.open();
+  await flush();
+  ws.respond('initialize', result);
+  await flush();
+  return ws;
+}
+
+let client: WsCoreClient | undefined;
+
+beforeEach(() => {
+  jest.useFakeTimers();
+  MockWebSocket.reset();
+  logs.length = 0;
+});
+
+afterEach(() => {
+  client?.dispose();
+  client = undefined;
+  jest.useRealTimers();
+});
+
+describe('WsCoreClient', () => {
+  it('connects_and_initializes_with_settings', async () => {
+    client = makeClient({ chatModel: 'llama-test', completionsEnabled: false });
+    const statuses: unknown[] = [];
+    client.onStatus((s) => statuses.push(s));
+    const reconnects = jest.fn();
+    client.onReconnect(reconnects);
+
+    // Sent before the socket is up: the notification is queued, the request waits.
+    client.notify('textDocument/didOpen', { textDocument: { uri: 'file:///a.py', text: 'x' } });
+    const sessions = client.request('chat/listSessions', {});
+    client.start();
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+    const ws = MockWebSocket.last;
+    // Jupyter's own rule: the token rides on the URL only when appendToken is set.
+    expect(ws.url).toBe('ws://localhost:8888/base/localpilot/rpc?token=secret%20token');
+    expect(client.state).toBe('connecting');
+
+    ws.open();
+    await flush();
+    const [init, ...rest] = ws.messages();
+    expect(rest).toHaveLength(0); // nothing goes out before initialize is answered
+    expect(init.method).toBe('initialize');
+    // The core always gets completionsEnabled: true; the client gates completions itself.
+    expect(init.params?.settings).toEqual({ ...DEFAULT_SETTINGS, chatModel: 'llama-test', completionsEnabled: true });
+
+    ws.respond('initialize', INIT_RESULT);
+    await flush();
+    expect(client.state).toBe('ready');
+    expect(client.initializeResult).toEqual(INIT_RESULT);
+    await expect(client.whenReady()).resolves.toEqual(INIT_RESULT);
+    expect(statuses).toEqual([INIT_RESULT.ollamaStatus]);
+    expect(reconnects).not.toHaveBeenCalled(); // the first connection is not a reconnect
+
+    const methods = ws.messages().map((m) => m.method);
+    expect(methods).toEqual(['initialize', 'textDocument/didOpen', 'chat/listSessions']);
+    ws.respond('chat/listSessions', { sessions: [] });
+    await expect(sessions).resolves.toEqual({ sessions: [] });
+
+    // Later core notifications reach their handlers; `status` also reaches onStatus.
+    const tokens: unknown[] = [];
+    client.onNotification('chat/token', (p) => tokens.push(p));
+    ws.receive({ jsonrpc: '2.0', method: 'chat/token', params: { sessionId: 's', text: 'hi' } });
+    ws.receive({ jsonrpc: '2.0', method: 'status', params: { ollama: 'down', detail: 'connection refused' } });
+    expect(tokens).toEqual([{ sessionId: 's', text: 'hi' }]);
+    expect(statuses).toEqual([INIT_RESULT.ollamaStatus, { ollama: 'down', detail: 'connection refused' }]);
+
+    // Core → client requests (negative ids) are answered on the same socket.
+    client.onRequest('workspace/applyEdit', () => ({ applied: true }));
+    ws.receive({ jsonrpc: '2.0', id: -1, method: 'workspace/applyEdit', params: { sessionId: 's' } });
+    await flush();
+    expect(ws.messages().pop()).toEqual({ jsonrpc: '2.0', id: -1, result: { applied: true } });
+  });
+
+  it('builds the socket URL without a token when Jupyter does not append one', () => {
+    const s = serverSettings({ appendToken: false });
+    client = new WsCoreClient({ serverSettings: s, settings: () => DEFAULT_SETTINGS, onLog: () => undefined });
+    client.start();
+    expect(MockWebSocket.last.url).toBe('ws://localhost:8888/base/localpilot/rpc');
+  });
+
+  it('reconnects_with_backoff_and_replays_didOpen', async () => {
+    client = makeClient();
+    const order: string[] = [];
+    const docs = new Map([['file:///nb.ipynb.cell0.py', 'import os']]);
+    client.onReconnect(() => {
+      order.push('reconnect');
+      for (const [uri, text] of docs) {
+        client!.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1, text } });
+      }
+    });
+    client.start();
+    const first = await connect();
+    expect(client.state).toBe('ready');
+
+    // The core restarted: the server closes every socket with 1012.
+    first.serverClose(1012, 'LocalPilot core restarted');
+    expect(client.state).toBe('reconnecting');
+    // Sent while disconnected: dropped (the replay brings the core up to date).
+    client.notify('textDocument/didChange', { textDocument: { uri: 'file:///x.py' } });
+
+    // Backoff 0.5 s, 1 s, 2 s, 4 s, 8 s, then capped at 10 s; failed attempts never open.
+    const delays = [500, 1000, 2000, 4000, 8000, 10000, 10000];
+    for (const [i, delay] of delays.entries()) {
+      const before = MockWebSocket.instances.length;
+      await jest.advanceTimersByTimeAsync(delay - 1);
+      expect(MockWebSocket.instances).toHaveLength(before);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(MockWebSocket.instances).toHaveLength(before + 1);
+      if (i < delays.length - 1) MockWebSocket.last.serverClose(1006);
+    }
+
+    // This attempt succeeds: initialize first, and the replay only after its answer.
+    const ws = MockWebSocket.last;
+    ws.open();
+    await flush();
+    expect(ws.messages().map((m) => m.method)).toEqual(['initialize']);
+    expect(order).toEqual([]);
+    ws.respond('initialize', INIT_RESULT);
+    await flush();
+    expect(order).toEqual(['reconnect']);
+    expect(client.state).toBe('ready');
+    const sent = ws.messages();
+    expect(sent.map((m) => m.method)).toEqual(['initialize', 'textDocument/didOpen']);
+    expect(sent[1].params?.textDocument).toEqual({
+      uri: 'file:///nb.ipynb.cell0.py',
+      languageId: 'python',
+      version: 1,
+      text: 'import os'
+    });
+    // The didChange sent while disconnected never went anywhere.
+    expect(MockWebSocket.instances.flatMap((s) => s.messages()).some((m) => m.method === 'textDocument/didChange')).toBe(false);
+
+    // A successful initialize resets the backoff to 0.5 s.
+    ws.serverClose(1012, 'LocalPilot core restarted');
+    const before = MockWebSocket.instances.length;
+    await jest.advanceTimersByTimeAsync(500);
+    expect(MockWebSocket.instances).toHaveLength(before + 1);
+    await connect();
+    expect(order).toEqual(['reconnect', 'reconnect']);
+  });
+
+  it('disconnect_mid_turn_rejects_pending_and_emits_error', async () => {
+    client = makeClient();
+    const disconnects: CoreDisconnected[] = [];
+    client.onDisconnect((e) => disconnects.push(e));
+    const states: string[] = [];
+    client.onStateChanged((s) => states.push(s));
+    client.start();
+    const ws = await connect();
+
+    // A chat turn is streaming and a history request is in flight.
+    const history = client.request('chat/history', { sessionId: 's1' });
+    let historyError: unknown;
+    history.catch((e) => (historyError = e));
+    ws.receive({ jsonrpc: '2.0', method: 'chat/token', params: { sessionId: 's1', text: 'par' } });
+
+    ws.serverClose(1012, 'LocalPilot core restarted');
+    await flush();
+
+    expect(historyError).toBeInstanceOf(CoreDisconnected);
+    expect(historyError).not.toBeInstanceOf(RpcError);
+    expect((historyError as CoreDisconnected).code).toBe(1012);
+    expect((historyError as CoreDisconnected).reason).toBe('LocalPilot core restarted');
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toBeInstanceOf(CoreDisconnected);
+    expect(disconnects[0].code).toBe(1012);
+    expect(states).toEqual(['connecting', 'ready', 'reconnecting']);
+
+    // Requests made while disconnected wait for the next connection, abortable.
+    const aborter = new AbortController();
+    const aborted = client.request('completion/request', {}, aborter.signal);
+    const later = client.request('chat/listSessions', {});
+    aborter.abort();
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+
+    await jest.advanceTimersByTimeAsync(500);
+    const next = await connect();
+    expect(next.messages().map((m) => m.method)).toEqual(['initialize', 'chat/listSessions']);
+    next.respond('chat/listSessions', { sessions: [] });
+    await expect(later).resolves.toEqual({ sessions: [] });
+
+    // Failed attempts that never opened do not emit another disconnect.
+    next.serverClose(1006);
+    await jest.advanceTimersByTimeAsync(500);
+    MockWebSocket.last.serverClose(1006);
+    expect(disconnects).toHaveLength(2);
+  });
+
+  it('stops retrying when the server refuses initialize, until reconnect()', async () => {
+    client = makeClient();
+    client.start();
+    const ws = MockWebSocket.last;
+    ws.open();
+    await flush();
+    const init = ws.messages()[0];
+    ws.receive({
+      jsonrpc: '2.0',
+      id: init.id,
+      error: { code: -32603, message: 'LocalPilot core crashed; POST /localpilot/restart to retry' }
+    });
+    await flush();
+    expect(client.state).toBe('crashed');
+    expect(client.lastError?.message).toContain('POST /localpilot/restart');
+    expect(logs.join('\n')).toContain('initialize refused');
+    await expect(client.request('chat/listSessions', {})).rejects.toThrow('POST /localpilot/restart');
+
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    // After POST /localpilot/restart the plugin calls reconnect(): a fresh socket at once.
+    client.reconnect();
+    expect(ws.closedWith?.code).toBe(1000);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    await connect();
+    expect(client.state).toBe('ready');
+    expect(client.lastError).toBeUndefined();
+  });
+
+  it('dispose closes the socket, rejects pending requests and never reconnects', async () => {
+    client = makeClient();
+    client.start();
+    const ws = await connect();
+    const pending = client.request('chat/history', { sessionId: 's1' });
+    client.dispose();
+    await expect(pending).rejects.toBeInstanceOf(Error);
+    expect(ws.closedWith?.code).toBe(1000);
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    expect(client.state).toBe('disposed');
+  });
+});

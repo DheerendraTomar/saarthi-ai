@@ -1,6 +1,6 @@
 [build-system]
-# hatch-jupyter-builder builds the labextension; its build hook is wired in Task 2
-# (there is no labextension yet, so enabling it now would break `pip install -e .`).
+# hatch-jupyter-builder builds the labextension (jlpm build:prod) into
+# localpilot_jupyter/labextension when a wheel is built; see the jupyter-builder hook below.
 requires = ["hatchling>=1.21", "hatch-jupyter-builder>=0.9"]
 build-backend = "hatchling.build"
 
@@ -24,16 +24,39 @@ test = ["pytest>=7", "pytest-jupyter[server]>=0.6", "pytest-asyncio>=0.21"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["localpilot_jupyter"]
-# The bundled core (localpilot_jupyter/bin/<triple>/localpilot-core) is git-ignored
-# but must ship in the wheel.
-artifacts = ["localpilot_jupyter/bin"]
+# The bundled core (localpilot_jupyter/bin/<triple>/localpilot-core) and the built
+# labextension are git-ignored but must ship in the wheel.
+artifacts = ["localpilot_jupyter/bin", "localpilot_jupyter/labextension"]
 
 [tool.hatch.build.targets.wheel.shared-data]
 "jupyter-config/jupyter_server_config.d" = "etc/jupyter/jupyter_server_config.d"
+"localpilot_jupyter/labextension" = "share/jupyter/labextensions/localpilot-jupyter"
+"install.json" = "share/jupyter/labextensions/localpilot-jupyter/install.json"
+
+# The prebuilt labextension (git-ignored) is produced by `jlpm build:prod`
+# (`jlpm build` for editable installs) before the wheel is assembled.
+[tool.hatch.build.hooks.jupyter-builder]
+dependencies = ["hatch-jupyter-builder>=0.9"]
+build-function = "hatch_jupyter_builder.npm_builder"
+ensured-targets = [
+  "localpilot_jupyter/labextension/static/style.js",
+  "localpilot_jupyter/labextension/package.json",
+]
+skip-if-exists = ["localpilot_jupyter/labextension/static/style.js"]
+
+[tool.hatch.build.hooks.jupyter-builder.build-kwargs]
+build_cmd = "build:prod"
+npm = ["jlpm"]
+
+[tool.hatch.build.hooks.jupyter-builder.editable-build-kwargs]
+build_cmd = "install:extension"
+npm = ["jlpm"]
+source_dir = "src"
+build_dir = "localpilot_jupyter/labextension"
 
 [tool.hatch.build.targets.sdist]
-artifacts = ["localpilot_jupyter/bin"]
-exclude = [".venv", ".github"]
+artifacts = ["localpilot_jupyter/bin", "localpilot_jupyter/labextension"]
+exclude = [".venv", ".github", "node_modules", "lib", ".yarn"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

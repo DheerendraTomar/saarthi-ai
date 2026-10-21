@@ -1,0 +1,17 @@
+.jp-LocalPilotStatus {
+  padding: 0 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.jp-LocalPilotStatus:hover {
+  background-color: var(--jp-layout-color2);
+}
+
+.jp-LocalPilotStatus-warning {
+  background-color: var(--jp-warn-color2);
+}
+
+.jp-LocalPilotStatus-error {
+  background-color: var(--jp-error-color2);
+}

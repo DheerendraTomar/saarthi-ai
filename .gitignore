@@ -9,5 +9,10 @@ vscode/bin/
 chat-ui/dist/
 jupyterlab/.venv/
 jupyterlab/localpilot_jupyter/bin/
+jupyterlab/localpilot_jupyter/labextension/
+jupyterlab/lib/
+jupyterlab/.yarn/
+jupyterlab/tsconfig.tsbuildinfo
+jupyterlab/coverage/
 __pycache__/
 .pytest_cache/

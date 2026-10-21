@@ -1,0 +1,88 @@
+{
+  "jupyter.lab.setting-icon-label": "LocalPilot",
+  "title": "LocalPilot",
+  "description": "LocalPilot: local Ollama-backed inline completions and agent chat. Same keys and defaults as the VS Code extension's localpilot.* settings. Changing a setting the core reads restarts the LocalPilot core on the Jupyter server.",
+  "type": "object",
+  "properties": {
+    "ollamaUrl": {
+      "title": "Ollama URL",
+      "type": "string",
+      "default": "http://localhost:11434",
+      "description": "Base URL of the local Ollama server, as seen from the Jupyter server. LocalPilot talks to nothing else."
+    },
+    "completionModel": {
+      "title": "Completion model",
+      "type": "string",
+      "default": "qwen2.5-coder:0.5b-base",
+      "description": "Small fill-in-the-middle model used for inline completions (qwen2.5-coder:1.5b-base is the higher-quality alternative)."
+    },
+    "chatModel": {
+      "title": "Chat model",
+      "type": "string",
+      "default": "qwen3.8:27b-mlx",
+      "description": "Tool-calling model used for agent chat."
+    },
+    "completionsEnabled": {
+      "title": "Inline completions",
+      "type": "boolean",
+      "default": true,
+      "description": "Show inline (ghost text) completions."
+    },
+    "completionDebounceMs": {
+      "title": "Completion debounce (ms)",
+      "type": "number",
+      "default": 120,
+      "minimum": 0,
+      "description": "Delay after the last keystroke before a completion is requested."
+    },
+    "completionMaxTokens": {
+      "title": "Completion max tokens",
+      "type": "number",
+      "default": 32,
+      "minimum": 1,
+      "description": "Maximum tokens generated per inline completion."
+    },
+    "chatThinking": {
+      "title": "Chat thinking",
+      "type": "string",
+      "enum": ["off", "on"],
+      "default": "off",
+      "description": "Let the chat model think before answering (slower)."
+    },
+    "coreBinaryPath": {
+      "title": "Core binary path (unused in JupyterLab)",
+      "type": "string",
+      "default": "",
+      "description": "Kept for parity with VS Code; ignored here. The Jupyter server picks the core binary itself: set $LOCALPILOT_CORE_BINARY or c.LocalPilot.core_binary in the server config."
+    },
+    "allowedCommandsAlways": {
+      "title": "Always-allowed commands",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Commands approved with \"Always\"; the agent runs these without asking."
+    },
+    "completionContextTokens": {
+      "title": "Completion context tokens",
+      "type": "number",
+      "default": 3584,
+      "minimum": 256,
+      "description": "Total prompt budget for inline completions (prefix + suffix + related snippets)."
+    },
+    "chatContextTokens": {
+      "title": "Chat context tokens",
+      "type": "number",
+      "default": 24000,
+      "minimum": 1024,
+      "description": "Chat history budget before older turns are dropped."
+    },
+    "logLevel": {
+      "title": "Core log level (unused in JupyterLab)",
+      "type": "string",
+      "enum": ["error", "warn", "info", "debug", "trace"],
+      "default": "info",
+      "description": "Kept for parity with VS Code; ignored here. The Jupyter server launches the core: set c.LocalPilot.core_log_level in the server config."
+    }
+  },
+  "additionalProperties": false
+}
