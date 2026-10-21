@@ -245,6 +245,8 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
       delete next.pull;
       return next;
     }
+    case "ui/theme":
+      return state; // applied to the document by App (applyTheme)
     default: {
       // Exhaustiveness: a new HostToUi variant must be handled above.
       const unknown: never = event;

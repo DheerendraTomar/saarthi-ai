@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHostBridge, IframeBridge, TestBridge } from "../src/host";
+import { applyTheme, createHostBridge, IframeBridge, TestBridge } from "../src/host";
 import type { HostToUi, UiToHost } from "../src/host";
 
 type W = Window & {
@@ -128,6 +128,18 @@ describe("IframeBridge", () => {
       else delete (window as unknown as { parent?: unknown }).parent;
     }
     expect(window.parent).toBe(window);
+  });
+});
+
+describe("applyTheme", () => {
+  it("apply_theme_sets_only_vscode_variables", () => {
+    const el = document.createElement("div");
+    applyTheme({ "--vscode-foreground": "#123456", color: "red", "--other": "x", "--vscode-font-family": 42 as unknown as string }, el);
+    expect(el.style.getPropertyValue("--vscode-foreground")).toBe("#123456");
+    expect(el.style.getPropertyValue("color")).toBe("");
+    expect(el.style.getPropertyValue("--other")).toBe("");
+    expect(el.style.getPropertyValue("--vscode-font-family")).toBe("");
+    applyTheme(null as unknown as Record<string, string>, el); // ignored
   });
 });
 

@@ -14,6 +14,19 @@ function setup() {
 }
 
 describe("App", () => {
+  it("app_applies_host_theme_variables", () => {
+    const { emit } = setup();
+    const root = document.documentElement.style;
+    emit({ type: "ui/theme", vars: { "--vscode-foreground": "#111111", "--vscode-sideBar-background": "#fafafa" } });
+    expect(root.getPropertyValue("--vscode-foreground")).toBe("#111111");
+    expect(root.getPropertyValue("--vscode-sideBar-background")).toBe("#fafafa");
+    // A later theme replaces values (dark → light switches).
+    emit({ type: "ui/theme", vars: { "--vscode-foreground": "#eeeeee" } });
+    expect(root.getPropertyValue("--vscode-foreground")).toBe("#eeeeee");
+    root.removeProperty("--vscode-foreground");
+    root.removeProperty("--vscode-sideBar-background");
+  });
+
   it("app_renders_messages_and_sends_on_enter", () => {
     const { bridge, emit, container } = setup();
     expect(bridge.sent).toEqual([{ type: "ui/ready" }]);

@@ -43,7 +43,9 @@ export type HostToUi =
   | { type: "session/list"; sessions: SessionSummary[]; current: string | null }
   | { type: "session/history"; sessionId: string; messages: HistoryMessage[] }
   | { type: "ui/activeFile"; uri: string | null; selection?: Range }
-  | { type: "ui/error"; message: string };
+  | { type: "ui/error"; message: string }
+  /** Host-originated: theme colours/fonts as `--vscode-*` custom properties (hosts that cannot share CSS variables, e.g. an iframe). */
+  | { type: "ui/theme"; vars: Record<string, string> };
 
 export interface HostBridge {
   post(msg: UiToHost): void;
@@ -70,6 +72,20 @@ type HostWindow = Window & {
   acquireVsCodeApi?: () => VsCodeApi;
   cefQuery?: (args: CefQueryArgs) => number;
 };
+
+const THEME_VAR = /^--vscode-[A-Za-z0-9.-]+$/;
+
+/**
+ * Applies a `ui/theme` message: sets each `--vscode-*` custom property on
+ * `root` (default: `<html>`), which styles.css reads. Other names and
+ * non-string values are ignored.
+ */
+export function applyTheme(vars: Record<string, string>, root: HTMLElement = document.documentElement): void {
+  if (!vars || typeof vars !== "object") return;
+  for (const [name, value] of Object.entries(vars)) {
+    if (THEME_VAR.test(name) && typeof value === "string") root.style.setProperty(name, value);
+  }
+}
 
 /** Listens for host → UI messages delivered as `window` "message" events. */
 function onWindowMessage(cb: (msg: HostToUi) => void): () => void {

@@ -1,6 +1,6 @@
 import { memo } from "preact/compat";
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "preact/hooks";
-import type { HostBridge } from "../host";
+import { applyTheme, type HostBridge } from "../host";
 import type { Attachment, ChatToolResult, Decision, JsonValue } from "../protocol";
 import { initialState, reduce } from "../state";
 import type { State } from "../state";
@@ -140,7 +140,10 @@ export function App({ bridge }: AppProps) {
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const off = bridge.onMessage(dispatch);
+    const off = bridge.onMessage((msg) => {
+      if (msg.type === "ui/theme") applyTheme(msg.vars);
+      dispatch(msg);
+    });
     bridge.post({ type: "ui/ready" });
     return off;
   }, [bridge]);
