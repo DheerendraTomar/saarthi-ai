@@ -1,5 +1,6 @@
 // HostBridge: how the chat UI talks to whichever host embeds it
-// (VS Code webview, JetBrains JCEF, or an in-memory bridge for tests).
+// (VS Code webview, JetBrains JCEF, a parent page's <iframe> such as the
+// JupyterLab sidebar, or an in-memory bridge for tests).
 import type {
   Attachment,
   ChatDone,
@@ -121,6 +122,38 @@ class CefBridge implements HostBridge {
   }
 }
 
+/**
+ * Embedded in another page's `<iframe>` (JupyterLab): posts go to the parent
+ * with `postMessage(msg, "*")` — the frame is sandboxed without
+ * `allow-same-origin`, so its origin is opaque and no narrower target
+ * origin can match — and only messages whose `source` is that parent are
+ * accepted. State is kept in memory (the frame lives as long as the panel).
+ */
+export class IframeBridge implements HostBridge {
+  private state: unknown = undefined;
+  constructor(private readonly parent: Window = window.parent) {}
+  post(msg: UiToHost): void {
+    this.parent.postMessage(msg, "*");
+  }
+  onMessage(cb: (msg: HostToUi) => void): () => void {
+    const listener = (e: MessageEvent) => {
+      if (e.source !== this.parent) return;
+      const data: unknown = e.data;
+      if (data && typeof data === "object" && typeof (data as { type?: unknown }).type === "string") {
+        cb(data as HostToUi);
+      }
+    };
+    window.addEventListener("message", listener);
+    return () => window.removeEventListener("message", listener);
+  }
+  getState<T>(): T | undefined {
+    return this.state as T | undefined;
+  }
+  setState<T>(s: T): void {
+    this.state = s;
+  }
+}
+
 /** In-memory bridge for tests and standalone dev (`vite dev`). */
 export class TestBridge implements HostBridge {
   readonly sent: UiToHost[] = [];
@@ -150,7 +183,10 @@ export class TestBridge implements HostBridge {
   }
 }
 
-/** Picks the bridge for the current host: VS Code → JCEF → TestBridge. */
+/**
+ * Picks the bridge for the current host: VS Code → JCEF → parent page (we are
+ * in an iframe) → TestBridge. VS Code webviews are iframes too, hence the order.
+ */
 export function createHostBridge(): HostBridge {
   const w = window as HostWindow;
   if (typeof w.acquireVsCodeApi === "function") {
@@ -158,6 +194,9 @@ export function createHostBridge(): HostBridge {
   }
   if (typeof w.cefQuery === "function") {
     return new CefBridge(w.cefQuery.bind(w));
+  }
+  if (w.parent && w.parent !== w) {
+    return new IframeBridge(w.parent);
   }
   return new TestBridge();
 }

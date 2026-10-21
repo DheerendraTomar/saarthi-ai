@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHostBridge, TestBridge } from "../src/host";
+import { createHostBridge, IframeBridge, TestBridge } from "../src/host";
 import type { HostToUi, UiToHost } from "../src/host";
 
 type W = Window & {
@@ -77,6 +77,57 @@ describe("createHostBridge", () => {
 
   it("falls_back_to_test_bridge", () => {
     expect(createHostBridge()).toBeInstanceOf(TestBridge);
+  });
+});
+
+describe("IframeBridge", () => {
+  it("iframe_bridge_posts_to_parent_and_receives_from_parent", () => {
+    const parent = { postMessage: vi.fn() };
+    const bridge = new IframeBridge(parent as unknown as Window);
+    const msg: UiToHost = { type: "chat/approve", toolCallId: "t1", decision: "once", editedArgs: { path: "a.py" } };
+    bridge.post(msg);
+    expect(parent.postMessage).toHaveBeenCalledWith(msg, "*");
+
+    const received: HostToUi[] = [];
+    const off = bridge.onMessage((m) => received.push(m));
+    const token: HostToUi = { type: "chat/token", sessionId: "s1", delta: "hi", kind: "text" };
+    // From the parent (the JupyterLab host page): delivered.
+    window.dispatchEvent(new MessageEvent("message", { data: token, source: parent as unknown as Window }));
+    // From anything else (another frame, the page itself): ignored.
+    window.dispatchEvent(new MessageEvent("message", { data: { type: "ui/error", message: "spoofed" }, source: window }));
+    // Not a host message: ignored.
+    window.dispatchEvent(new MessageEvent("message", { data: "noise", source: parent as unknown as Window }));
+    off();
+    window.dispatchEvent(new MessageEvent("message", { data: token, source: parent as unknown as Window }));
+    expect(received).toEqual([token]);
+
+    expect(bridge.getState()).toBeUndefined();
+    bridge.setState({ draft: "x" });
+    expect(bridge.getState()).toEqual({ draft: "x" });
+  });
+
+  it("createHostBridge_uses_iframe_bridge_when_framed", () => {
+    const parent = { postMessage: vi.fn() };
+    const original = Object.getOwnPropertyDescriptor(window, "parent");
+    Object.defineProperty(window, "parent", { value: parent, configurable: true });
+    try {
+      const bridge = createHostBridge();
+      expect(bridge).toBeInstanceOf(IframeBridge);
+      bridge.post({ type: "ui/ready" });
+      expect(parent.postMessage).toHaveBeenCalledWith({ type: "ui/ready" }, "*");
+
+      // VS Code webviews are iframes too: the VS Code API still wins.
+      const api = { postMessage: vi.fn(), getState: vi.fn(), setState: vi.fn() };
+      (window as W).acquireVsCodeApi = () => api;
+      expect(createHostBridge()).not.toBeInstanceOf(IframeBridge);
+      delete (window as W).acquireVsCodeApi;
+      (window as W).cefQuery = vi.fn();
+      expect(createHostBridge()).not.toBeInstanceOf(IframeBridge);
+    } finally {
+      if (original) Object.defineProperty(window, "parent", original);
+      else delete (window as unknown as { parent?: unknown }).parent;
+    }
+    expect(window.parent).toBe(window);
   });
 });
 
