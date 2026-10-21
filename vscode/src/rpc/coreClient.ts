@@ -169,7 +169,7 @@ export class CoreClient {
   /** Sends a notification; queued while starting (the core drops pre-initialize ones), dropped when not running. */
   notify(method: string, params?: unknown): void {
     if (this._state === "ready" && this.running) {
-      this.running.endpoint.notify(method, params);
+      this.sendNotification(this.running.endpoint, method, params);
     } else if (this._state === "starting") {
       this.queuedNotifications.push([method, params]);
     }
@@ -270,15 +270,20 @@ export class CoreClient {
     child.stdin.on("error", () => {}); // EPIPE after the core died; the close handler deals with it.
 
     let exited = false;
-    const onExit = (exit: CoreExit) => {
+    const onExit = (exit: CoreExit, spawnError?: Error) => {
       if (exited) return;
       exited = true;
       settle(exit);
-      this.handleExit(running, exit);
+      this.handleExit(running, exit, spawnError);
     };
     child.on("error", (err) => {
-      onLog("error", `LocalPilot core failed (${base.command}): ${err.message}`);
-      if (child.pid === undefined) onExit({ code: null, signal: null });
+      if (child.pid === undefined) {
+        // ENOENT / EACCES etc.: the binary cannot be launched, so retrying is pointless.
+        onLog("error", `LocalPilot core could not be started (${base.command}): ${err.message}`);
+        onExit({ code: null, signal: null }, err);
+      } else {
+        onLog("warn", `LocalPilot core process error: ${err.message}`);
+      }
     });
     // `close` (not `exit`): fires after stdout is drained, so no response is lost.
     child.on("close", (code, signal) => onExit({ code, signal }));
@@ -290,7 +295,7 @@ export class CoreClient {
           this.setState("ready");
           const queued = this.queuedNotifications;
           this.queuedNotifications = [];
-          for (const [method, params] of queued) endpoint.notify(method, params);
+          for (const [method, params] of queued) this.sendNotification(endpoint, method, params);
         }
         return result;
       })
@@ -310,7 +315,7 @@ export class CoreClient {
     return ready;
   }
 
-  private handleExit(running: Running, exit: CoreExit): void {
+  private handleExit(running: Running, exit: CoreExit, spawnError?: Error): void {
     if (this.running !== running) {
       running.endpoint.dispose();
       return;
@@ -322,6 +327,12 @@ export class CoreClient {
       running.endpoint.dispose();
       this.stopping = undefined;
       this.setState("stopped");
+      return;
+    }
+    if (spawnError) {
+      running.endpoint.rejectAll(spawnError);
+      running.endpoint.dispose();
+      this.setState("crashed");
       return;
     }
     running.endpoint.rejectAll(new CoreCrashed(exit));
@@ -344,6 +355,15 @@ export class CoreClient {
       `LocalPilot core exited unexpectedly (${describeExit(exit)}); restarting (${this.restarts.length}/${max} this minute)`,
     );
     void this.launch().catch(() => {});
+  }
+
+  /** Notifications are fire-and-forget: a dead pipe is logged, never thrown to the caller. */
+  private sendNotification(endpoint: RpcEndpoint, method: string, params: unknown): void {
+    try {
+      endpoint.notify(method, params);
+    } catch (e) {
+      this.opts.onLog("warn", `dropped ${method} notification: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private register(running: Running, method: string): void {

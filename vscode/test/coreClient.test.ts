@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -66,13 +67,13 @@ afterEach(async () => {
 
 describe("CoreClient", () => {
   it("start_sends_initialize_and_returns_result", async () => {
-    const { client, states, waitForLog } = makeClient({ FAKE_OLLAMA: "modelMissing" });
+    const { client, states, waitForLog } = makeClient();
     const indexReady = new Promise((resolve) => client.onNotification("index/ready", resolve));
     expect(client.state).toBe("stopped");
     const result = await client.start(DEFAULT_SETTINGS);
     expect(result).toEqual({
       capabilities: { completion: true, chat: true, bench: false },
-      ollamaStatus: { ollama: "modelMissing", detail: expect.any(String) },
+      ollamaStatus: { ollama: "ok", detail: expect.any(String) },
       indexStatus: "building",
     });
     expect(client.state).toBe("ready");
@@ -179,5 +180,42 @@ describe("CoreClient", () => {
     const p = client.request("completion/request", { uri: "file:///a.py", position: { line: 0, character: 0 }, requestId: "r" }, token);
     cancel();
     await expect(p).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("index_ready_before_initialize_response_is_delivered", async () => {
+    const { client } = makeClient({ FAKE_INDEX_FIRST: "1" });
+    const seen: Array<[unknown, CoreState]> = [];
+    client.onNotification("index/ready", (p) => seen.push([p, client.state]));
+    const result = await client.start(DEFAULT_SETTINGS);
+    expect(result.indexStatus).toBe("building");
+    // Delivered while the client was still starting; the client must not lose it.
+    expect(seen).toEqual([[{ files: 1, buildMs: 1 }, "starting"]]);
+  });
+
+  it("spawn_failure_goes_straight_to_crashed", async () => {
+    const logs: Array<[string, string]> = [];
+    const states: CoreState[] = [];
+    const client = new CoreClient({
+      binaryPath: join(here, "does-not-exist", "localpilot-core"),
+      workspaceRoot: here,
+      logLevel: "info",
+      onLog: (level, message) => logs.push([level, message]),
+    });
+    clients.push(client);
+    client.onDidChangeState((s) => states.push(s));
+    await expect(client.start(DEFAULT_SETTINGS)).rejects.toThrow(/ENOENT/);
+    expect(client.state).toBe("crashed");
+    expect(states).toEqual(["starting", "crashed"]);
+    expect(logs.filter(([level]) => level === "error")).toHaveLength(1);
+    expect(logs.some(([level]) => level === "warn")).toBe(false);
+  });
+
+  it("notify_never_throws_when_stdin_is_closed", async () => {
+    const { client, logs } = makeClient({ FAKE_IGNORE_SHUTDOWN: "1" }, { shutdownTimeoutMs: 200 });
+    await client.start(DEFAULT_SETTINGS);
+    const internals = client as unknown as { running: { child: ChildProcess } };
+    internals.running.child.stdin!.end();
+    expect(() => client.notify("textDocument/didSave", { uri: "file:///a.py" })).not.toThrow();
+    expect(logs.some(([level, m]) => level === "warn" && /textDocument\/didSave/.test(m))).toBe(true);
   });
 });
