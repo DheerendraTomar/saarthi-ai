@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-10-21
+
+- Adaptive completions never generate more tokens than `localpilot.completionMaxTokens`: learning only shortens suggestions (it could previously go up to twice the setting, above the latency target).
+- Every 10th multi-line suggestion per language uses the configured limits, so longer suggestions keep being tried after learning has shortened them.
+- One typing run through a suggestion is logged once: the rest served from the cache after each key is no longer a separate record, and style examples no longer repeat the same suggestion.
+- Settings panel stats: partial, typed-through and rejected counts, "Accept rate (incl. partial)", and the line / token limits tagged *learned* or *default*. **Reset learning** asks for a second click (**Confirm**). The context budget field starts at 256, like the setting.
+- The chat view only writes a model name that is installed in Ollama (or already configured).
+
 ## 0.2.0 — 2026-10-21
 
 - Model selection: pick the chat and completion models from the models installed in Ollama (chat header, Settings panel, status bar menu, **Select Chat Model** / **Select Completion Model**), with size and capability hints and an explicit "Ollama down" state.

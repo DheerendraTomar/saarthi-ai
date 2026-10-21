@@ -2,7 +2,7 @@
   "name": "localpilot",
   "displayName": "LocalPilot",
   "description": "Copilot-style inline completions and agent chat, running entirely on your machine via Ollama.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "localpilot",
   "private": true,
   "license": "MIT",
