@@ -542,7 +542,7 @@ async def test_completion_request_ids_are_namespaced_per_tab(bridge: Bridge, stu
     a_id, _ = await connect(bridge)
     b_id, _ = await connect(bridge)
     await send(bridge, a_id, {"id": 2, "method": "completion/request", "params": {"uri": "file:///a.py", "position": {"line": 0, "character": 0}, "requestId": "r1"}})
-    for method in ("completion/cancel", "completion/accepted", "completion/rejected"):
+    for method in ("completion/cancel", "completion/accepted", "completion/rejected", "completion/outcome"):
         await send(bridge, b_id, {"method": method, "params": {"requestId": "r1"}})
     sent = {(m["method"], m["params"]["requestId"]) for m in stub.sent if m.get("method", "").startswith("completion/")}
     assert sent == {
@@ -550,6 +550,7 @@ async def test_completion_request_ids_are_namespaced_per_tab(bridge: Bridge, stu
         ("completion/cancel", f"{b_id}:r1"),
         ("completion/accepted", f"{b_id}:r1"),
         ("completion/rejected", f"{b_id}:r1"),
+        ("completion/outcome", f"{b_id}:r1"),
     }
 
 
@@ -646,3 +647,60 @@ async def test_requests_fail_fast_when_core_not_running(bridge: Bridge, stub: St
     assert a.received[-1]["id"] == 5 and a.received[-1]["error"]["code"] == -32603
     await send(bridge, a_id, {"id": 6, "method": "initialize", "params": {"settings": {}}})
     assert a.received[-1]["id"] == 6 and "crashed" in a.received[-1]["error"]["message"]
+
+
+def sessions_changed(tab: StubTab) -> list[dict]:
+    return [m["params"] for m in tab.received if m.get("method") == "localpilot/sessionsChanged"]
+
+
+async def test_delete_session_drops_ownership_and_tells_the_other_tabs(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    c_id, c = await connect(bridge)
+    await chat_send(bridge, a_id, "s1")
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    stub.emit({"method": "chat/toolCall", "params": {"sessionId": "s1", "toolCallId": "tc1", "requiresApproval": True}})
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s1", "stopReason": "done"}})
+    assert bridge._owners.get("s1") == a_id
+
+    # b deletes a's session: forwarded (not adopted), the core allows it.
+    await send(bridge, b_id, {"id": 9, "method": "chat/deleteSession", "params": {"sessionId": "s1"}})
+    forwarded = next(m for m in stub.sent if m.get("method") == "chat/deleteSession")
+    assert bridge._owners.get("s1") == a_id  # a refused delete must not move the session
+    stub.emit({"id": forwarded["id"], "result": {}})
+    assert b.received[-1] == {"jsonrpc": "2.0", "id": 9, "result": {}}
+    assert "s1" not in bridge._owners and "s1" not in bridge._pending_calls and "s1" not in bridge._running
+    # Every other tab hears about it (the deleting tab answers its own UI).
+    assert sessions_changed(a) == [{"deleted": ["s1"]}]
+    assert sessions_changed(c) == [{"deleted": ["s1"]}]
+    assert sessions_changed(b) == []
+
+
+async def test_refused_delete_keeps_the_running_session(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1")
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    await send(bridge, b_id, {"id": 9, "method": "chat/deleteSession", "params": {"sessionId": "s1"}})
+    forwarded = next(m for m in stub.sent if m.get("method") == "chat/deleteSession")
+    stub.emit({"id": forwarded["id"], "error": {"code": -32602, "message": "turn running in session s1"}})
+    assert b.received[-1]["error"]["code"] == -32602
+    assert bridge._owners["s1"] == a_id and "s1" in bridge._running
+    assert sessions_changed(a) == []
+
+
+async def test_clear_sessions_keeps_only_skipped_and_tells_the_other_tabs(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})  # s1 running
+    await chat_send(bridge, a_id, "s2", id=3)
+    stub.emit({"id": forwarded_send(stub, a_id, 3)["id"], "result": {}})
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s2", "stopReason": "done"}})
+    await send(bridge, b_id, {"id": 9, "method": "chat/clearSessions", "params": {}})
+    forwarded = next(m for m in stub.sent if m.get("method") == "chat/clearSessions")
+    stub.emit({"id": forwarded["id"], "result": {"deleted": 1, "skipped": ["s1"]}})
+    assert b.received[-1]["result"] == {"deleted": 1, "skipped": ["s1"]}
+    assert bridge._owners == {"s1": a_id}
+    assert sessions_changed(a) == [{"cleared": True, "skipped": ["s1"]}]
+    assert sessions_changed(b) == []

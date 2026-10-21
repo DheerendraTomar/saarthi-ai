@@ -1,6 +1,6 @@
 import type { CommandRegistry } from '@lumino/commands';
 import { DisposableSet, type IDisposable } from '@lumino/disposable';
-import { CHAT_WIDGET_ID } from './chat/chatWidget';
+import { CHAT_WIDGET_ID, MODEL_SETTING, type ModelInfo, type ModelKind } from './chat/chatWidget';
 import type { OllamaStatus, WsCoreClient } from './client';
 import type { Settings } from './settings';
 
@@ -10,7 +10,11 @@ export const COMMANDS = {
   pullModel: 'localpilot:pull-model',
   newSession: 'localpilot:new-session',
   toggleCompletions: 'localpilot:toggle-completions',
-  restartCore: 'localpilot:restart-core'
+  restartCore: 'localpilot:restart-core',
+  selectChatModel: 'localpilot:select-chat-model',
+  selectCompletionModel: 'localpilot:select-completion-model',
+  showCompletionStats: 'localpilot:show-completion-stats',
+  resetLearning: 'localpilot:reset-completion-learning'
 } as const;
 
 /**
@@ -46,6 +50,12 @@ export interface CommandUi {
   error(message: string): void;
   /** Lets the user pick a model to pull; undefined when cancelled. */
   pickModel(choices: string[]): Promise<string | undefined>;
+  /** Lets the user pick one of `items` (not editable), `selected` preselected; undefined when cancelled. */
+  pickItem(title: string, items: string[], selected?: string): Promise<string | undefined>;
+  /** A confirmation dialog; true when the user chose `acceptLabel`. */
+  confirm(title: string, body: string, acceptLabel: string): Promise<boolean>;
+  /** Shows read-only text (multi-line) in a dialog. */
+  showText(title: string, body: string): Promise<void>;
 }
 
 export interface CommandDeps {
@@ -54,9 +64,15 @@ export interface CommandDeps {
   activateById(id: string): void;
   terminals: TerminalManager;
   client: Pick<WsCoreClient, 'request' | 'onNotification'>;
-  chat: { newSession(): Promise<void> };
+  chat: {
+    newSession(): Promise<void>;
+    /** Sends the chat panel a fresh `models/list` (after a palette pick). */
+    postModels?(): Promise<void>;
+  };
   /** Current plugin settings. */
   settings(): Settings;
+  /** Writes one plugin setting (a core setting restarts the core). */
+  setSetting(key: keyof Settings, value: unknown): Promise<void>;
   /** Writes `completionsEnabled` to the plugin settings (client-only: no core restart). */
   setCompletionsEnabled(enabled: boolean): Promise<void>;
   /** `POST /localpilot/restart`, then reconnect a crashed client. */
@@ -144,6 +160,106 @@ export async function pullModel(deps: CommandDeps, model?: string): Promise<void
   }
 }
 
+/** `986000000` → "986 MB", `17000000000` → "17.0 GB". */
+export function formatSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  return `${Math.max(1, Math.round(bytes / 1e6))} MB`;
+}
+
+/**
+ * Picks the chat or completion model from the models installed in Ollama
+ * (core `ollama/models`) and writes it to the settings (the core restarts).
+ */
+export async function selectModel(deps: CommandDeps, kind: ModelKind): Promise<void> {
+  let models: ModelInfo[];
+  try {
+    ({ models } = await deps.client.request<{ models: ModelInfo[] }>('ollama/models', {}));
+  } catch (e) {
+    deps.ui.error(`LocalPilot: Ollama is not reachable (${errorMessage(e)}). Start it (Start Ollama), then try again.`);
+    return;
+  }
+  if (!Array.isArray(models) || models.length === 0) {
+    deps.ui.error('LocalPilot: no models are installed in Ollama. Pull one first (Pull Model with Ollama…).');
+    return;
+  }
+  const key = MODEL_SETTING[kind];
+  const current = deps.settings()[key];
+  const picked = await deps.ui.pickItem(
+    kind === 'chat' ? 'Chat model' : 'Completion model',
+    models.map((m) => m.name),
+    current
+  );
+  if (!picked || picked === current) return;
+  try {
+    await deps.setSetting(key, picked);
+  } catch (e) {
+    deps.ui.error(`LocalPilot: could not save the ${kind} model: ${errorMessage(e)}`);
+    return;
+  }
+  deps.ui.info(`LocalPilot: ${kind} model set to ${picked}.`);
+  await deps.chat.postModels?.().catch(() => undefined);
+}
+
+interface LanguageStats {
+  served: number;
+  accepted: number;
+  partial: number;
+  rejected: number;
+  typedThrough: number;
+  acceptRate: number;
+  learnedMaxLines: number;
+  learnedNumPredict: number;
+  /** The limits were learned; `false`: the configured defaults (< 10 outcomes or adaptive off). */
+  learned: boolean;
+  examples: number;
+}
+
+/** Core `completion/stats` as text: one block per language, then the log path. */
+export function formatStats(stats: { languages?: Record<string, LanguageStats>; logPath?: string | null; adaptive?: boolean }): string {
+  const lines: string[] = [];
+  for (const [lang, l] of Object.entries(stats.languages ?? {})) {
+    lines.push(
+      `${lang}: ${Math.round(l.acceptRate * 100)}% accepted of ${l.served}`,
+      `  accepted ${l.accepted} · partial ${l.partial} · typed through ${l.typedThrough} · rejected ${l.rejected}`,
+      `  ${l.learned && stats.adaptive ? 'learned' : 'default'}: ${l.learnedMaxLines} lines, ${l.learnedNumPredict} tokens, ` +
+        `${l.examples} example${l.examples === 1 ? '' : 's'}`
+    );
+  }
+  if (lines.length === 0) lines.push('No completion outcomes recorded yet.');
+  lines.push('', `Adaptive completions: ${stats.adaptive ? 'on' : 'off'}`);
+  if (stats.logPath) lines.push(`Outcome log: ${stats.logPath}`);
+  return lines.join('\n');
+}
+
+/** Shows core `completion/stats`. */
+export async function showCompletionStats(deps: CommandDeps): Promise<void> {
+  let stats: Parameters<typeof formatStats>[0];
+  try {
+    stats = await deps.client.request('completion/stats', {});
+  } catch (e) {
+    deps.ui.error(`LocalPilot: could not read completion stats: ${errorMessage(e)}`);
+    return;
+  }
+  await deps.ui.showText('LocalPilot completion stats', formatStats(stats));
+}
+
+/** Core `completion/resetLearning` after a confirmation (the outcome log itself is kept). */
+export async function resetLearning(deps: CommandDeps): Promise<void> {
+  const ok = await deps.ui.confirm(
+    'Reset completion learning?',
+    'Reset what LocalPilot learned from your completions (lengths and style examples)? The outcome log is kept.',
+    'Reset'
+  );
+  if (!ok) return;
+  try {
+    await deps.client.request('completion/resetLearning', {});
+    deps.ui.info('LocalPilot: completion learning was reset.');
+  } catch (e) {
+    deps.ui.error(`LocalPilot: could not reset learning: ${errorMessage(e)}`);
+  }
+}
+
 /** Registers the LocalPilot commands and their palette items (the open-chat shortcut is in the schema). */
 export function registerCommands(deps: CommandDeps): IDisposable {
   const set = new DisposableSet();
@@ -185,6 +301,30 @@ export function registerCommands(deps: CommandDeps): IDisposable {
     commands.addCommand(COMMANDS.restartCore, {
       label: 'Restart LocalPilot Core',
       execute: () => deps.restartCore().catch(report('restarting the core'))
+    })
+  );
+  set.add(
+    commands.addCommand(COMMANDS.selectChatModel, {
+      label: 'Select Chat Model…',
+      execute: () => selectModel(deps, 'chat')
+    })
+  );
+  set.add(
+    commands.addCommand(COMMANDS.selectCompletionModel, {
+      label: 'Select Completion Model…',
+      execute: () => selectModel(deps, 'completion')
+    })
+  );
+  set.add(
+    commands.addCommand(COMMANDS.showCompletionStats, {
+      label: 'Show Completion Stats',
+      execute: () => showCompletionStats(deps)
+    })
+  );
+  set.add(
+    commands.addCommand(COMMANDS.resetLearning, {
+      label: 'Reset Completion Learning…',
+      execute: () => resetLearning(deps)
     })
   );
   for (const command of Object.values(COMMANDS)) {

@@ -85,6 +85,12 @@
       "enum": ["error", "warn", "info", "debug", "trace"],
       "default": "info",
       "description": "Kept for parity with VS Code; ignored here. The Jupyter server launches the core: set c.LocalPilot.core_log_level in the server config."
+    },
+    "adaptiveCompletions": {
+      "title": "Adaptive completions",
+      "type": "boolean",
+      "default": true,
+      "description": "Learn from what you do with suggestions (accepted, partly taken, typed through, rejected): per language, adapt how long completions are and add a few of your accepted completions as style examples. Outcomes are logged to .localpilot/completions.jsonl in the server root either way."
     }
   },
   "additionalProperties": false

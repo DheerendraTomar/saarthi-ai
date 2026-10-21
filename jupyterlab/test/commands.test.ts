@@ -13,6 +13,7 @@ function setup() {
   let settings: Settings = { ...DEFAULT_SETTINGS, completionModel: 'qwen-coder', chatModel: 'qwen-chat' };
   const progress: Array<(p: unknown) => void> = [];
   const requests: Array<[string, unknown]> = [];
+  const answers = new Map<string, () => unknown>();
   const deps: CommandDeps = {
     commands,
     activateById: jest.fn(),
@@ -30,6 +31,8 @@ function setup() {
       request: (async (method: string, params?: unknown) => {
         requests.push([method, params]);
         if (method === 'ollama/pull') for (const p of progress) p({ model: 'qwen-coder', status: 'pulling', completed: 1, total: 4 });
+        const answer = answers.get(method);
+        if (answer) return answer();
         return method === 'ollama/status' ? { ollama: 'ok', detail: '' } : {};
       }) as CommandDeps['client']['request'],
       onNotification: (method: string, handler: (p: unknown) => void) => {
@@ -37,18 +40,28 @@ function setup() {
         return { isDisposed: false, dispose: () => progress.splice(progress.indexOf(handler), 1) };
       }
     },
-    chat: { newSession: jest.fn(async () => undefined) },
+    chat: { newSession: jest.fn(async () => undefined), postModels: jest.fn(async () => undefined) },
     settings: () => settings,
+    setSetting: jest.fn(async (key: keyof Settings, value: unknown) => {
+      settings = { ...settings, [key]: value };
+    }),
     setCompletionsEnabled: jest.fn(async (on: boolean) => {
       settings = { ...settings, completionsEnabled: on };
     }),
     restartCore: jest.fn(async () => undefined),
     onStatus: jest.fn(),
     onPullProgress: jest.fn(),
-    ui: { info: jest.fn(), error: jest.fn(), pickModel: jest.fn(async () => undefined) }
+    ui: {
+      info: jest.fn(),
+      error: jest.fn(),
+      pickModel: jest.fn(async () => undefined),
+      pickItem: jest.fn(async () => undefined),
+      confirm: jest.fn(async () => false),
+      showText: jest.fn(async () => undefined)
+    }
   };
   const registered = registerCommands(deps);
-  return { commands, deps, opened, terminals, running, requests, progress, registered };
+  return { commands, deps, opened, terminals, running, requests, progress, registered, answers, current: () => settings };
 }
 
 describe('open-chat shortcut', () => {
@@ -123,5 +136,73 @@ describe('commands', () => {
     await commands.execute(COMMANDS.pullModel);
     expect(deps.ui.pickModel).toHaveBeenCalledWith(['qwen-coder', 'qwen-chat']);
     expect(requests.filter(([m]) => m === 'ollama/pull')).toHaveLength(1);
+  });
+
+  it('select_model_writes_the_picked_installed_model', async () => {
+    const { commands, deps, answers, current } = setup();
+    answers.set('ollama/models', () => ({
+      models: [
+        { name: 'qwen-chat', sizeBytes: 17e9, supportsInsert: false, supportsTools: true },
+        { name: 'fim-2', sizeBytes: 986e6, supportsInsert: true, supportsTools: false }
+      ]
+    }));
+    (deps.ui.pickItem as jest.Mock).mockResolvedValueOnce('fim-2');
+    await commands.execute(COMMANDS.selectCompletionModel);
+    const [title, items, selected] = (deps.ui.pickItem as jest.Mock).mock.calls[0];
+    expect(title).toBe('Completion model');
+    expect(items).toEqual(['qwen-chat', 'fim-2']);
+    expect(selected).toBe('qwen-coder'); // not installed: nothing preselected beyond the current name
+    expect(deps.setSetting).toHaveBeenCalledWith('completionModel', 'fim-2');
+    expect(current().completionModel).toBe('fim-2');
+    expect(deps.chat.postModels).toHaveBeenCalled();
+
+    // Cancelled: nothing written.
+    await commands.execute(COMMANDS.selectChatModel);
+    expect(deps.setSetting).toHaveBeenCalledTimes(1);
+
+    // Ollama down: an error, no picker.
+    answers.set('ollama/models', () => {
+      throw new Error('connection refused');
+    });
+    await commands.execute(COMMANDS.selectChatModel);
+    expect(deps.ui.pickItem).toHaveBeenCalledTimes(2);
+    expect((deps.ui.error as jest.Mock).mock.calls.at(-1)[0]).toContain('connection refused');
+  });
+
+  it('reset_learning_asks_first_and_stats_are_shown', async () => {
+    const { commands, deps, requests, answers } = setup();
+    await commands.execute(COMMANDS.resetLearning);
+    expect(deps.ui.confirm).toHaveBeenCalledTimes(1);
+    expect(requests.filter(([m]) => m === 'completion/resetLearning')).toHaveLength(0);
+    (deps.ui.confirm as jest.Mock).mockResolvedValueOnce(true);
+    await commands.execute(COMMANDS.resetLearning);
+    expect(requests.filter(([m]) => m === 'completion/resetLearning')).toHaveLength(1);
+    expect(deps.ui.info).toHaveBeenLastCalledWith('LocalPilot: completion learning was reset.');
+
+    answers.set('completion/stats', () => ({
+      languages: {
+        python: {
+          served: 20,
+          accepted: 8,
+          partial: 2,
+          rejected: 9,
+          typedThrough: 1,
+          acceptRate: 0.5,
+          learnedMaxLines: 4,
+          learnedNumPredict: 48,
+          learned: true,
+          examples: 3
+        }
+      },
+      logPath: '/w/.localpilot/completions.jsonl',
+      adaptive: true
+    }));
+    await commands.execute(COMMANDS.showCompletionStats);
+    const [title, body] = (deps.ui.showText as jest.Mock).mock.calls[0];
+    expect(title).toBe('LocalPilot completion stats');
+    expect(body).toContain('python: 50% accepted of 20');
+    expect(body).toContain('accepted 8 · partial 2 · typed through 1 · rejected 9');
+    expect(body).toContain('learned: 4 lines, 48 tokens, 3 examples');
+    expect(body).toContain('/w/.localpilot/completions.jsonl');
   });
 });

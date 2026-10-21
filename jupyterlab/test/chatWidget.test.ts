@@ -4,6 +4,7 @@ import { Widget } from '@lumino/widgets';
 import { CoreDisconnected } from '../src/client';
 import { CHAT_WIDGET_ID, ChatWidget, renderHtml, type ChatClient, type ChatWidgetDeps } from '../src/chat/chatWidget';
 import { THEME_MAP, jupyterThemeVars } from '../src/chat/theme';
+import { DEFAULT_SETTINGS, type Settings } from '../src/settings';
 
 // A fake core client: canned answers per method, captured notification
 // handlers and disconnect listeners. The widget's iframe is real (jsdom); its
@@ -62,6 +63,7 @@ const CELL = 'file:///root/nb.ipynb.cell0.py';
 
 function setup(overrides: Partial<ChatWidgetDeps> = {}) {
   const client = new FakeClient();
+  const store: { settings: Settings } = { settings: { ...DEFAULT_SETTINGS, chatModel: 'chat-a', completionModel: 'fim-a' } };
   client.answers.set('chat/listSessions', () => ({ sessions: SESSIONS }));
   client.answers.set('chat/history', (p) => ({ sessionId: p.sessionId, messages: [{ role: 'user', content: `hello ${p.sessionId}` }] }));
   const deps: ChatWidgetDeps = {
@@ -73,6 +75,10 @@ function setup(overrides: Partial<ChatWidgetDeps> = {}) {
     pullModel: jest.fn(async () => undefined),
     onChatActiveChanged: jest.fn(),
     themeVars: () => ({ '--vscode-foreground': '#101010' }),
+    settings: () => store.settings,
+    setSetting: jest.fn(async (key: keyof Settings, value: unknown) => {
+      store.settings = { ...store.settings, [key]: value };
+    }),
     ...overrides
   };
   const widget = new ChatWidget(client, deps);
@@ -89,7 +95,7 @@ function setup(overrides: Partial<ChatWidgetDeps> = {}) {
     await new Promise((r) => setTimeout(r, 0));
   };
   const types = () => posted.map((m) => m.type);
-  return { client, deps, widget, frame, posted, fromUi, types };
+  return { client, deps, widget, frame, posted, fromUi, types, store };
 }
 
 let current: ChatWidget | undefined;
@@ -386,6 +392,227 @@ describe('ChatWidget', () => {
     expect(posted).toEqual([
       { type: 'ui/activeFile', uri: CELL },
       { type: 'ui/activeFile', uri: null }
+    ]);
+  });
+
+  // ------------------------------------------------------------ v2 host contract
+
+  const MODELS = [
+    { name: 'chat-a', sizeBytes: 1, supportsInsert: false, supportsTools: true },
+    { name: 'chat-b', sizeBytes: 2, supportsInsert: false, supportsTools: true },
+    { name: 'fim-b', sizeBytes: 3, supportsInsert: true, supportsTools: false }
+  ];
+  const ofType = (posted: Array<Record<string, unknown>>, type: string) => posted.filter((m) => m.type === type);
+
+  it('models_list_reports_ollama_down_with_error', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    client.answers.set('ollama/models', () => ({ models: MODELS }));
+    widget.setStatus({ ollama: 'modelMissing', detail: 'x' });
+    await fromUi({ type: 'models/list' });
+    expect(ofType(posted, 'models/list')).toEqual([
+      { type: 'models/list', models: MODELS, current: { chat: 'chat-a', completion: 'fim-a' }, ollama: 'modelMissing' }
+    ]);
+    posted.length = 0;
+    client.answers.set('ollama/models', () => {
+      throw new Error('Ollama is not reachable at http://localhost:11434');
+    });
+    await fromUi({ type: 'models/list' });
+    expect(posted).toEqual([
+      {
+        type: 'models/list',
+        models: [],
+        current: { chat: 'chat-a', completion: 'fim-a' },
+        ollama: 'down',
+        error: 'Ollama is not reachable at http://localhost:11434'
+      }
+    ]);
+  });
+
+  it('model_select_always_answers_models_list', async () => {
+    const { client, deps, widget, posted, fromUi, store } = setup();
+    current = widget;
+    client.answers.set('ollama/models', () => ({ models: MODELS }));
+    await fromUi({ type: 'model/select', kind: 'chat', name: 'chat-b' });
+    expect(deps.setSetting).toHaveBeenCalledWith('chatModel', 'chat-b');
+    expect(ofType(posted, 'models/list').at(-1)?.current).toEqual({ chat: 'chat-b', completion: 'fim-a' });
+    expect(ofType(posted, 'ui/error')).toEqual([]);
+
+    // A name Ollama does not have is never written; the answer reverts the pick.
+    posted.length = 0;
+    await fromUi({ type: 'model/select', kind: 'completion', name: 'evil; rm -rf' });
+    expect(deps.setSetting).toHaveBeenCalledTimes(1);
+    expect(posted.map((m) => m.type)).toEqual(['ui/error', 'models/list']);
+    expect(posted[1].current).toEqual({ chat: 'chat-b', completion: 'fim-a' });
+
+    // A failed write still answers.
+    posted.length = 0;
+    (deps.setSetting as jest.Mock).mockRejectedValueOnce(new Error('read-only settings'));
+    await fromUi({ type: 'model/select', kind: 'completion', name: 'fim-b' });
+    expect(posted.map((m) => m.type)).toEqual(['ui/error', 'models/list']);
+    expect(String(posted[0].message)).toContain('read-only settings');
+    expect(posted[1].current).toEqual({ chat: 'chat-b', completion: 'fim-a' });
+    expect(store.settings.completionModel).toBe('fim-a');
+
+    // Bad kind: nothing written, still answered.
+    posted.length = 0;
+    await fromUi({ type: 'model/select', kind: 'other', name: 'chat-a' });
+    expect(deps.setSetting).toHaveBeenCalledTimes(2);
+    expect(posted.map((m) => m.type)).toEqual(['models/list']);
+  });
+
+  it('settings_set_always_answers_settings_current', async () => {
+    const { deps, widget, posted, fromUi, store } = setup();
+    current = widget;
+    await fromUi({ type: 'settings/get' });
+    const panel = (s: Settings) => ({
+      type: 'settings/current',
+      settings: {
+        completionModel: s.completionModel,
+        completionMaxTokens: s.completionMaxTokens,
+        completionDebounceMs: s.completionDebounceMs,
+        completionContextTokens: s.completionContextTokens,
+        adaptiveCompletions: s.adaptiveCompletions
+      }
+    });
+    expect(posted).toEqual([panel(store.settings)]);
+
+    posted.length = 0;
+    await fromUi({
+      type: 'settings/set',
+      patch: {
+        completionMaxTokens: 0,
+        completionDebounceMs: -5.4,
+        completionContextTokens: 100.6,
+        adaptiveCompletions: false,
+        completionModel: 'sneaky',
+        ollamaUrl: 'http://evil'
+      }
+    });
+    expect((deps.setSetting as jest.Mock).mock.calls).toEqual([
+      ['completionMaxTokens', 1],
+      ['completionDebounceMs', 0],
+      ['completionContextTokens', 256],
+      ['adaptiveCompletions', false]
+    ]);
+    expect(posted).toEqual([panel(store.settings)]);
+    expect(store.settings.completionModel).toBe('fim-a');
+
+    // A failed write: an error, and the answer still comes (with the committed values).
+    posted.length = 0;
+    (deps.setSetting as jest.Mock).mockRejectedValueOnce(new Error('nope'));
+    await fromUi({ type: 'settings/set', patch: { completionMaxTokens: 64 } });
+    expect(posted.map((m) => m.type)).toEqual(['ui/error', 'settings/current']);
+    expect((posted[1].settings as Settings).completionMaxTokens).toBe(1);
+    // Garbage patch: answered all the same.
+    posted.length = 0;
+    await fromUi({ type: 'settings/set', patch: 'x' });
+    expect(posted).toEqual([panel(store.settings)]);
+  });
+
+  it('session_delete_running_turn_posts_ui_error', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    await fromUi({ type: 'ui/ready' });
+    client.answers.set('chat/deleteSession', (p) => {
+      if (p.sessionId === 's1') throw Object.assign(new Error('turn running in session s1'), { code: -32602 });
+      return {};
+    });
+    posted.length = 0;
+    await fromUi({ type: 'session/delete', sessionId: 's1' });
+    expect(posted.map((m) => m.type)).toEqual(['ui/error']);
+    expect(String(posted[0].message)).toMatch(/still running/);
+    expect(widget.currentSessionId).toBe('s1');
+
+    // Deleting the current session: session/deleted with the next one, then the list.
+    client.answers.set('chat/deleteSession', () => ({}));
+    client.answers.set('chat/listSessions', () => ({ sessions: SESSIONS.slice(1) }));
+    posted.length = 0;
+    await fromUi({ type: 'session/delete', sessionId: 's1' });
+    expect(client.calls.filter(([m]) => m === 'chat/deleteSession').at(-1)).toEqual(['chat/deleteSession', { sessionId: 's1' }]);
+    expect(posted).toEqual([
+      { type: 'session/deleted', sessionId: 's1', next: 's2' },
+      { type: 'session/list', sessions: SESSIONS.slice(1), current: 's2' }
+    ]);
+    expect(widget.currentSessionId).toBe('s2');
+  });
+
+  it('clear_all_posts_one_deleted_per_session', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    const three = [...SESSIONS, { sessionId: 's3', title: 'third', updatedAtMs: 0 }];
+    client.answers.set('chat/listSessions', () => ({ sessions: three }));
+    await fromUi({ type: 'ui/ready' });
+    client.answers.set('chat/clearSessions', () => {
+      client.answers.set('chat/listSessions', () => ({ sessions: [three[1]] }));
+      return { deleted: 2, skipped: ['s2'] };
+    });
+    posted.length = 0;
+    await fromUi({ type: 'session/clearAll' });
+    expect(posted).toEqual([
+      { type: 'session/deleted', sessionId: 's1', next: 's2' },
+      { type: 'session/deleted', sessionId: 's3', next: 's2' },
+      { type: 'ui/error', message: '1 session with a running reply was kept.' },
+      { type: 'session/list', sessions: [three[1]], current: 's2' }
+    ]);
+
+    // Nothing left: next is null.
+    client.answers.set('chat/clearSessions', () => {
+      client.answers.set('chat/listSessions', () => ({ sessions: [] }));
+      return { deleted: 1, skipped: [] };
+    });
+    posted.length = 0;
+    await fromUi({ type: 'session/clearAll' });
+    expect(posted).toEqual([
+      { type: 'session/deleted', sessionId: 's2', next: null },
+      { type: 'session/list', sessions: [], current: null }
+    ]);
+  });
+
+  it('reset_learning_then_stats_in_order', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    let finishReset!: () => void;
+    client.answers.set('completion/resetLearning', () => new Promise<object>((r) => (finishReset = () => r({}))));
+    const stats = { languages: {}, logPath: '/w/.localpilot/completions.jsonl', adaptive: true };
+    client.answers.set('completion/stats', () => stats);
+    await fromUi({ type: 'completion/resetLearning' });
+    await fromUi({ type: 'completion/stats' });
+    // The stats request waits for the reset.
+    expect(client.methods()).toEqual(['completion/resetLearning']);
+    expect(posted).toEqual([]);
+    finishReset();
+    await fromUi({ type: 'noop' });
+    expect(client.methods()).toEqual(['completion/resetLearning', 'completion/stats']);
+    expect(posted).toEqual([{ type: 'completion/stats', stats }]);
+  });
+
+  it('another_tab_deleting_sessions_updates_this_ui', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    await fromUi({ type: 'ui/ready' });
+    client.answers.set('chat/listSessions', () => ({ sessions: SESSIONS.slice(1) }));
+    posted.length = 0;
+    client.notifyUi('localpilot/sessionsChanged', { deleted: ['s1'] });
+    await fromUi({ type: 'noop' });
+    expect(posted).toEqual([
+      { type: 'session/deleted', sessionId: 's1', next: 's2' },
+      { type: 'session/list', sessions: SESSIONS.slice(1), current: 's2' }
+    ]);
+  });
+
+  it('ready_reports_turns_running_in_other_sessions', async () => {
+    const { client, widget, posted, fromUi } = setup();
+    current = widget;
+    await fromUi({ type: 'ui/ready' });
+    // s2 (not the current session) has a turn waiting on approval here.
+    client.notifyUi('chat/toolCall', { sessionId: 's2', toolCallId: 't2', name: 'run_command', args: {}, requiresApproval: true });
+    expect(posted.at(-1)).toEqual({ type: 'chat/turnState', sessionId: 's2', running: true });
+    posted.length = 0;
+    await fromUi({ type: 'ui/ready' });
+    expect(ofType(posted, 'chat/turnState')).toEqual([
+      { type: 'chat/turnState', sessionId: 's1', running: false },
+      { type: 'chat/turnState', sessionId: 's2', running: true }
     ]);
   });
 });

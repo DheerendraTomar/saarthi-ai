@@ -29,6 +29,8 @@ export interface Settings {
   completionContextTokens: number;
   chatContextTokens: number;
   logLevel: string;
+  /** Let the core adapt completion length and style examples to the user's accept/reject outcomes. */
+  adaptiveCompletions: boolean;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -43,7 +45,8 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   allowedCommandsAlways: [],
   completionContextTokens: 3584,
   chatContextTokens: 24000,
-  logLevel: 'info'
+  logLevel: 'info',
+  adaptiveCompletions: true
 });
 
 /** Wait for edits to settle before restarting the core (VS Code uses the same). */

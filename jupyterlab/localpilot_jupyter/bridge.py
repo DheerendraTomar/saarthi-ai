@@ -9,7 +9,7 @@ Tab → core
 - Other requests: the id is rewritten to the string `"<tab>:<json id>"` and forwarded;
   the core's response is routed back to that tab with its original id restored.
   While the core is stopped/crashed they fail at once with -32603.
-- `completion/request|cancel|accepted|rejected`: `params.requestId` is rewritten to
+- `completion/request|cancel|accepted|rejected|outcome`: `params.requestId` is rewritten to
   `"<tab>:<requestId>"`, so two tabs' request ids never collide in the core.
 - `chat/send` records `sessionId → tab` (ownership) unless the session has a running
   turn whose owner is still connected (the core will refuse that send, and the turn's
@@ -18,6 +18,12 @@ Tab → core
   session's `chat/done`. Other `chat/*` requests naming a session whose owner is gone
   adopt it; a `chat/history` that adopts a session is followed (after its response) by a
   replay of that session's pending `chat/toolCall`.
+- `chat/deleteSession` / `chat/clearSessions` never adopt a session (a tab may delete a
+  session another tab owns; the core refuses one with a running turn). On success the
+  bridge drops its ownership / running / pending-call entries for the deleted sessions
+  (for `clearSessions`: every session not in `skipped`) and sends every *other* tab
+  `localpilot/sessionsChanged` (`{deleted: [id]}` or `{cleared: true, skipped}`), so
+  their chat panels refresh; the deleting tab updates its own UI from the response.
 - Document sync is refcounted per (uri, tab): `didOpen` is forwarded only for the first
   tab opening a uri (a later tab's `didOpen` becomes a full-text `didChange`, so the
   core holds that tab's text), `didChange`/`didSave` always, `didClose` only when the
@@ -60,8 +66,12 @@ METHOD_NOT_FOUND = -32601
 PARSE_ERROR = -32700
 #: Methods whose `params.requestId` is namespaced per tab.
 REQUEST_ID_METHODS = frozenset(
-    {"completion/request", "completion/cancel", "completion/accepted", "completion/rejected"}
+    {"completion/request", "completion/cancel", "completion/accepted", "completion/rejected", "completion/outcome"}
 )
+#: Session deletions: never adopt the session; on success the bridge forgets it and tells the other tabs.
+DELETE_METHODS = frozenset({"chat/deleteSession", "chat/clearSessions"})
+#: Bridge-originated notification to the other tabs after a successful deletion.
+SESSIONS_CHANGED = "localpilot/sessionsChanged"
 #: WebSocket close code "Service Restart".
 CLOSE_RESTART = 1012
 
@@ -112,6 +122,8 @@ class Bridge:
         # forwarded chat/send id → [session, whether it had a running turn when forwarded,
         # stale]; a successful response starts a turn unless the turn already ended (stale)
         self._send_after: dict[str, list[Any]] = {}
+        # forwarded chat/deleteSession|clearSessions id → the deleted session (None: clear all)
+        self._delete_after: dict[str, Optional[str]] = {}
         # sessions with a running turn (successful chat/send until chat/done)
         self._running: set[str] = set()
         # document uri → tabs that have it open
@@ -167,6 +179,7 @@ class Bridge:
             del self._pending_client[key]
             self._replay_after.pop(key, None)
             self._send_after.pop(key, None)
+            self._delete_after.pop(key, None)
         for uri in [u for u, holders in self._docs.items() if tab_id in holders]:
             self._docs[uri].discard(tab_id)
             if not self._docs[uri]:
@@ -245,7 +258,7 @@ class Bridge:
             return
         replay_session: Optional[str] = None
         send_session = params.get("sessionId") if method == "chat/send" else None
-        if method.startswith("chat/"):
+        if method.startswith("chat/") and method not in DELETE_METHODS:
             replay_session = self._track_chat_request(tab_id, method, params)
         if method in REQUEST_ID_METHODS:
             self._namespace_request_id(tab_id, msg)
@@ -263,11 +276,16 @@ class Bridge:
             self._replay_after[forwarded] = replay_session
         if isinstance(send_session, str):
             self._send_after[forwarded] = [send_session, send_session in self._running, False]
+        if method == "chat/clearSessions":
+            self._delete_after[forwarded] = None
+        elif method == "chat/deleteSession" and isinstance(params.get("sessionId"), str):
+            self._delete_after[forwarded] = params["sessionId"]
         msg["id"] = forwarded
         if not self._send_core(json.dumps(msg)):
             self._pending_client.pop(forwarded, None)
             self._replay_after.pop(forwarded, None)
             self._send_after.pop(forwarded, None)
+            self._delete_after.pop(forwarded, None)
             self._send_tab(tab_id, _error(id_value, INTERNAL_ERROR, "LocalPilot core is not running"))
 
     async def _initialize(self, tab_id: str, id_value: Any, params: dict[str, Any]) -> None:
@@ -383,11 +401,35 @@ class Bridge:
             self._owners[sent_session] = tab_id
             if not stale:
                 self._running.add(sent_session)
+        deleting = forwarded in self._delete_after
+        deleted_session = self._delete_after.pop(forwarded, None)
         msg["id"] = original
         self._send_tab(tab_id, json.dumps(msg))
+        if deleting and "error" not in msg:
+            self._sessions_deleted(tab_id, deleted_session, msg.get("result"))
         session = self._replay_after.pop(forwarded, None)
         if session is not None and self._owners.get(session) == tab_id and session in self._pending_calls:
             self._send_tab(tab_id, self._pending_calls[session][1])
+
+    def _sessions_deleted(self, tab_id: str, session: Optional[str], result: Any) -> None:
+        """A successful `chat/deleteSession` (`session`) or `chat/clearSessions` (None) from `tab_id`."""
+        if session is not None:
+            gone = {session}
+            params: dict[str, Any] = {"deleted": [session]}
+        else:
+            raw = result.get("skipped") if isinstance(result, dict) else None
+            skipped = [s for s in raw if isinstance(s, str)] if isinstance(raw, list) else []
+            known = set(self._owners) | set(self._running) | set(self._pending_calls)
+            gone = known - set(skipped)
+            params = {"cleared": True, "skipped": skipped}
+        for s in gone:
+            self._owners.pop(s, None)
+            self._running.discard(s)
+            self._pending_calls.pop(s, None)
+        line = json.dumps({"jsonrpc": "2.0", "method": SESSIONS_CHANGED, "params": params})
+        for other in list(self.tabs):
+            if other != tab_id:
+                self._send_tab(other, line)
 
     def _notification_from_core(self, method: str, msg: dict[str, Any], line: str) -> None:
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
@@ -457,6 +499,7 @@ class Bridge:
         self._pending_core.clear()
         self._replay_after.clear()
         self._send_after.clear()
+        self._delete_after.clear()
         self._running.clear()
         self._pending_calls.clear()
         # The next core starts with an empty overlay; tabs re-send didOpen after reconnecting.

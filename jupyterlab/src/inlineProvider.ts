@@ -49,15 +49,54 @@ interface Target {
   text: SharedText;
 }
 
+/** How long a partly taken suggestion may sit without progress before its outcome is reported. */
+export const OUTCOME_IDLE_MS = 2000;
+
+/** The shown suggestion, watched through its document's changes until its outcome is known. */
 interface Shown {
   requestId: string;
   uri: string;
-  /** The document text before and after the cursor when it was shown. */
-  prefix: string;
-  suffix: string;
-  /** The document text up to the cursor followed by each item's text: an accepted item starts the source. */
-  accepted: string[];
+  /** The document text before and after the cursor when it was requested. */
+  before: string;
+  after: string;
+  suggestion: string;
+  /** The longest prefix of `suggestion` now between `before` and `after`. */
+  gained: string;
+  /** What was there when shown (progress means gaining more). */
+  baseline: number;
+  /** Some gain arrived as a chunk: one edit inserting ≥ 2 characters (with a letter or digit), e.g. the completer's accept. */
+  chunked: boolean;
+  timer?: ReturnType<typeof setTimeout>;
   off: () => void;
+}
+
+/**
+ * The part of `middle` that is a prefix of `suggestion`, allowing trailing
+ * auto-closed brackets/quotes the suggestion still has later (typing `foo(`
+ * gives `foo()` while the suggestion is `foo(1)`); undefined once it diverged.
+ * (Same rule as the VS Code client.)
+ */
+function matchedPrefix(middle: string, suggestion: string): string | undefined {
+  if (suggestion.startsWith(middle)) return middle;
+  const closers = /[)\]}"'`]+$/.exec(middle);
+  if (!closers) return undefined;
+  const prefix = middle.slice(0, closers.index);
+  if (!suggestion.startsWith(prefix)) return undefined;
+  let rest = suggestion.slice(prefix.length);
+  for (const c of closers[0]) {
+    const i = rest.indexOf(c);
+    if (i < 0) return undefined;
+    rest = rest.slice(i + 1);
+  }
+  return prefix;
+}
+
+/** The text one change inserted (a shared model's `sourceChange` delta with a single insert), else "". */
+function insertedText(change: unknown): string {
+  const delta = (change as { sourceChange?: unknown } | null)?.sourceChange;
+  if (!Array.isArray(delta)) return '';
+  const inserts = delta.filter((op) => typeof (op as { insert?: unknown })?.insert === 'string');
+  return inserts.length === 1 ? (inserts[0] as { insert: string }).insert : '';
 }
 
 const EMPTY: IInlineCompletionList = { items: [] };
@@ -124,11 +163,25 @@ interface Attachment {
  *   in-flight request is aborted with `completion/cancel`; so is one that
  *   outlives the completer's own deadline (`debouncerDelay + timeout` for a
  *   typing trigger, `timeout` for an explicit invoke).
- * - Accept/reject: the completer has no hook. A shown item counts as accepted
- *   once the document's text starts with the text before the cursor plus the
- *   item (what `InlineCompleter.accept()` produces). Typing through it (the
- *   ghost text stays) keeps it pending; any other next `fetch` reports it
- *   `completion/rejected`.
+ * - Outcomes (`completion/outcome`): the completer has no accept hook and no
+ *   partial accept (4.5 offers only the full `accept()`, which inserts the
+ *   rest of the item in one edit). The shown suggestion (the first item) is
+ *   watched through its cell's / file's `sharedModel.changed`, as the VS Code
+ *   client does: a "chunk" is one edit inserting ≥ 2 characters (with a
+ *   letter or digit) that extends the suggestion — the completer's accept, or
+ *   (a known bias) a tab-completer accept or paste that matches the ghost
+ *   text. Once the text between the suggestion's surroundings is the whole
+ *   suggestion (trailing whitespace ignored), stops matching, or
+ *   `OUTCOME_IDLE_MS` pass without progress, it is reported once:
+ *   - whole, with a chunk → `accepted` (with `acceptedText`);
+ *   - whole, typed key by key → `typedThrough`;
+ *   - part of it with a chunk → `partial` with `acceptedText`;
+ *   - otherwise (untouched and superseded by the next fetch, or only part of
+ *     it typed by hand) → `rejected`.
+ *   Typing into the ghost text keeps it watched; when the next fetch shows
+ *   the rest of it (the core's typed-prefix cache hit, whose request id the
+ *   core resolves to the original suggestion) the watch moves to the new id
+ *   unreported, keeping whether a chunk was taken.
  */
 export class LocalPilotInlineProvider implements IInlineCompletionProvider {
   readonly identifier = 'localpilot';
@@ -187,7 +240,7 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
     const jsIdx = Text.charIndexToJsIndex(request.offset, request.text);
     const prefix = request.text.slice(0, jsIdx);
     const suffix = request.text.slice(jsIdx);
-    this.supersede(target?.uri, prefix, suffix, request.text);
+    this.supersede(target?.uri);
     if (!target || client.state !== 'ready') return EMPTY;
     // The active cell can change within the debounce window: the request must be about this text.
     if (target.text.getSource() !== request.text) return EMPTY;
@@ -234,7 +287,7 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
       .filter((item) => typeof item?.text === 'string' && item.text.length > 0)
       .map((item) => ({ insertText: item.text }));
     if (items.length === 0) return EMPTY;
-    this.show({ requestId, uri: target.uri, prefix, suffix, accepted: items.map((i) => prefix + i.insertText) }, target);
+    this.show(requestId, target, prefix, suffix, items[0].insertText);
     return { items };
   }
 
@@ -246,64 +299,113 @@ export class LocalPilotInlineProvider implements IInlineCompletionProvider {
   private detach(): void {
     this.inflight?.cancel(false);
     this.inflight = undefined;
-    this.shown?.off();
-    this.shown = undefined;
+    if (this.shown) this.unwatch(this.shown);
     this.attached = undefined;
   }
 
   /**
-   * Watches the document for the shown items being accepted. A suggestion
-   * still pending (typed through) is handed off unreported: the core served
-   * the new one from the same cache entry.
+   * Watches `target` for what happens to `suggestion` (requested between
+   * `before` and `after`). A suggestion still being typed through whose rest
+   * this one is hands its watch over unreported; any other is settled first.
    */
-  private show(info: Omit<Shown, 'off'>, target: Target): void {
-    this.shown?.off();
-    const changed = () => {
-      if (this.shown === shown && this.isAccepted(target.text.getSource())) this.report('completion/accepted');
+  private show(requestId: string, target: Target, before: string, after: string, suggestion: string): void {
+    const prev = this.shown;
+    let chunked = false;
+    if (prev) {
+      const handOff =
+        prev.uri === target.uri &&
+        prev.gained.length > prev.baseline &&
+        prev.before + prev.gained === before &&
+        prev.suggestion === prev.gained + suggestion;
+      if (handOff) {
+        chunked = prev.chunked;
+        this.unwatch(prev);
+      } else {
+        this.finish(prev);
+      }
+    }
+    const changed = (_: unknown, change: unknown) => {
+      if (this.shown === shown) this.update(shown, target.text.getSource(), insertedText(change));
     };
+    const shown: Shown = {
+      requestId,
+      uri: target.uri,
+      before,
+      after,
+      suggestion,
+      gained: '',
+      baseline: 0,
+      chunked,
+      off: () => target.text.changed.disconnect(changed)
+    };
+    // The user may have typed on while the request ran.
+    const now = this.matched(shown, target.text.getSource());
+    if (now !== undefined) {
+      shown.gained = now;
+      shown.baseline = now.length;
+    }
     target.text.changed.connect(changed);
-    const shown: Shown = { ...info, off: () => target.text.changed.disconnect(changed) };
     this.shown = shown;
   }
 
-  private isAccepted(source: string): boolean {
-    return this.shown?.accepted.some((text) => source.startsWith(text)) ?? false;
+  /** The part of the suggestion now between its surroundings in `text`; undefined once it diverged. */
+  private matched(t: Shown, text: string): string | undefined {
+    const fits = text.length >= t.before.length + t.after.length && text.startsWith(t.before) && text.endsWith(t.after);
+    return fits ? matchedPrefix(text.slice(t.before.length, text.length - t.after.length), t.suggestion) : undefined;
   }
 
-  /** Reports the shown suggestion once, then stops watching it. */
-  private report(method: 'completion/accepted' | 'completion/rejected'): void {
-    const shown = this.shown;
-    if (!shown) return;
-    this.shown = undefined;
-    shown.off();
-    this.attached?.options.client.notify(method, { requestId: shown.requestId });
+  /** A change to the shown suggestion's document (`inserted`: what the edit inserted, if one insert). */
+  private update(t: Shown, text: string, inserted: string): void {
+    const gained = this.matched(t, text);
+    if (gained === undefined) return this.finish(t);
+    if (gained.length >= t.gained.length + 2 && inserted.length >= 2 && /\w/.test(inserted)) t.chunked = true;
+    t.gained = gained;
+    if (gained.length <= t.baseline) return;
+    // Nothing more to take (trailing whitespace is not required: Enter auto-indents differently).
+    if (gained.trimEnd() === t.suggestion.trimEnd()) return this.finish(t);
+    clearTimeout(t.timer);
+    t.timer = setTimeout(() => this.shown === t && this.finish(t), OUTCOME_IDLE_MS);
+  }
+
+  /** Stops watching `t` without reporting it. */
+  private unwatch(t: Shown): void {
+    clearTimeout(t.timer);
+    t.off();
+    if (this.shown === t) this.shown = undefined;
+  }
+
+  /** Stops watching `t` and reports its outcome (once). */
+  private finish(t: Shown): void {
+    this.unwatch(t);
+    const client = this.attached?.options.client;
+    if (!client) return;
+    const { requestId, gained, suggestion } = t;
+    const progressed = gained.length > t.baseline;
+    const whole = gained.trimEnd() === suggestion.trimEnd();
+    let params: Record<string, string>;
+    if (progressed && whole && t.chunked) params = { requestId, outcome: 'accepted', acceptedText: suggestion };
+    else if (progressed && whole) params = { requestId, outcome: 'typedThrough' };
+    else if (progressed && t.chunked) params = { requestId, outcome: 'partial', acceptedText: gained };
+    else params = { requestId, outcome: 'rejected' };
+    client.notify('completion/outcome', params);
   }
 
   /**
-   * A new fetch (`uri`, cursor between `prefix` and `suffix` of `text`): the
-   * completer has dropped the previous request, so the in-flight one is
-   * cancelled. The shown suggestion is
-   * - accepted if the document already holds it (the completer's change
-   *   listener can run before ours);
-   * - still pending if the user typed into it (the completer keeps the ghost
-   *   text; rejecting would evict the core's cache entry the typed-prefix
-   *   lookup serves from);
-   * - rejected otherwise.
+   * A new fetch for `uri`: the completer has dropped the previous request, so
+   * the in-flight one is cancelled. The shown suggestion is settled after
+   * the current change emission has reached our listener (the completer's
+   * own listener can call `fetch` first, with `debouncerDelay: 0`): rejected
+   * if it is untouched or this fetch is for another document; one being
+   * typed through stays watched (rejecting it would evict the core's cache
+   * entry the typed-prefix lookup serves from).
    */
-  private supersede(uri: string | undefined, prefix: string, suffix: string, text: string): void {
+  private supersede(uri: string | undefined): void {
     this.inflight?.cancel(true);
     this.inflight = undefined;
-    const shown = this.shown;
-    if (!shown) return;
-    if (shown.uri === uri) {
-      if (this.isAccepted(text)) return this.report('completion/accepted');
-      const typedThrough =
-        suffix === shown.suffix &&
-        prefix.length > shown.prefix.length &&
-        prefix.startsWith(shown.prefix) &&
-        shown.accepted.some((item) => item.startsWith(prefix));
-      if (typedThrough) return;
-    }
-    this.report('completion/rejected');
+    if (!this.shown) return;
+    setTimeout(() => {
+      const t = this.shown;
+      if (t && (t.uri !== uri || t.gained.length <= t.baseline)) this.finish(t);
+    }, 0);
   }
 }

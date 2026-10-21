@@ -16,9 +16,19 @@ class FakeShared {
   getSource(): string {
     return this.source;
   }
+  /** Replaces the text, emitting a Yjs-style delta of the change (common prefix/suffix kept), like the shared models. */
   setSource(text: string): void {
+    const old = this.source;
+    let start = 0;
+    while (start < old.length && start < text.length && old[start] === text[start]) start++;
+    let end = 0;
+    while (end < old.length - start && end < text.length - start && old[old.length - 1 - end] === text[text.length - 1 - end]) end++;
+    const delta: Array<Record<string, unknown>> = [];
+    if (start) delta.push({ retain: start });
+    if (old.length - start - end) delta.push({ delete: old.length - start - end });
+    if (text.length - start - end) delta.push({ insert: text.slice(start, text.length - end) });
     this.source = text;
-    this.changed.emit({ sourceChange: [{ insert: text }] });
+    this.changed.emit({ sourceChange: delta });
   }
 }
 
@@ -274,41 +284,79 @@ describe('LocalPilotInlineProvider', () => {
     expect(await result).toEqual({ items: [{ insertText: insert }] });
   }
 
-  it('reports accepted when the suggestion lands in the document', async () => {
+  const outcome = (requestId: string, kind: string, acceptedText?: string) => ({
+    method: 'completion/outcome',
+    params: acceptedText === undefined ? { requestId, outcome: kind } : { requestId, outcome: kind, acceptedText }
+  });
+
+  it('provider_reports_outcome_accepted_and_rejected', async () => {
     const { widget, model } = notebookWidget('c1', 'x = ');
     await show('x = ', '42\ny = x', widget);
-    model.sharedModel.setSource('x = 4'); // typing through the suggestion is not accepting it
+    model.sharedModel.setSource('x = 4'); // one typed character: not an accept
     expect(client.notes).toEqual([]);
-    model.sharedModel.setSource('x = 42\ny = x'); // InlineCompleter.accept()
-    expect(client.notes).toEqual([{ method: 'completion/accepted', params: { requestId: '1' } }]);
-    // The follow-up fetch does not also reject it.
+    model.sharedModel.setSource('x = 42\ny = x'); // InlineCompleter.accept(): the rest in one edit
+    expect(client.notes).toEqual([outcome('1', 'accepted', '42\ny = x')]);
+    // The follow-up fetch does not also report it.
     void provider.fetch(req('x = 42\ny = x'), ctx(widget));
     await flush();
     expect(client.notes).toHaveLength(1);
+
+    // A suggestion the user types past is rejected, once (the pending follow-up fetch was cancelled).
+    await show('x = 42\ny = x', '\nz = 1', widget);
+    const outcomes = () => client.notes.filter((n) => n.method === 'completion/outcome');
+    model.sharedModel.setSource('x = 42\ny = x7');
+    expect(outcomes()).toEqual([outcome('1', 'accepted', '42\ny = x'), outcome('3', 'rejected')]);
+    model.sharedModel.setSource('x = 42\ny = x\nz = 1');
+    expect(outcomes()).toHaveLength(2);
   });
 
-  it('reports accepted when the next fetch already sees the accepted text', async () => {
-    // The completer's own change listener runs first and re-enters fetch.
+  it('reports accepted when the completer re-enters fetch before our change listener runs', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    // The completer's own change listener is connected first and fetches at once.
+    model.sharedModel.changed.connect(() => void provider.fetch(req(model.sharedModel.getSource()), ctx(widget)));
+    await show('x = ', '42', widget);
+    model.sharedModel.setSource('x = 42');
+    await flush();
+    expect(client.notes).toEqual([outcome('1', 'accepted', '42')]);
+  });
+
+  it('an untouched suggestion the next fetch supersedes is rejected', async () => {
     const { widget } = notebookWidget('c1', 'x = ');
     await show('x = ', '42', widget);
-    void provider.fetch(req('x = 42'), ctx(widget));
+    void provider.fetch(req('x = ', 2), ctx(widget, true)); // cursor moved, explicit invoke
     await flush();
-    expect(client.notes).toEqual([{ method: 'completion/accepted', params: { requestId: '1' } }]);
+    expect(client.notes).toEqual([outcome('1', 'rejected')]);
   });
 
-  it('reports rejected for a shown suggestion the next fetch supersedes', async () => {
+  it('typing the whole suggestion by hand is typedThrough', async () => {
     const { widget, model } = notebookWidget('c1', 'x = ');
     await show('x = ', '42', widget);
-    model.sharedModel.setSource('x = 7');
-    void provider.fetch(req('x = 7'), ctx(widget));
-    await flush();
-    expect(client.notes).toEqual([{ method: 'completion/rejected', params: { requestId: '1' } }]);
-    // Reported once: a later accept-looking edit is ignored.
+    model.sharedModel.setSource('x = 4');
     model.sharedModel.setSource('x = 42');
-    expect(client.notes).toHaveLength(1);
+    expect(client.notes).toEqual([outcome('1', 'typedThrough')]);
   });
 
-  it('typing through a shown suggestion keeps it pending (not rejected)', async () => {
+  it('a chunk then divergence is partial with the taken text', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    await show('x = ', 'foo(bar)', widget);
+    model.sharedModel.setSource('x = foo'); // e.g. a tab-completer accept matching the ghost text
+    expect(client.notes).toEqual([]);
+    model.sharedModel.setSource('x = fooz');
+    expect(client.notes).toEqual([outcome('1', 'partial', 'foo')]);
+  });
+
+  it('a partly taken suggestion is reported after 2 s without progress', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    await show('x = ', 'foo(bar)', widget);
+    jest.useFakeTimers();
+    model.sharedModel.setSource('x = foo');
+    jest.advanceTimersByTime(1999);
+    expect(client.notes).toEqual([]);
+    jest.advanceTimersByTime(1);
+    expect(client.notes).toEqual([outcome('1', 'partial', 'foo')]);
+  });
+
+  it('typing through a shown suggestion hands it off to the typed-prefix hit', async () => {
     const { widget, model } = notebookWidget('c1', 'x = ');
     await show('x = ', '42\ny = x', widget);
     // The user types the first character of the ghost text; the completer
@@ -318,13 +366,24 @@ describe('LocalPilotInlineProvider', () => {
     await flush();
     expect(client.notes).toEqual([]);
     expect(client.requests[1].params.position).toEqual({ line: 0, character: 5 });
-    // The core serves the rest from the same cache entry: the new suggestion
-    // takes over without a report for the old one.
+    // The core serves the rest from the same cache entry (and resolves this id
+    // to the original record): the new suggestion takes over unreported.
     client.requests[1].resolve({ items: [{ text: '2\ny = x', range: RANGE }] });
     expect(await next).toEqual({ items: [{ insertText: '2\ny = x' }] });
     expect(client.notes).toEqual([]);
     model.sharedModel.setSource('x = 42\ny = x');
-    expect(client.notes).toEqual([{ method: 'completion/accepted', params: { requestId: '2' } }]);
+    expect(client.notes).toEqual([outcome('2', 'accepted', '2\ny = x')]);
+  });
+
+  it('a different new suggestion settles the partly typed one first', async () => {
+    const { widget, model } = notebookWidget('c1', 'x = ');
+    await show('x = ', '42', widget);
+    model.sharedModel.setSource('x = 4');
+    const next = provider.fetch(req('x = 4'), ctx(widget));
+    await flush();
+    client.requests[1].resolve({ items: [{ text: '00', range: RANGE }] }); // not the rest of "42"
+    await next;
+    expect(client.notes).toEqual([outcome('1', 'rejected')]);
   });
 
   it('typing through then diverging rejects the suggestion', async () => {
@@ -333,12 +392,11 @@ describe('LocalPilotInlineProvider', () => {
     model.sharedModel.setSource('x = 4');
     void provider.fetch(req('x = 4'), ctx(widget));
     await flush();
-    client.requests[1].resolve({ items: [] }); // nothing new: the first one is still pending
+    client.requests[1].resolve({ items: [] }); // nothing new: the first one is still watched
     await flush();
+    expect(client.notes).toEqual([]);
     model.sharedModel.setSource('x = 47');
-    void provider.fetch(req('x = 47'), ctx(widget));
-    await flush();
-    expect(client.notes).toEqual([{ method: 'completion/rejected', params: { requestId: '1' } }]);
+    expect(client.notes).toEqual([outcome('1', 'rejected')]);
   });
 
   it('detach cancels quietly and stops fetching', async () => {

@@ -1,5 +1,5 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
-import { Clipboard, ICommandPalette, IThemeManager, InputDialog, Notification } from '@jupyterlab/apputils';
+import { Clipboard, Dialog, ICommandPalette, IThemeManager, InputDialog, Notification, showDialog } from '@jupyterlab/apputils';
 import type { CodeEditor } from '@jupyterlab/codeeditor';
 import { ICompletionProviderManager } from '@jupyterlab/completer';
 import { IDocumentManager } from '@jupyterlab/docmanager';
@@ -9,7 +9,7 @@ import { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { IStatusBar } from '@jupyterlab/statusbar';
 import { LabIcon } from '@jupyterlab/ui-components';
 import { DisposableSet } from '@lumino/disposable';
-import { Menu } from '@lumino/widgets';
+import { Menu, Widget } from '@lumino/widgets';
 import { applyEdit, type ApplyEditParams, type EditNotebook } from './chat/applyEdit';
 import chatHtml from './chat/chat-ui.txt';
 import { ChatWidget, type ActiveFile } from './chat/chatWidget';
@@ -28,12 +28,12 @@ export type { ConnectionState, InitializeResult, OllamaStatus, WsCoreClientOptio
 export * from './cellUri';
 export { applyEdit } from './chat/applyEdit';
 export type { ApplyEditOptions, ApplyEditParams, ApplyEditResult, EditOp } from './chat/applyEdit';
-export { CHAT_WIDGET_ID, ChatWidget, IFRAME_SANDBOX } from './chat/chatWidget';
+export { CHAT_WIDGET_ID, ChatWidget, IFRAME_SANDBOX, SESSIONS_CHANGED } from './chat/chatWidget';
 export type { ActiveFile, ChatClient, ChatWidgetDeps } from './chat/chatWidget';
 export { COMMANDS, OPEN_CHAT_KEYS } from './commands';
 export { CONCAT_DEBOUNCE_MS, DocumentSync } from './documentSync';
 export type { DocumentSyncOptions, SyncClient, SyncNotebookPanel } from './documentSync';
-export { DEFAULT_TIMEOUT_MS, LocalPilotInlineProvider } from './inlineProvider';
+export { DEFAULT_TIMEOUT_MS, LocalPilotInlineProvider, OUTCOME_IDLE_MS } from './inlineProvider';
 export type { InlineClient, InlineProviderOptions, InlineSync } from './inlineProvider';
 export * from './settings';
 export { StatusItem } from './status';
@@ -116,6 +116,15 @@ const plugin: JupyterFrontEndPlugin<void> = {
         dismiss: (id) => Notification.dismiss(id)
       })
     );
+
+    /**
+     * Writes one LocalPilot setting to the registry: the watcher above picks
+     * it up (restarting the core for a core setting). Read back with
+     * `readSettings(pluginSettings)`, which is current as soon as `set` resolves.
+     */
+    const setSetting = async (key: keyof Settings, value: unknown) => {
+      await pluginSettings.set(key, value as Parameters<typeof pluginSettings.set>[1]);
+    };
 
     /** Restarts the core (with `s`, else the server's current settings). */
     const restart = async (s?: Settings) => {
@@ -215,7 +224,10 @@ const plugin: JupyterFrontEndPlugin<void> = {
       themeVars: () => {
         const style = getComputedStyle(document.body);
         return jupyterThemeVars((name) => style.getPropertyValue(name));
-      }
+      },
+      // The chat panel's model pickers and Settings panel.
+      settings: () => readSettings(pluginSettings),
+      setSetting
     });
     chat.title.icon = chatIcon;
     app.shell.add(chat, 'right', { rank: 1000 });
@@ -269,6 +281,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
       client,
       chat,
       settings: () => settings,
+      setSetting,
       setCompletionsEnabled: async (on) => {
         await pluginSettings.set('completionsEnabled', on);
       },
@@ -287,6 +300,25 @@ const plugin: JupyterFrontEndPlugin<void> = {
         pickModel: async (choices) => {
           const result = await InputDialog.getItem({ title: 'Model to pull with Ollama', items: choices, editable: true });
           return result.button.accept ? (result.value ?? undefined) : undefined;
+        },
+        pickItem: async (title, items, selected) => {
+          const at = selected === undefined ? -1 : items.indexOf(selected);
+          const result = await InputDialog.getItem({ title, items, current: Math.max(0, at), editable: false });
+          return result.button.accept ? (result.value ?? undefined) : undefined;
+        },
+        confirm: async (title, body, acceptLabel) => {
+          const result = await showDialog({
+            title,
+            body,
+            buttons: [Dialog.cancelButton(), Dialog.warnButton({ label: acceptLabel })]
+          });
+          return result.button.accept;
+        },
+        showText: async (title, body) => {
+          const pre = document.createElement('pre');
+          pre.textContent = body;
+          pre.style.whiteSpace = 'pre-wrap';
+          await showDialog({ title, body: new Widget({ node: pre }), buttons: [Dialog.okButton()] });
         }
       },
       palette

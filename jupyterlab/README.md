@@ -10,11 +10,6 @@ halves:
 - a **JupyterLab extension**: ghost-text completions in notebook cells and files, a
   chat sidebar (the same chat UI as VS Code), commands and a status-bar item.
 
-The chat panel's v2 controls (model pickers, Settings panel with completion stats,
-session Delete / Clear all) are not wired in JupyterLab yet — they show "Loading…"
-or do nothing; coming in the next update. Change models and settings in the
-Settings Editor meanwhile.
-
 ## Install
 
 LocalPilot is not on PyPI; build the wheel from this repo and install it into the
@@ -28,10 +23,10 @@ script needs).
 ```sh
 pip install "jupyterlab>=4.5,<5"           # provides jlpm
 npm ci                                     # once, from the repo root
-bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.1.2-py3-none-any.whl
-pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.1.2-py3-none-any.whl
+bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.2.0-py3-none-any.whl
+pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.2.0-py3-none-any.whl
 jupyter server extension list              # → localpilot_jupyter enabled, OK
-jupyter labextension list                  # → localpilot-jupyter v0.1.2 enabled OK
+jupyter labextension list                  # → localpilot-jupyter v0.2.0 enabled OK
 ```
 
 `--no-deps` keeps pip from reinstalling (or upgrading) JupyterLab and the rest of
@@ -102,11 +97,20 @@ extension's `localpilot.*` settings, without the prefix:
 | `allowedCommandsAlways` | `[]` | Commands approved with **Always**; the agent runs these without asking. |
 | `coreBinaryPath` | `""` | **Ignored in JupyterLab** (kept for parity). Server-side instead: see below. |
 | `logLevel` | `info` | **Ignored in JupyterLab** (kept for parity). Server-side instead: see below. |
+| `adaptiveCompletions` | `true` | Adapt completion length and style examples to your outcomes (see *Adaptive completions*). Off: the configured limits, no examples; outcomes are still logged. |
 
 The core reads its settings only when it starts, so changing any setting except
 `completionsEnabled` and `completionDebounceMs` restarts it (once, 0.5 s after the
 last edit). The core is shared by every tab of the Jupyter server, and a restart
 ends a chat reply that is still streaming.
+
+The chat panel edits some of these too: its **model pickers** write `chatModel` /
+`completionModel` (only models Ollama reports as installed), and its **Settings**
+panel writes `completionMaxTokens` (≥ 1), `completionDebounceMs` (≥ 0),
+`completionContextTokens` (≥ 256) and `adaptiveCompletions`, rounding and clamping
+to those minimums. Both go through the settings registry like an edit in the
+Settings Editor (so a core setting restarts the core). The palette has **Select
+Chat Model…** and **Select Completion Model…** as well.
 
 **Server-side settings** (the browser never chooses which binary the server runs):
 
@@ -114,6 +118,54 @@ ends a chat reply that is still streaming.
 | --- | --- |
 | Core binary | `$LOCALPILOT_CORE_BINARY`, else `c.LocalPilot.core_binary` in `jupyter_server_config.py`, else the bundled `localpilot_jupyter/bin/<triple>/localpilot-core`. |
 | Core log level | `c.LocalPilot.core_log_level = "debug"` (`error` … `trace`, default `info`). |
+
+## Chat sessions
+
+The chat panel's session switcher has **Delete** (per session) and **Clear all**.
+The core refuses to delete a session whose reply is still running (the panel says
+so); **Clear all** keeps such sessions and reports how many it kept. Sessions are
+shared by every tab of the Jupyter server: deleting one in a tab removes it from
+the other tabs' chat panels too, and a tab may delete a session another tab
+started.
+
+## Adaptive completions
+
+LocalPilot learns from what you do with its suggestions — no model training, just
+per-language bookkeeping in the core:
+
+- Every shown suggestion's outcome is logged to `<root_dir>/.localpilot/completions.jsonl`
+  (language, a prompt hash, at most 200 characters before the cursor, the
+  suggestion, the outcome and timings). Outcomes reported by JupyterLab:
+  - **accepted** — the whole suggestion was taken with `Tab` (the inline
+    completer's accept);
+  - **typedThrough** — you typed the whole suggestion yourself, key by key
+    (auto-closed brackets and quotes are fine);
+  - **partial** — part of it arrived in one multi-character edit and then the text
+    went elsewhere (see the biases below); the taken text is logged;
+  - **rejected** — it was dismissed or replaced by the next request untouched, you
+    typed something else, or you typed only part of it by hand.
+
+  A suggestion you are partway through is reported once nothing more of it
+  arrives for 2 s; trailing whitespace does not count.
+- **Known biases** (JupyterLab's inline completer has no accept hook and no
+  *accept next word / line*; LocalPilot infers outcomes from the cell's or file's
+  edits, like the VS Code extension):
+  - any single edit inserting ≥ 2 characters (with a letter or digit) that matches
+    the ghost text counts as a `Tab` accept — including a tab-completer (Jupyter
+    `Tab` completion) accept or a paste that happens to match it. This is also the
+    only way **partial** arises in JupyterLab;
+  - a one-character suggestion accepted with `Tab` is logged as **typedThrough**;
+  - taking part of a suggestion and pressing `Tab` more than 2 s later is logged as
+    **rejected** (or **partial**), not accepted.
+- **Stats**: **Show Completion Stats** (palette) or the chat panel's Settings shows
+  per-language counts, the accept rate and whether the length limits were
+  *learned* (from ≥ 10 outcomes, with adaptive completions on) or are the
+  configured *default*.
+- **To reset**: **Reset Completion Learning…** (palette; asks first) or **Reset
+  learning**, then **Confirm**, in the chat panel's Settings forgets the learned
+  values and examples; the log file is kept. To stop adapting without resetting,
+  set `adaptiveCompletions` to `false`. To delete the history entirely, delete
+  `.localpilot/completions.jsonl` too.
 
 ## Manual smoke checklist
 
@@ -140,6 +192,21 @@ Walk this after installing a new build (`jupyter lab` restarted, models pulled):
    **Deny**: nothing runs, and the agent says it was denied.
 8. **Theme** — switch **Settings → Theme** between JupyterLab Light and Dark: the
    chat panel follows without a reload.
+9. **Model pickers** — in the chat panel, pick another chat model and another
+   completion model from the pickers: the Settings Editor shows the new
+   `chatModel` / `completionModel`, the core restarts, and the picker keeps the new
+   choice. Quit Ollama and open the picker again: it says Ollama is down and keeps
+   the last list. **Select Chat Model…** from the palette does the same.
+10. **Settings panel** — open the chat panel's Settings, change *Max tokens* to `0`:
+    it snaps to `1`; toggle *Adaptive completions*: the Settings Editor follows.
+11. **Delete / Clear all** — delete a finished session: the panel switches to the
+    next one; with a reply streaming in another session, **Clear all** keeps that
+    one and says so. With a second JupyterLab tab open, its chat panel drops the
+    deleted sessions too.
+12. **Completion stats** — accept a ghost-text suggestion with `Tab`, dismiss
+    another by typing something else, then **Show Completion Stats**: `accepted`
+    and `rejected` went up for the language. **Reset Completion Learning…** asks
+    first, then the stats show *default* limits.
 
 ## Troubleshooting
 

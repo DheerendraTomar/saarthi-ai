@@ -1,3 +1,5 @@
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { ServerConnection } from '@jupyterlab/services';
 import type { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { Signal } from '@lumino/signaling';
@@ -9,6 +11,7 @@ import {
   fetchStatus,
   readSettings,
   restartCore,
+  sameCoreSettings,
   watchSettings
 } from '../src/settings';
 
@@ -42,8 +45,21 @@ describe('settings', () => {
       allowedCommandsAlways: [],
       completionContextTokens: 3584,
       chatContextTokens: 24000,
-      logLevel: 'info'
+      logLevel: 'info',
+      adaptiveCompletions: true
     });
+    // Same defaults as the VS Code extension's localpilot.* settings.
+    const vscode = JSON.parse(readFileSync(join(__dirname, '..', '..', 'vscode', 'package.json'), 'utf8')) as {
+      contributes: { configuration: { properties: Record<string, { default: unknown }> } };
+    };
+    expect(vscode.contributes.configuration.properties['localpilot.adaptiveCompletions'].default).toBe(true);
+  });
+
+  it('adaptiveCompletions is forwarded to the core and restarts it', () => {
+    const s = readSettings(asSettings(new FakePluginSettings({ adaptiveCompletions: false })));
+    expect(s.adaptiveCompletions).toBe(false);
+    expect(coreInitSettings(s).adaptiveCompletions).toBe(false);
+    expect(sameCoreSettings(s, { ...s, adaptiveCompletions: true })).toBe(false);
   });
 
   it('reads the composite settings over the defaults', () => {
