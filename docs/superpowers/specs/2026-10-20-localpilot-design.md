@@ -412,6 +412,43 @@ complete inside `.ipynb` cells in PyCharm's notebook editor.
   workspace is the server's filesystem), Notebook 7 classic UI beyond what the
   shared lab extension already provides.
 
+### 8.5 v2 features — added 2026-10-21
+
+Owner requests for the VS Code extension (delivered through the shared core and
+chat UI, so every client gets them):
+
+1. **Model selection.** A picker listing the models installed in Ollama (core
+   `ollama/models` → `/api/tags`: name, size, family, whether it supports
+   `insert`/`tools`), separately for the chat model and the completion model;
+   choosing one writes the setting (which restarts the core) and the current
+   choice is shown in the chat header / status menu.
+2. **Chat history deletion.** Per-session delete (core `chat/deleteSession`,
+   refused while that session's turn is running) and "clear all sessions"
+   with confirmation; session files are removed from `.localpilot/sessions/`.
+3. **Completion settings + adaptive learning.** A settings panel (completion
+   model, max tokens, debounce, context budget, adaptive on/off) and an
+   *adaptive* completion engine, no weight training:
+   - The core records every served suggestion with its outcome in
+     `.localpilot/completions.jsonl` (bounded, rotated): language, prompt
+     hash, suggestion, lines, outcome (`accepted` | `partial` | `rejected` |
+     `typedThrough`), latency. Clients report outcomes via
+     `completion/accepted` (full) and a new `completion/outcome { requestId,
+     outcome, acceptedText? }`; the existing `completion/rejected` stays.
+   - **Learned length:** per language, from the last 50 outcomes, the engine
+     picks the multi-line cap and `num_predict` that maximise accepted text
+     (bounded to [16, 2×`completionMaxTokens`] tokens and [1, 8] lines).
+   - **Style examples:** up to 3 recently accepted (context tail, suggestion)
+     pairs from the same language are placed in the stable snippet block of
+     the prompt (refreshed on the normal snippet cadence so KV-cache reuse is
+     kept).
+   - `completion/stats` returns per-language accept rates and the learned
+     values; `completion/resetLearning` clears them. Setting
+     `adaptiveCompletions` (default true) turns the behaviour off without
+     deleting the log.
+   - **Later add-on (not in this round):** export the log as a fine-tuning
+     dataset and a LoRA pipeline (MLX) that registers the result as an Ollama
+     model. The log format above is the dataset's source of truth.
+
 ## 9. Testing and verification
 
 - Rust: unit tests for prompt assembly (byte-stable prefixes), cache, edit
