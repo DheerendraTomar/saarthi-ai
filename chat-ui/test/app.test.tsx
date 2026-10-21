@@ -94,3 +94,82 @@ describe("status pill", () => {
     expect(screen.getByRole("button", { name: "Pull model" })).toBeTruthy();
   });
 });
+
+describe("sessions", () => {
+  it("session_switch_posts_switchSession_and_new_posts_newSession", () => {
+    const { bridge, emit } = setup();
+    emit({
+      type: "session/list",
+      sessions: [
+        { sessionId: "s1", title: "Fix the build", updatedAtMs: 2 },
+        { sessionId: "s2", title: "Explain parser", updatedAtMs: 1 },
+      ],
+      current: "s1",
+    });
+    const select = screen.getByRole("combobox", { name: "Session" }) as HTMLSelectElement;
+    expect([...select.options].map((o) => o.textContent)).toEqual(["Fix the build", "Explain parser"]);
+    expect(select.value).toBe("s1");
+
+    fireEvent.change(select, { target: { value: "s2" } });
+    expect(bridge.sent).toContainEqual({ type: "chat/switchSession", sessionId: "s2" });
+
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    expect(bridge.sent).toContainEqual({ type: "chat/newSession" });
+
+    // No current session yet: a placeholder is selected, switching still works.
+    emit({ type: "session/list", sessions: [{ sessionId: "s2", title: "Explain parser", updatedAtMs: 1 }], current: null });
+    expect(select.value).toBe("");
+    expect(select.options[0].textContent).toBe("New session");
+  });
+});
+
+describe("code blocks", () => {
+  it("copy_and_insert_post_raw_code", () => {
+    const { bridge, emit } = setup();
+    emit({ type: "chat/token", sessionId: "s1", delta: 'Try:\n\n```ts\nconst a = "<x>" && b;\n```\n', kind: "text" });
+    emit({ type: "chat/done", sessionId: "s1", stopReason: "done" });
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    expect(bridge.sent).toContainEqual({ type: "ui/copy", text: 'const a = "<x>" && b;' });
+    fireEvent.click(screen.getByRole("button", { name: "Insert code at cursor" }));
+    expect(bridge.sent).toContainEqual({ type: "ui/insertAtCursor", text: 'const a = "<x>" && b;' });
+  });
+});
+
+describe("attachments", () => {
+  it("attach_toggle_includes_active_file_and_selection", () => {
+    const { bridge, emit } = setup();
+    const input = screen.getByLabelText("Message") as HTMLTextAreaElement;
+    // No active file: no toggle.
+    expect(screen.queryByRole("button", { name: /^Attach/ })).toBeNull();
+
+    emit({ type: "ui/activeFile", uri: "file:///w/src/main.rs" });
+    const toggle = screen.getByRole("button", { name: "Attach current file main.rs" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.input(input, { target: { value: "one" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(bridge.sent).toContainEqual({ type: "chat/send", message: "one", attachments: [{ uri: "file:///w/src/main.rs" }] });
+    emit({ type: "chat/done", sessionId: "s1", stopReason: "done" });
+
+    // A non-empty selection is attached as a range.
+    const range = { start: { line: 1, character: 0 }, end: { line: 3, character: 4 } };
+    emit({ type: "ui/activeFile", uri: "file:///w/src/lib.rs", selection: range });
+    const selToggle = screen.getByRole("button", { name: "Attach selection lib.rs" });
+    expect(selToggle.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.input(input, { target: { value: "two" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(bridge.sent).toContainEqual({
+      type: "chat/send",
+      message: "two",
+      attachments: [{ uri: "file:///w/src/lib.rs", range }],
+    });
+    emit({ type: "chat/done", sessionId: "s1", stopReason: "done" });
+
+    // Toggled off → nothing attached.
+    fireEvent.click(selToggle);
+    fireEvent.input(input, { target: { value: "three" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(bridge.sent).toContainEqual({ type: "chat/send", message: "three", attachments: [] });
+  });
+});

@@ -2,7 +2,9 @@
 // source is escaped (shown as text), link targets are restricted to
 // http(s)/mailto, and images are rendered as their alt text so the webview
 // never fetches anything. Fenced code gets `class="language-<lang>"` and a
-// `data-code` attribute holding the raw code (for copy / insert buttons).
+// `data-code` attribute holding the raw code, inside a `.code-block` with
+// Copy / Insert buttons (`data-action="copy" | "insert"`; the host page
+// handles clicks by delegation).
 import { Marked } from "marked";
 
 const ESCAPES: Record<string, string> = {
@@ -31,7 +33,12 @@ const md = new Marked({
       const name = (lang ?? "").trim().split(/\s+/)[0];
       const cls = /^[\w+-]+$/.test(name) ? ` class="language-${name}"` : "";
       const code = text.replace(/\n$/, "");
-      return `<pre><code${cls} data-code="${escapeHtml(code)}">${escapeHtml(code)}</code></pre>\n`;
+      return (
+        `<div class="code-block"><div class="code-actions">` +
+        `<button type="button" data-action="copy" aria-label="Copy code">Copy</button>` +
+        `<button type="button" data-action="insert" aria-label="Insert code at cursor">Insert</button>` +
+        `</div><pre><code${cls} data-code="${escapeHtml(code)}">${escapeHtml(code)}</code></pre></div>\n`
+      );
     },
     link({ href, title, tokens }) {
       const inner = this.parser.parseInline(tokens);

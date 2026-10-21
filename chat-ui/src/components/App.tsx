@@ -1,9 +1,13 @@
-import { useEffect, useReducer, useRef } from "preact/hooks";
+import { memo } from "preact/compat";
+import { useCallback, useEffect, useMemo, useReducer, useRef } from "preact/hooks";
 import type { HostBridge } from "../host";
+import type { Attachment, ChatToolResult, Decision, JsonValue } from "../protocol";
 import { initialState, reduce } from "../state";
 import type { State } from "../state";
 import { Composer } from "./Composer";
 import { Message } from "./Message";
+import type { CodeAction } from "./Message";
+import { ToolCard } from "./ToolCard";
 
 export interface AppProps {
   bridge: HostBridge;
@@ -62,6 +66,72 @@ function StatusPill({ status, pull, bridge }: Pick<State, "status" | "pull"> & {
   );
 }
 
+function SessionSwitcher({ sessions, currentSessionId, bridge }: Pick<State, "sessions" | "currentSessionId"> & { bridge: HostBridge }) {
+  const known = currentSessionId !== null && sessions.some((s) => s.sessionId === currentSessionId);
+  return (
+    <div class="sessions">
+      <select
+        aria-label="Session"
+        value={known ? currentSessionId : ""}
+        // `input` fires on every selection change (browsers fire it for <select>).
+        onInput={(e) => {
+          const sessionId = (e.target as HTMLSelectElement).value;
+          if (sessionId && sessionId !== currentSessionId) bridge.post({ type: "chat/switchSession", sessionId });
+        }}
+      >
+        {known ? null : (
+          <option value="" disabled>
+            New session
+          </option>
+        )}
+        {sessions.map((s) => (
+          <option key={s.sessionId} value={s.sessionId}>
+            {s.title || "Untitled"}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        class="secondary"
+        aria-label="New session"
+        title="New session"
+        onClick={() => bridge.post({ type: "chat/newSession" })}
+      >
+        New
+      </button>
+    </div>
+  );
+}
+
+interface ToolCallRowProps {
+  msg: Extract<State["messages"][number], { kind: "toolCall" }>;
+  sessionId: string;
+  awaiting: boolean;
+  result: ChatToolResult | undefined;
+  onDecision(toolCallId: string, decision: Decision, editedArgs?: JsonValue): void;
+}
+
+function ToolCallRowView({ msg, sessionId, awaiting, result, onDecision }: ToolCallRowProps) {
+  const call = useMemo(
+    () => ({
+      sessionId,
+      toolCallId: msg.toolCallId,
+      name: msg.name,
+      args: msg.args,
+      requiresApproval: awaiting,
+      ...(msg.preview !== undefined ? { preview: msg.preview } : {}),
+    }),
+    [msg, sessionId, awaiting],
+  );
+  const decide = useCallback(
+    (decision: Decision, editedArgs?: JsonValue) => onDecision(msg.toolCallId, decision, editedArgs),
+    [onDecision, msg.toolCallId],
+  );
+  return <ToolCard call={call} result={result} onDecision={decide} />;
+}
+
+const ToolCallRow = memo(ToolCallRowView);
+
 export function App({ bridge }: AppProps) {
   const [state, dispatch] = useReducer(reduce, undefined, initialState);
   const listRef = useRef<HTMLDivElement>(null);
@@ -78,26 +148,73 @@ export function App({ bridge }: AppProps) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [state.messages, state.streaming]);
 
-  const onSend = (text: string) => {
+  const onSend = (text: string, attachments: Attachment[]) => {
     dispatch({ type: "composer/send", text });
-    bridge.post({ type: "chat/send", message: text, attachments: [] });
+    bridge.post({ type: "chat/send", message: text, attachments });
   };
+
+  // Stable callbacks so memoized rows and cards skip re-rendering per token.
+  const onCodeAction = useCallback(
+    (action: CodeAction, text: string) =>
+      bridge.post(action === "copy" ? { type: "ui/copy", text } : { type: "ui/insertAtCursor", text }),
+    [bridge],
+  );
+  const onDecision = useCallback(
+    (toolCallId: string, decision: Decision, editedArgs?: JsonValue) =>
+      bridge.post(
+        editedArgs === undefined
+          ? { type: "chat/approve", toolCallId, decision }
+          : { type: "chat/approve", toolCallId, decision, editedArgs },
+      ),
+    [bridge],
+  );
+
+  // Results are their own rows in `messages`; join them into their cards.
+  const results = useMemo(() => {
+    const calls = new Set<string>();
+    const byId = new Map<string, ChatToolResult>();
+    for (const m of state.messages) {
+      if (m.kind === "toolCall") calls.add(m.toolCallId);
+      else if (m.kind === "toolResult" && calls.has(m.toolCallId)) {
+        byId.set(m.toolCallId, { sessionId: state.currentSessionId ?? "", toolCallId: m.toolCallId, ok: m.ok, summary: m.summary });
+      }
+    }
+    return byId;
+  }, [state.messages, state.currentSessionId]);
 
   const { streaming } = state;
   return (
     <div class="app">
       <header class="header">
-        {/* Task 3: session switcher (state.sessions / state.currentSessionId). */}
+        <SessionSwitcher sessions={state.sessions} currentSessionId={state.currentSessionId} bridge={bridge} />
         <StatusPill status={state.status} pull={state.pull} bridge={bridge} />
       </header>
       <div class="messages" ref={listRef} role="log" aria-live="polite">
-        {state.messages.map((m, i) => (
-          <Message key={i} msg={m} />
-        ))}
+        {state.messages.map((m, i) => {
+          if (m.kind === "toolCall") {
+            return (
+              <ToolCallRow
+                // Keyed by identity so a card's local decision / edited command
+                // never carries over to another session's row at the same index.
+                key={`tool:${state.currentSessionId ?? ""}:${m.toolCallId}`}
+                msg={m}
+                sessionId={state.currentSessionId ?? ""}
+                // Approval is only possible while the core still awaits it
+                // (chat/done and session switches clear pending approvals).
+                awaiting={m.requiresApproval && state.pendingApprovals.has(m.toolCallId)}
+                result={results.get(m.toolCallId)}
+                onDecision={onDecision}
+              />
+            );
+          }
+          if (m.kind === "toolResult" && results.has(m.toolCallId)) return null;
+          return <Message key={i} msg={m} onCodeAction={onCodeAction} />;
+        })}
         {streaming && (streaming.text || streaming.thinking) ? (
           <Message
             msg={{ kind: "assistant", text: streaming.text, ...(streaming.thinking ? { thinking: streaming.thinking } : {}) }}
             streaming
+            onCodeAction={onCodeAction}
           />
         ) : null}
       </div>
@@ -109,7 +226,7 @@ export function App({ bridge }: AppProps) {
           </button>
         </div>
       ) : null}
-      <Composer streaming={streaming !== null} onSend={onSend} onStop={() => bridge.post({ type: "chat/stop" })} />
+      <Composer streaming={streaming !== null} activeFile={state.activeFile} onSend={onSend} onStop={() => bridge.post({ type: "chat/stop" })} />
     </div>
   );
 }

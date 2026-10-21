@@ -21,6 +21,15 @@
   --lp-error: var(--vscode-errorForeground, #f48771);
   --lp-warn: var(--vscode-editorWarning-foreground, #cca700);
   --lp-ok: var(--vscode-testing-iconPassed, #73c991);
+  --lp-dropdown-bg: var(--vscode-dropdown-background, var(--lp-input-bg));
+  --lp-dropdown-fg: var(--vscode-dropdown-foreground, var(--lp-fg));
+  --lp-dropdown-border: var(--vscode-dropdown-border, var(--lp-border));
+  --lp-diff-add-bg: var(--vscode-diffEditor-insertedLineBackground, var(--vscode-diffEditor-insertedTextBackground, rgba(155, 185, 85, 0.2)));
+  --lp-diff-del-bg: var(--vscode-diffEditor-removedLineBackground, var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2)));
+  --lp-diff-add-fg: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
+  --lp-diff-del-fg: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+  --lp-diff-hunk-fg: var(--vscode-textPreformat-foreground, var(--lp-link));
+  --lp-card-bg: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.06));
   --lp-font: var(--vscode-font-family, system-ui, -apple-system, "Segoe UI", sans-serif);
   --lp-font-size: var(--vscode-font-size, 13px);
   --lp-mono: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
@@ -54,7 +63,7 @@ body {
 .header {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 8px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--lp-border);
@@ -76,8 +85,17 @@ button:disabled {
   opacity: 0.5;
   cursor: default;
 }
+button.secondary {
+  color: var(--lp-button2-fg);
+  background: var(--lp-button2-bg);
+}
+button.secondary:hover:not(:disabled) {
+  background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
 button:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+input:focus-visible,
+select:focus-visible {
   outline: 1px solid var(--lp-focus);
   outline-offset: 1px;
 }
@@ -217,10 +235,36 @@ textarea:focus-visible {
 
 .composer {
   display: flex;
-  align-items: flex-end;
-  gap: 6px;
+  flex-direction: column;
+  gap: 4px;
   padding: 8px 10px 10px;
   border-top: 1px solid var(--lp-border);
+}
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+.composer-context {
+  display: flex;
+  gap: 4px;
+}
+.composer .attach {
+  font-size: 0.9em;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: var(--lp-muted);
+  background: none;
+  border: 1px dashed var(--lp-border);
+}
+.composer .attach.on {
+  color: var(--lp-fg);
+  background: var(--lp-code-bg);
+  border-style: solid;
+  border-color: var(--lp-focus);
+}
+.composer .attach:hover:not(:disabled) {
+  background: var(--lp-code-bg);
 }
 .composer textarea {
   flex: 1;
@@ -236,4 +280,164 @@ textarea:focus-visible {
 .composer .stop {
   background: var(--lp-button2-bg);
   color: var(--lp-button2-fg);
+}
+
+/* Session switcher */
+.sessions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.sessions select {
+  min-width: 0;
+  max-width: 220px;
+  font: inherit;
+  color: var(--lp-dropdown-fg);
+  background: var(--lp-dropdown-bg);
+  border: 1px solid var(--lp-dropdown-border);
+  border-radius: 2px;
+  padding: 2px 4px;
+}
+
+/* Code blocks: Copy / Insert */
+.code-block {
+  position: relative;
+}
+.code-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.code-block:hover .code-actions,
+.code-block:focus-within .code-actions {
+  opacity: 1;
+}
+.code-actions button {
+  font-size: 0.85em;
+  padding: 1px 6px;
+  color: var(--lp-button2-fg);
+  background: var(--lp-button2-bg);
+}
+
+/* Tool cards */
+.tool-card {
+  font-size: 0.92em;
+  border: 1px solid var(--lp-border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: var(--lp-card-bg);
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.tool-card.awaiting {
+  border-left-color: var(--lp-warn);
+}
+.tool-card.ok,
+.tool-card.approved {
+  border-left-color: var(--lp-ok);
+}
+.tool-card.err,
+.tool-card.denied {
+  border-left-color: var(--lp-error);
+}
+.tool-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+.tool-name {
+  font-family: var(--lp-mono);
+  font-weight: 600;
+}
+.tool-args {
+  color: var(--lp-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tool-command {
+  width: 100%;
+  font-family: var(--lp-mono);
+  font-size: inherit;
+  color: var(--lp-input-fg);
+  background: var(--lp-input-bg);
+  border: 1px solid var(--lp-input-border);
+  border-radius: 2px;
+  padding: 3px 6px;
+}
+.tool-command:read-only {
+  opacity: 0.8;
+}
+.tool-preview {
+  margin: 0;
+  font-family: var(--lp-mono);
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow: auto;
+}
+.tool-actions {
+  display: flex;
+  gap: 6px;
+}
+.tool-pending {
+  color: var(--lp-muted);
+}
+.tool-result-line.ok {
+  color: var(--lp-ok);
+}
+.tool-result-line.err {
+  color: var(--lp-error);
+}
+
+/* Unified diff */
+.diff-body {
+  margin: 0;
+  font-family: var(--lp-mono);
+  font-size: 0.95em;
+  max-height: 400px;
+  overflow: auto;
+  border: 1px solid var(--lp-border);
+  border-radius: 2px;
+  background: var(--lp-code-bg);
+}
+.diff-line {
+  white-space: pre;
+  padding: 0 6px;
+  min-height: 1.4em;
+}
+.diff-line.add {
+  background: var(--lp-diff-add-bg);
+  color: var(--lp-diff-add-fg);
+}
+.diff-line.del {
+  background: var(--lp-diff-del-bg);
+  color: var(--lp-diff-del-fg);
+}
+.diff-line.hunk {
+  color: var(--lp-diff-hunk-fg);
+}
+.diff-line.meta {
+  color: var(--lp-muted);
+  font-weight: 600;
+}
+.diff-more {
+  margin-top: 4px;
+  font-size: 0.9em;
+  color: var(--lp-link);
+  background: none;
+  padding: 0;
+}
+.diff-more:hover:not(:disabled) {
+  background: none;
+  text-decoration: underline;
 }
