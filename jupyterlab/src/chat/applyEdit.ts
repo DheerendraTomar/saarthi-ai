@@ -84,6 +84,8 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const CONCAT_PATH = /\.ipynb\.cells\.[^./\\]+$/;
 /** `<nb>.ipynb.cell<i>.<ext>`: one code cell, synced under a virtual file path. */
 const CELL_PATH = /\.ipynb\.cell\d+\.[^./\\]+$/;
+/** A notebook file: never opened for a text edit (that would start a kernel). */
+const NOTEBOOK_PATH = /\.ipynb$/i;
 
 /** One resolved op, ready to apply. */
 interface Planned {
@@ -140,7 +142,10 @@ async function exists(contents: EditContents, path: string): Promise<boolean> {
 
 /**
  * Applies an approved agent edit (the core's `workspace/applyEdit`). Every op
- * is resolved and checked before anything changes. Notebook cells arrive under
+ * is resolved and checked before anything changes, and every op that needs
+ * no open document (kinds, paths, cells, creates) before any file is opened;
+ * a `.ipynb` path is refused (edit its cells). If an edit applied but a save
+ * failed, the result is `{applied: false, error}` with the unsaved paths. Notebook cells arrive under
  * their virtual `<nb>.ipynb.cell<i>.<ext>` URI: `resolveCell` maps it to the
  * notebook and the cell's id, and the cell is looked up by that id in the
  * notebook's model (a deleted cell fails cleanly) and edited through
@@ -168,6 +173,11 @@ export async function applyEdit(params: ApplyEditParams, opts: ApplyEditOptions 
     return path;
   };
 
+  // Phase 1: everything that can be checked without opening a document —
+  // op kinds, paths, the cell rules (cells are open already, so their ranges
+  // too) and `create` targets — so a bad op refuses the edit before any file
+  // is opened (opening has side effects: a notebook would start a kernel).
+  const fileEdits: Array<{ uri: string; path: string; range: WireRange; newText: string }> = [];
   try {
     if (!Array.isArray(params?.ops)) return { applied: false, error: 'invalid edit: no ops' };
     for (const op of params.ops) {
@@ -192,27 +202,11 @@ export async function applyEdit(params: ApplyEditParams, opts: ApplyEditOptions 
       }
       if (op.kind === 'edit') {
         const path = await serverPath(uri);
-        const dm = opts.docManager;
-        if (!dm) return { applied: false, error: `cannot open ${uri}: no document manager` };
-        const widget = dm.findWidget(path) ?? dm.open(path, 'default', undefined, { activate: false });
-        const context = widget ? dm.contextForWidget(widget) : undefined;
-        if (!context) return { applied: false, error: `cannot open ${path}` };
-        await context.ready;
-        const text = context.model?.sharedModel as Partial<EditText> | undefined;
-        if (typeof text?.getSource !== 'function' || typeof text.updateSource !== 'function') {
-          return { applied: false, error: `${path} is not a text document` };
+        if (NOTEBOOK_PATH.test(path)) {
+          return { applied: false, error: `cannot edit ${path} as text: edit its cells (.cell<N>) instead` };
         }
-        const at = offsets(text.getSource(), op.range);
-        if (!at) return { applied: false, error: `cannot edit ${path}: the range is outside the file's current text` };
-        planned.push({
-          text: text as EditText,
-          start: at[0],
-          end: at[1],
-          newText: String(op.newText ?? ''),
-          save: () => context.save(),
-          key: context,
-          label: path
-        });
+        if (!opts.docManager) return { applied: false, error: `cannot open ${uri}: no document manager` };
+        fileEdits.push({ uri, path, range: op.range, newText: String(op.newText ?? '') });
       } else if (op.kind === 'create') {
         const path = await serverPath(uri);
         if (!opts.contents) return { applied: false, error: `cannot create ${path}: no contents manager` };
@@ -221,6 +215,31 @@ export async function applyEdit(params: ApplyEditParams, opts: ApplyEditOptions 
       } else {
         return { applied: false, error: `unknown edit op ${JSON.stringify((op as { kind?: unknown }).kind)}` };
       }
+    }
+
+    // Phase 2: open the files (in the background) and check their ranges.
+    const dm = opts.docManager;
+    for (const edit of fileEdits) {
+      if (!dm) break; // checked in phase 1
+      const widget = dm.findWidget(edit.path) ?? dm.open(edit.path, 'default', undefined, { activate: false });
+      const context = widget ? dm.contextForWidget(widget) : undefined;
+      if (!context) return { applied: false, error: `cannot open ${edit.path}` };
+      await context.ready;
+      const text = context.model?.sharedModel as Partial<EditText> | undefined;
+      if (typeof text?.getSource !== 'function' || typeof text.updateSource !== 'function') {
+        return { applied: false, error: `${edit.path} is not a text document` };
+      }
+      const at = offsets(text.getSource(), edit.range);
+      if (!at) return { applied: false, error: `cannot edit ${edit.path}: the range is outside the file's current text` };
+      planned.push({
+        text: text as EditText,
+        start: at[0],
+        end: at[1],
+        newText: edit.newText,
+        save: () => context.save(),
+        key: context,
+        label: edit.path
+      });
     }
   } catch (e) {
     return { applied: false, error: `invalid edit: ${message(e)}` };
@@ -255,5 +274,6 @@ export async function applyEdit(params: ApplyEditParams, opts: ApplyEditOptions 
       unsaved.push(`${p.label} (${message(e)})`);
     }
   }
-  return unsaved.length ? { applied: true, error: `applied but could not save ${unsaved.join(', ')}` } : { applied: true };
+  // Not `applied: true`: the core would report the edit as applied and saved.
+  return unsaved.length ? { applied: false, error: `applied but could not save ${unsaved.join(', ')}` } : { applied: true };
 }

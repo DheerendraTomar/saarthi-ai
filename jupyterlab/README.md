@@ -13,7 +13,9 @@ halves:
 ## Install
 
 LocalPilot is not on PyPI; build the wheel from this repo and install it into the
-Python environment that runs JupyterLab (JupyterLab 4.5, jupyter_server 2.x).
+Python environment that runs JupyterLab. The package requires **JupyterLab ≥ 4.5**
+(< 5) and jupyter_server 2.x; it is built against the 4.5 APIs and does not load in
+older JupyterLab.
 Requires Rust (stable), Node 20+ and npm, `uv` (or `pip install build`), and
 JupyterLab 4.5 installed in the current Python env (it provides `jlpm`, which the
 script needs).
@@ -22,10 +24,13 @@ script needs).
 pip install "jupyterlab>=4.5,<5"           # provides jlpm
 npm ci                                     # once, from the repo root
 bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.1.0-py3-none-any.whl
-pip install --force-reinstall dist/localpilot_jupyter-0.1.0-py3-none-any.whl
+pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.1.0-py3-none-any.whl
 jupyter server extension list              # → localpilot_jupyter enabled, OK
 jupyter labextension list                  # → localpilot-jupyter v0.1.0 enabled OK
 ```
+
+`--no-deps` keeps pip from reinstalling (or upgrading) JupyterLab and the rest of
+the environment along with the wheel; they are already installed above.
 
 `SKIP_CORE_BUILD=1 bash scripts/package-jupyterlab.sh` skips `cargo build` and
 bundles the existing `dist/core/<triple>/localpilot-core` (from
@@ -161,6 +166,16 @@ Walk this after installing a new build (`jupyter lab` restarted, models pulled):
   **Settings → Inline Completer**.
 - **403 on `/localpilot/rpc`**: LocalPilot needs the same permission as terminals
   (`execute` on `terminals`), because the agent can run commands.
+- **"LocalPilot unreachable"** (status bar, plus a notification with **Retry**): the
+  tab could not reach the server extension at all — 5 failed connects, a socket
+  closed with 1008/4403/4404, or `GET /localpilot/status` answered 403/404. Usually
+  the server extension is not loaded in the environment running `jupyter lab`: run
+  `jupyter server extension list` there (it must list `localpilot_jupyter enabled`),
+  fix it, restart `jupyter lab`, then click **Retry** (or **Restart LocalPilot
+  Core**). Requests fail at once in this state instead of waiting.
+- **A large file isn't seen by completions / chat**: documents above 1 MB (about a
+  million characters; a notebook's cells each and all together) are not synced to the
+  core; the browser console says so once per file.
 
 ## Development
 

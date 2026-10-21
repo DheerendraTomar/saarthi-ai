@@ -171,6 +171,60 @@ describe('applyEdit: files', () => {
     expect(dm.findWidget).not.toHaveBeenCalled();
   });
 
+  it('validates_every_op_before_opening_any_file', async () => {
+    const ctx = fileContext('a\n');
+    const dm = docManager({}, { 'b.txt': ctx });
+    const bogus = await applyEdit(
+      {
+        ops: [
+          { kind: 'edit', uri: 'file:///home/me/work/b.txt', range: range(0, 0, 0, 1), newText: 'b' },
+          { kind: 'bogus', uri: 'file:///home/me/work/c.txt' } as never
+        ],
+        save: true
+      },
+      { rootDir: ROOT, docManager: dm }
+    );
+    expect(bogus).toEqual({ applied: false, error: expect.stringMatching(/unknown edit op "bogus"/) });
+    const outside = await applyEdit(
+      {
+        ops: [
+          { kind: 'edit', uri: 'file:///home/me/work/b.txt', range: range(0, 0, 0, 1), newText: 'b' },
+          { kind: 'edit', uri: 'file:///etc/hosts', range: range(0, 0, 0, 0), newText: 'x' }
+        ],
+        save: true
+      },
+      { rootDir: ROOT, docManager: dm }
+    );
+    expect(outside.applied).toBe(false);
+    expect(dm.findWidget).not.toHaveBeenCalled();
+    expect(dm.open).not.toHaveBeenCalled();
+    expect(ctx.model.sharedModel.updates).toEqual([]);
+  });
+
+  it('refuses_a_text_edit_of_a_notebook_without_opening_it', async () => {
+    const dm = docManager({});
+    const result = await applyEdit(
+      { ops: [{ kind: 'edit', uri: 'file:///home/me/work/nb.ipynb', range: range(0, 0, 0, 0), newText: 'x' }], save: true },
+      { rootDir: ROOT, docManager: dm }
+    );
+    expect(result).toEqual({ applied: false, error: expect.stringMatching(/nb\.ipynb as text: edit its cells/) });
+    expect(dm.findWidget).not.toHaveBeenCalled();
+    expect(dm.open).not.toHaveBeenCalled();
+  });
+
+  it('reports_not_applied_when_the_save_fails', async () => {
+    const ctx = fileContext('a\n');
+    ctx.save.mockRejectedValueOnce(new Error('disk full'));
+    const dm = docManager({ 'b.txt': ctx });
+    const result = await applyEdit(
+      { ops: [{ kind: 'edit', uri: 'file:///home/me/work/b.txt', range: range(0, 0, 0, 1), newText: 'b' }], save: true },
+      { rootDir: ROOT, docManager: dm }
+    );
+    // The text changed in the editor, but the core must not report "applied and saved".
+    expect(result).toEqual({ applied: false, error: 'applied but could not save b.txt (disk full)' });
+    expect(ctx.model.sharedModel.source).toBe('b\n');
+  });
+
   it('creates_a_new_file_through_the_contents_api', async () => {
     const saved: Array<[string, unknown]> = [];
     const contents = {

@@ -372,7 +372,7 @@ Owner requirement: completions (and chat) must work in JupyterLab and notebooks.
 Order of delivery: VS Code → JupyterLab → JetBrains. JetBrains must also
 complete inside `.ipynb` cells in PyCharm's notebook editor.
 
-- Target: JupyterLab ≥ 4.1 (owner runs 4.5.5, jupyter_server 2.17, Python 3.11
+- Target: JupyterLab ≥ 4.5 (built against the 4.5 APIs; was ≥ 4.1 before 2026-10-21; owner runs 4.5.5, jupyter_server 2.17, Python 3.11
   via pyenv). Shipped as one pip package `localpilot-jupyter` containing (a) a
   prebuilt labextension and (b) a `jupyter_server` extension.
 - A browser cannot spawn the sidecar, so the **server extension owns the core
