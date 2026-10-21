@@ -54,13 +54,17 @@ checklist and troubleshooting are in [`jupyterlab/README.md`](jupyterlab/README.
 
 ## Quick start (PyCharm 2026.2, macOS arm64)
 
+Needs a JDK 25 (e.g. Temurin 25), Node.js 20+, and Rust to build the core (or
+`SKIP_CORE_BUILD=1` to reuse an existing `dist/core/<triple>/localpilot-core`).
+
 ```sh
 npm ci
-bash scripts/package-jetbrains.sh        # needs JDK 25 → dist/localpilot-jetbrains-0.1.0.zip
+bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.0.zip
 ```
 
 In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** →
-`dist/localpilot-jetbrains-0.1.0.zip`, then restart. With Ollama running and the
+`dist/localpilot-jetbrains-0.1.0.zip` (it loads without a restart; if an open
+project looks inert, reopen it). With Ollama running and the
 models pulled (above), ghost text appears in files and notebook cells, and
 `Cmd+Shift+L` opens the chat tool window. Settings, the manual smoke checklist and
 known limitations are in [`jetbrains/README.md`](jetbrains/README.md).

@@ -26,6 +26,7 @@ import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.Key
+import dev.localpilot.LocalPilotPluginDisposable
 import dev.localpilot.rpc.CoreProcess
 import dev.localpilot.rpc.CoreState
 import dev.localpilot.rpc.LocalPilotCore
@@ -175,9 +176,26 @@ class LocalPilotInlineCompletionProvider internal constructor(
             if (editor.getUserData(LISTENING_HANDLER) === handler) return
             editor.putUserData(LISTENING_HANDLER, handler)
         }
-        // Gone with the editor or with the project, whichever goes first.
-        val disposable = Disposer.newDisposable(project, "LocalPilot inline completion session listener")
-        EditorUtil.disposeWithEditor(editor) { Disposer.dispose(disposable) }
+        // Gone with the editor, the project or the plugin (dynamic unload), whichever goes first. The parent is the
+        // plugin; the editor and the project only hold platform-class disposables, removed when this one goes.
+        val disposable = Disposer.newDisposable(LocalPilotPluginDisposable.getInstance(), "LocalPilot inline completion session listener")
+        val withEditor = Disposer.newDisposable("LocalPilot session listener: editor")
+        val withProject = Disposer.newDisposable("LocalPilot session listener: project")
+        EditorUtil.disposeWithEditor(editor, withEditor)
+        if (!Disposer.tryRegister(project, withProject)) {
+            Disposer.dispose(disposable)
+            Disposer.dispose(withEditor)
+            synchronized(listenerLock) { editor.putUserData(LISTENING_HANDLER, null) }
+            return
+        }
+        Disposer.register(withEditor) { Disposer.dispose(disposable) }
+        Disposer.register(withProject) { Disposer.dispose(disposable) }
+        Disposer.register(disposable) {
+            Disposer.dispose(withEditor)
+            Disposer.dispose(withProject)
+            // A reloaded plugin (or a new provider instance) installs its own listener again.
+            synchronized(listenerLock) { if (editor.getUserData(LISTENING_HANDLER) === handler) editor.putUserData(LISTENING_HANDLER, null) }
+        }
         // The platform announced `current` before this listener existed: start from it.
         handler.addEventListener(SessionListener(editor, current), disposable)
     }

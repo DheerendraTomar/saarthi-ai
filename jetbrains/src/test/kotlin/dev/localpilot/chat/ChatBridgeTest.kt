@@ -2,6 +2,7 @@ package dev.localpilot.chat
 
 import com.intellij.openapi.Disposable
 import dev.localpilot.rpc.CoreCrashed
+import dev.localpilot.rpc.CoreNotRunning
 import dev.localpilot.rpc.CoreState
 import dev.localpilot.rpc.RpcException
 import dev.localpilot.settings.LocalPilotSettingsState
@@ -768,6 +769,58 @@ class ChatBridgeTest {
         val msg = ChatTheme.themeMessage(mapOf("--vscode-foreground" to "#000000", "--vscode-x" to "a{b"))
         assertEquals("ui/theme", msg.type)
         assertEquals(setOf("--vscode-foreground"), msg["vars"]!!.jsonObject.keys)
+    }
+
+    @Test
+    fun ready_while_the_core_is_down_is_answered_again_once_it_is_ready() = bridgeTest { h ->
+        h.core.sessions = mutableListOf("s1")
+        h.core.state.value = CoreState.STOPPED
+        settle()
+        val down: suspend (JsonElement) -> JsonElement = { throw CoreNotRunning("LocalPilot core is not running (state: STOPPED)") }
+        val saved = listOf("chat/listSessions", "chat/history", "ollama/status").associateWith { h.core.responders.getValue(it) }
+        for (method in saved.keys) h.core.responders[method] = down
+
+        h.ui("""{"type":"ui/ready"}""")
+        assertTrue(h.ofType("session/list").single()["sessions"]!!.jsonArray.isEmpty())
+        h.posted.clear()
+
+        h.core.responders.putAll(saved)
+        h.core.state.value = CoreState.STARTING
+        settle()
+        h.core.state.value = CoreState.READY
+        settle()
+        val list = h.ofType("session/list").single()
+        assertEquals(listOf("s1"), list["sessions"]!!.jsonArray.map { it.jsonObject.str("sessionId") })
+        assertEquals("s1", list.str("current"))
+        assertEquals("s1", h.ofType("session/history").single().str("sessionId"))
+        assertTrue(h.ofType("status").isNotEmpty())
+        assertTrue("the list comes first", h.types().indexOf("session/list") < h.types().indexOf("session/history"))
+
+        // Only the first READY after the failed ui/ready.
+        h.posted.clear()
+        h.core.state.value = CoreState.STARTING
+        settle()
+        h.core.state.value = CoreState.READY
+        settle()
+        assertTrue(h.ofType("session/list").isEmpty())
+    }
+
+    @Test
+    fun send_failing_because_the_core_stopped_is_reported_once() = bridgeTest { h ->
+        h.core.sessions = mutableListOf("s1")
+        h.ui("""{"type":"ui/ready"}""")
+        // A settings change restarts the core while chat/send is in flight: the state handler ends the turn first.
+        h.core.responders["chat/send"] = {
+            h.core.state.value = CoreState.STARTING
+            settle()
+            throw CoreNotRunning("LocalPilot core stopped")
+        }
+        h.posted.clear()
+        h.ui("""{"type":"chat/send","message":"hi","attachments":[]}""")
+        settle()
+        assertEquals("error", h.ofType("chat/done").single().str("stopReason"))
+        assertEquals(1, h.ofType("ui/error").size)
+        assertEquals(listOf(true, false), h.activeChanges)
     }
 
     // ------------------------------------------------------------ helpers

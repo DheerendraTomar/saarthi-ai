@@ -2,6 +2,7 @@ package dev.localpilot.status
 
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.localpilot.actions.HostStatus
+import dev.localpilot.actions.LocalPilotHost
 import dev.localpilot.rpc.CoreState
 
 class StatusWidgetTest : BasePlatformTestCase() {
@@ -20,5 +21,22 @@ class StatusWidgetTest : BasePlatformTestCase() {
         assertEquals("LocalPilot: Ollama down", text(ready.copy(ollama = "down"), enabled = false))
         assertEquals("LocalPilot: pulling 42%", text(ready.copy(core = CoreState.CRASHED, pullPercent = 42)))
         assertEquals("LocalPilot: pulling…", text(ready.copy(pullPercent = -1)))
+    }
+
+    fun test_status_shows_completions_paused_during_chat() {
+        fun text(status: HostStatus, enabled: Boolean = true) = StatusText.render(status, enabled).text
+        val chatting = HostStatus(core = CoreState.READY, ollama = "ok", chatActive = true)
+        assertEquals("LocalPilot: completions paused during chat", text(chatting))
+        // Below completions off and Ollama problems (as in VS Code), above starting/stopped.
+        assertEquals("LocalPilot: completions off", text(chatting, enabled = false))
+        assertEquals("LocalPilot: Ollama down", text(chatting.copy(ollama = "down")))
+        assertEquals("LocalPilot: completions paused during chat", text(chatting.copy(core = CoreState.STARTING)))
+
+        // The chat bridge's onChatActiveChanged lands in the host status the widget follows.
+        val host = LocalPilotHost.getInstance(project)
+        host.setChatActive(true)
+        assertTrue(host.status.value.chatActive)
+        host.setChatActive(false)
+        assertFalse(host.status.value.chatActive)
     }
 }

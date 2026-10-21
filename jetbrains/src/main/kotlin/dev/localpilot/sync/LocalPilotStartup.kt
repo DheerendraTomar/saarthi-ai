@@ -1,36 +1,20 @@
 package dev.localpilot.sync
 
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import dev.localpilot.actions.LocalPilotHost
-import dev.localpilot.rpc.LocalPilotCore
-import kotlinx.coroutines.CancellationException
 
 /**
- * On project open (background coroutine, never the EDT): installs the document sync and the host hooks
- * ([LocalPilotHost]: chat edits/commands/Ollama actions, status tracking), then starts the core.
- * The sync goes first so no edit is missed; its `didOpen`s are re-sent when the core becomes READY.
- * A core that cannot start is logged (and shown as an error balloon by [LocalPilotCore]), never thrown.
+ * On project open (background coroutine, never the EDT): [LocalPilotHost.ensureInstalled] installs the document sync
+ * and the host hooks, then starts the core. Projects that were already open when the plugin was loaded dynamically
+ * never run this; they are covered by [dev.localpilot.LocalPilotDynamicPluginListener] and the lazy calls from the
+ * tool window and the status bar widget.
  */
 class LocalPilotStartup : ProjectActivity {
     override suspend fun execute(project: Project) {
         // Tests drive the sync with a fake sink; never spawn a real core from the light test project.
         if (ApplicationManager.getApplication().isUnitTestMode) return
-        DocumentSyncService.getInstance(project).install()
-        // Edit / command / Ollama hooks and the core's applyEdit/runCommand handlers exist before the core can ask.
-        LocalPilotHost.getInstance(project).install()
-        try {
-            LocalPilotCore.getInstance(project).process.start()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            LOG.info("LocalPilot core did not start: ${e.message}")
-        }
-    }
-
-    private companion object {
-        private val LOG = logger<LocalPilotStartup>()
+        LocalPilotHost.getInstance(project).ensureInstalled()
     }
 }

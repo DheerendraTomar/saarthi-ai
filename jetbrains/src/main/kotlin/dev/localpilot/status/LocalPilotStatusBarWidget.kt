@@ -31,7 +31,7 @@ data class StatusPresentation(val text: String, val tooltip: String, val icon: I
 object StatusText {
     /**
      * Most important first (as VS Code's status bar): a running pull, a crashed / stopped core, Ollama down, model
-     * missing, completions off, starting, otherwise ready.
+     * missing, completions off, completions paused during a chat reply, stopped, starting, otherwise ready.
      */
     fun render(status: HostStatus, completionsEnabled: Boolean): StatusPresentation {
         val pull = status.pullPercent
@@ -61,6 +61,11 @@ object StatusText {
                 "LocalPilot inline completions are paused. Click → Inline Completions to resume.",
                 AllIcons.Actions.Pause,
             )
+            status.chatActive -> StatusPresentation(
+                "LocalPilot: completions paused during chat",
+                "LocalPilot: inline completions resume when the chat reply finishes (chat and completions share the model server).",
+                AllIcons.Actions.Pause,
+            )
             status.core == CoreState.STOPPED -> StatusPresentation("LocalPilot: stopped", "The LocalPilot core is not running.", null)
             status.core == CoreState.STARTING -> StatusPresentation("LocalPilot: starting…", "The LocalPilot core is starting.", null)
             else -> StatusPresentation("LocalPilot", "LocalPilot: running locally via Ollama.", null)
@@ -75,7 +80,11 @@ class LocalPilotStatusBarWidgetFactory : StatusBarWidgetFactory {
 
     override fun isAvailable(project: Project): Boolean = LocalPilotHost.isAvailable(project)
 
-    override fun createWidget(project: Project, scope: CoroutineScope): StatusBarWidget = LocalPilotStatusBarWidget(project, scope)
+    override fun createWidget(project: Project, scope: CoroutineScope): StatusBarWidget {
+        // Created for every open project when the plugin is loaded dynamically (no startup activity runs then).
+        if (!ApplicationManager.getApplication().isUnitTestMode) LocalPilotHost.getInstance(project).ensureInstalledLater()
+        return LocalPilotStatusBarWidget(project, scope)
+    }
 
     override fun canBeEnabledOn(statusBar: StatusBar): Boolean = true
 }

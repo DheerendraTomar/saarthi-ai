@@ -38,7 +38,12 @@ machine's), so it is effectively macOS arm64 only. On another platform, set
 
 1. In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** and pick
    `<repo>/dist/localpilot-jetbrains-0.1.0.zip`.
-2. Restart the IDE when asked.
+2. PyCharm 2026.2 loads it without a restart (all of LocalPilot's extension
+   points are dynamic). Projects that are already open are set up when the plugin
+   loads (document sync, chat hooks, core), and again lazily when the LocalPilot
+   tool window or status bar widget appears. If LocalPilot still looks inert in a
+   project (no ghost text, the status bar stuck on "stopped", chat edits answering
+   "not available"), reopen the project or restart the IDE.
 
 Alternatively, with the IDE **closed**, unzip the archive into the IDE's plugins
 directory. For PyCharm 2026.2 on macOS that is
@@ -67,9 +72,10 @@ and **Retry**. If a configured model is missing, the balloon offers **Pull model
   Word** / **Insert Next Line** inline-completion actions accept part of it.
 - **Chat**: `Cmd+Shift+L` (macOS) / `Ctrl+Shift+L` opens the LocalPilot tool window.
 - **Status bar**: the LocalPilot widget shows the state (starting, Ollama down,
-  model missing, pulling N%, completions off, crashed). Click it for the menu.
-- **Tools → LocalPilot** (and the status bar menu): Open Chat, New Chat, Start
-  Ollama, Check Ollama Again, Pull Model…, Select Chat Model…, Select Completion
+  model missing, pulling N%, completions off, completions paused during chat,
+  crashed). Click it for the menu.
+- **Tools → LocalPilot** (and the status bar menu): Open LocalPilot Chat, New
+  LocalPilot Chat, Start Ollama (only if Ollama is not already answering), Check Ollama Again, Pull Model…, Select Chat Model…, Select Completion
   Model…, Inline Completions (toggle), Show Completion Stats, Reset Completion
   Learning…, Restart LocalPilot Core.
 
@@ -159,7 +165,13 @@ Walk this after installing a new build (a project open, Ollama models pulled):
   `PATH`, the tab shows `ollama: not found`.
 - The **Pull model** balloon offers the configured models rather than detecting
   which one is missing.
-- No "completions paused during chat" status (VS Code shows one).
+- **Dynamic install / update**: the plugin installs itself into open projects
+  when it is loaded without a restart (verified by tests, not on every IDE
+  build). If a project stays inert after installing or updating, reopen it or
+  restart the IDE.
+- Cancelling a **Pull model** task only stops watching it: the protocol has no
+  pull cancel, so Ollama finishes the download (the status bar keeps the
+  percentage until it does).
 - Chat edits run on the EDT without modality, so an open modal dialog delays them
   until it closes; created files are not undone by **Undo**.
 - Windows is untested (the command runner's quoting, the bundled core).

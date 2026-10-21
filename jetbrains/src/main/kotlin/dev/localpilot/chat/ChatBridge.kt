@@ -2,6 +2,7 @@ package dev.localpilot.chat
 
 import com.intellij.openapi.Disposable
 import dev.localpilot.rpc.CoreCrashed
+import dev.localpilot.rpc.CoreNotRunning
 import dev.localpilot.rpc.CoreProcess
 import dev.localpilot.rpc.CoreState
 import dev.localpilot.rpc.RpcException
@@ -124,6 +125,8 @@ class ChatBridge(
     /** Counts `ui/ready`s; only the latest releases [heldEvents] (an earlier one's list may precede the page's last). */
     private var readyGeneration = 0
     private var lastState: CoreState? = null
+    /** The last `ui/ready` could not reach the core: answer it again on the next transition into READY. */
+    private var readyFailed = false
     private val chains = mapOf("settings" to Mutex(), "sessions" to Mutex(), "completion" to Mutex())
     private val subscriptions = mutableListOf<Disposable>()
     private val stateJob: Job
@@ -256,6 +259,7 @@ class ChatBridge(
         if (heldEvents == null) heldEvents = mutableListOf()
         try {
             postSessionList()
+            readyFailed = false
             if (generation == readyGeneration) releaseHeldEvents()
             current?.let { postHistory(it) }
             // Turns running in other sessions too, so the UI keeps their delete buttons disabled.
@@ -266,6 +270,7 @@ class ChatBridge(
             throw e
         } catch (e: Exception) {
             post(sessionListMessage(emptyList(), current))
+            if (e is CoreNotRunning || e is CoreCrashed) readyFailed = true
             if (generation == readyGeneration) releaseHeldEvents()
             if (e !is CoreCrashed) postError("LocalPilot core is not available: ${errorMessage(e)}")
         }
@@ -319,7 +324,10 @@ class ChatBridge(
                 return
             }
             if (e is CoreCrashed) return // reported by the state handler
-            if (endTurn(sessionId)) post(done(sessionId, "error"))
+            val wasRunning = endTurn(sessionId)
+            // The core stopped (e.g. a settings restart) and the state handler already ended this turn and said so.
+            if (!wasRunning && e is CoreNotRunning) return
+            if (wasRunning) post(done(sessionId, "error"))
             postError("Could not send the message: ${errorMessage(e)}")
         }
     }
@@ -594,6 +602,8 @@ class ChatBridge(
                 throw e
             } catch (_: Exception) {
             }
+            // The page asked while the core was down and got an empty list: answer it again now.
+            if (readyFailed && ui != null) onReady()
         }
     }
 

@@ -38,6 +38,7 @@ import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
+import dev.localpilot.actions.LocalPilotHost
 import dev.localpilot.rpc.LocalPilotCore
 import dev.localpilot.settings.LocalPilotSettings
 import dev.localpilot.settings.LocalPilotSettingsState
@@ -78,6 +79,8 @@ import javax.swing.SwingConstants
  */
 class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
+        // Belt and braces for a dynamic install (no startup activity ran for this already-open project).
+        if (!ApplicationManager.getApplication().isUnitTestMode) LocalPilotHost.getInstance(project).ensureInstalledLater()
         val panel = JPanel(BorderLayout())
         val content = ContentFactory.getInstance().createContent(panel, null, false)
         toolWindow.contentManager.addContent(content)
@@ -125,7 +128,8 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
      * Keeps the browser on the chat page: chat-ui renders http(s)/mailto links as real anchors, and following one would
      * replace the page (and give the remote page the bridge). Those navigations and every popup are cancelled; a web or
      * mail link the user clicked (a gesture in the main frame) opens in the system browser / mail client instead, and
-     * script-driven or sub-frame navigations are cancelled silently. `about:blank` (the browser's initial page) is
+     * script-driven or sub-frame navigations are cancelled silently, and so is every popup (`onBeforePopup` carries no
+     * gesture information, so a script could open one at will). `about:blank` (the browser's initial page) is
      * allowed only until the chat page has loaded, so the context menu's Back cannot blank the pane.
      */
     private fun installNavigationGuard(browser: JBCefBrowser) {
@@ -162,10 +166,8 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }, browser.cefBrowser)
         browser.jbCefClient.addLifeSpanHandler(object : CefLifeSpanHandlerAdapter() {
-            override fun onBeforePopup(cefBrowser: CefBrowser?, frame: CefFrame?, targetUrl: String?, targetFrameName: String?): Boolean {
-                if (targetUrl != null && ChatHtml.opensExternally(targetUrl)) browse(targetUrl)
-                return true
-            }
+            // No user-gesture information here: cancel silently (a clicked link goes through onBeforeBrowse instead).
+            override fun onBeforePopup(cefBrowser: CefBrowser?, frame: CefFrame?, targetUrl: String?, targetFrameName: String?): Boolean = true
         }, browser.cefBrowser)
     }
 
@@ -323,6 +325,8 @@ class ChatService(private val project: Project, cs: CoroutineScope) : Disposable
         core = CoreProcessChatCore(LocalPilotCore.getInstance(project).process),
         settings = PlatformChatSettings,
         editors = IdeChatEditorHost(project),
+        // The status bar says "completions paused during chat" while a turn streams.
+        onChatActiveChanged = { active -> if (!project.isDisposed) LocalPilotHost.getInstance(project).setChatActive(active) },
     )
 
     /** Replaces the edit/command/Ollama hooks (Task 5d: ApplyEdit, RunCommand, StartOllama/PullModel actions). */

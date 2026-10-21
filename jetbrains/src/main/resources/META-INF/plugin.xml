@@ -28,6 +28,12 @@
                                 implementation="dev.localpilot.status.LocalPilotStatusBarWidgetFactory"/>
     </extensions>
 
+    <applicationListeners>
+        <!-- A dynamic install never runs the startup activity for projects that are already open. -->
+        <listener class="dev.localpilot.LocalPilotDynamicPluginListener"
+                  topic="com.intellij.ide.plugins.DynamicPluginListener"/>
+    </applicationListeners>
+
     <actions>
         <action id="LocalPilot.OpenChat" class="dev.localpilot.actions.OpenChatAction"
                 text="Open LocalPilot Chat" description="Show the LocalPilot chat tool window"
