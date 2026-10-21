@@ -149,3 +149,26 @@ describe("reduce", () => {
     expect(s.pull).toBeUndefined();
   });
 });
+
+describe("pull progress lifecycle", () => {
+  const progress: HostToUi = { type: "ollama/pullProgress", model: "m:1b", status: "pulling", completed: 1, total: 4 };
+
+  it("failed_pull_is_cleared_by_ui_error_or_status", () => {
+    let s = run([progress, { type: "ui/error", message: "pull failed: no space" }]);
+    expect(s.pull).toBeUndefined();
+    expect(s.notice).toBe("pull failed: no space");
+
+    s = run([progress, { type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' }]);
+    expect(s.pull).toBeUndefined();
+    s = run([progress, { type: "status", ollama: "ok", detail: "" }]);
+    expect(s.pull).toBeUndefined();
+
+    // Progress after a status report shows again.
+    s = reduce(s, progress);
+    expect(s.pull?.completed).toBe(1);
+  });
+
+  it("initial_status_is_unknown_until_host_reports", () => {
+    expect(initialState().status.ollama).toBe("unknown");
+  });
+});

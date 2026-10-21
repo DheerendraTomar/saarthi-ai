@@ -48,6 +48,13 @@ function StatusPill({ status, pull, bridge }: Pick<State, "status" | "pull"> & {
       </div>
     );
   }
+  if (status.ollama === "unknown") {
+    return (
+      <div class="status-pill unknown" role="status">
+        Checking Ollama…
+      </div>
+    );
+  }
   return (
     <div class="status-pill ok" role="status" title={status.detail}>
       Ollama ready

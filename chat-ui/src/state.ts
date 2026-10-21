@@ -57,7 +57,8 @@ export interface State {
   /** In-flight assistant turn; `null` when idle. */
   streaming: { text: string; thinking: string } | null;
   pendingApprovals: Map<string, ToolCardState>;
-  status: { ollama: OllamaState; detail: string };
+  /** `"unknown"` until the host sends its first `status`. */
+  status: { ollama: OllamaState | "unknown"; detail: string };
   pull?: PullState;
   activeFile: { uri: string; selection?: Range } | null;
   /** A short, non-message notice (context full, host error). */
@@ -78,7 +79,7 @@ export function initialState(): State {
     messages: [],
     streaming: null,
     pendingApprovals: new Map(),
-    status: { ollama: "ok", detail: "" },
+    status: { ollama: "unknown", detail: "" },
     activeFile: null,
     notice: null,
   };
@@ -197,8 +198,13 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
       }
       return { ...state, messages, streaming: null, pendingApprovals: new Map(), notice };
     }
-    case "status":
-      return { ...state, status: { ollama: event.ollama, detail: event.detail } };
+    case "status": {
+      // A failed pull sends no final progress; any status report ends the
+      // progress display (an ongoing pull re-sets it on its next event).
+      const next: State = { ...state, status: { ollama: event.ollama, detail: event.detail } };
+      delete next.pull;
+      return next;
+    }
     case "ollama/pullProgress": {
       if (event.status === "success") {
         const next = { ...state };
@@ -226,8 +232,11 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
         ...state,
         activeFile: event.uri === null ? null : event.selection ? { uri: event.uri, selection: event.selection } : { uri: event.uri },
       };
-    case "ui/error":
-      return { ...state, notice: event.message };
+    case "ui/error": {
+      const next: State = { ...state, notice: event.message };
+      delete next.pull;
+      return next;
+    }
     default: {
       // Exhaustiveness: a new HostToUi variant must be handled above.
       const unknown: never = event;

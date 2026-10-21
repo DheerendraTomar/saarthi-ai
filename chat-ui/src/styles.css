@@ -92,7 +92,8 @@ textarea:focus-visible {
   border-radius: 999px;
   padding: 1px 4px 1px 10px;
 }
-.status-pill.ok {
+.status-pill.ok,
+.status-pill.unknown {
   padding-right: 10px;
 }
 .status-pill.ok::before,

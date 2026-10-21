@@ -1,3 +1,4 @@
+import { memo } from "preact/compat";
 import { renderMarkdown } from "../markdown";
 import type { Msg } from "../state";
 
@@ -16,7 +17,7 @@ function Thinking({ text }: { text: string }) {
   );
 }
 
-export function Message({ msg, streaming = false }: MessageProps) {
+function MessageView({ msg, streaming = false }: MessageProps) {
   switch (msg.kind) {
     case "user":
       return <div class="msg user">{msg.text}</div>;
@@ -48,3 +49,9 @@ export function Message({ msg, streaming = false }: MessageProps) {
       );
   }
 }
+
+/**
+ * Memoized: `Msg` objects are immutable (the reducer replaces, never mutates),
+ * so committed rows skip re-rendering markdown on every streamed token.
+ */
+export const Message = memo(MessageView);

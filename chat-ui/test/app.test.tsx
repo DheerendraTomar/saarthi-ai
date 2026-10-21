@@ -81,3 +81,16 @@ describe("App", () => {
     expect(container.textContent).toContain("<img src=x onerror=alert(1)>");
   });
 });
+
+describe("status pill", () => {
+  it("shows_checking_until_status_then_recovers_from_failed_pull", () => {
+    const { emit } = setup();
+    expect(screen.getByText("Checking Ollama…")).toBeTruthy();
+    emit({ type: "ollama/pullProgress", model: "m:1b", status: "pulling", completed: 1, total: 4 });
+    expect(screen.getByText(/Pulling m:1b/)).toBeTruthy();
+    emit({ type: "ui/error", message: "pull failed" });
+    expect(screen.queryByText(/Pulling m:1b/)).toBeNull();
+    emit({ type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' });
+    expect(screen.getByRole("button", { name: "Pull model" })).toBeTruthy();
+  });
+});
