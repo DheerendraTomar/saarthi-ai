@@ -112,6 +112,8 @@ const plugin: JupyterFrontEndPlugin<void> = {
         onChange: (s) => {
           settings = s;
           status.setCompletionsEnabled(s.completionsEnabled);
+          // The toggle's label and checkmark read the settings.
+          if (app.commands.hasCommand(COMMANDS.toggleCompletions)) app.commands.notifyCommandChanged(COMMANDS.toggleCompletions);
         },
         restart
       })
