@@ -9,5 +9,5 @@
     "isolatedModules": true,
     "types": ["jest"]
   },
-  "include": ["src/*", "test/*"]
+  "include": ["src/**/*", "test/*"]
 }

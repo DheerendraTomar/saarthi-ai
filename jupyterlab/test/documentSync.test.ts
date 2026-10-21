@@ -371,6 +371,10 @@ describe('DocumentSync', () => {
     ]);
     expect(sync.uriForFile(file)).toBe('file:///w/src/my%20mod.py');
     expect(sync.uriForFile({})).toBeUndefined();
+    expect(sync.isSynced('file:///w/src/my mod.py')).toBe(true);
+    expect(sync.isSynced(`${NB}.cell0.py`)).toBe(true);
+    expect(sync.isSynced(`${NB}.cells.py`)).toBe(false);
+    expect(sync.isSynced('file:///w/other.py')).toBe(false);
 
     file.model.sharedModel.setSource('import sys');
     a.sharedModel.setSource('a2'); // concat update pending when the core goes away
@@ -400,6 +404,7 @@ describe('DocumentSync', () => {
     file.dispose();
     expect(client.take()).toEqual(['didClose file:///w/src/my%20mod.py']);
     expect(sync.uriForFile(file)).toBeUndefined();
+    expect(sync.isSynced('file:///w/src/my%20mod.py')).toBe(false);
 
     sync.dispose();
     client.reconnected();

@@ -8,6 +8,7 @@ module.exports = tseslint.config(
       'lib/',
       'localpilot_jupyter/',
       'coverage/',
+      'scripts/',
       '.venv/',
       '*.js'
     ]

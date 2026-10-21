@@ -2410,19 +2410,19 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@jupyterlab/docmanager@npm:^4.6.4":
-  version: 4.6.4
-  resolution: "@jupyterlab/docmanager@npm:4.6.4"
+"@jupyterlab/docmanager@npm:~4.5.0":
+  version: 4.5.11
+  resolution: "@jupyterlab/docmanager@npm:4.5.11"
   dependencies:
-    "@jupyterlab/apputils": ^4.7.4
-    "@jupyterlab/coreutils": ^6.6.4
-    "@jupyterlab/docregistry": ^4.6.4
-    "@jupyterlab/rendermime": ^4.6.4
-    "@jupyterlab/services": ^7.6.4
-    "@jupyterlab/statedb": ^4.6.4
-    "@jupyterlab/statusbar": ^4.6.4
-    "@jupyterlab/translation": ^4.6.4
-    "@jupyterlab/ui-components": ^4.6.4
+    "@jupyterlab/apputils": ^4.6.11
+    "@jupyterlab/coreutils": ^6.5.11
+    "@jupyterlab/docregistry": ^4.5.11
+    "@jupyterlab/rendermime": ^4.5.11
+    "@jupyterlab/services": ^7.5.11
+    "@jupyterlab/statedb": ^4.5.11
+    "@jupyterlab/statusbar": ^4.5.11
+    "@jupyterlab/translation": ^4.5.11
+    "@jupyterlab/ui-components": ^4.5.11
     "@lumino/algorithm": ^2.0.4
     "@lumino/coreutils": ^2.2.2
     "@lumino/disposable": ^2.1.5
@@ -2430,9 +2430,9 @@ __metadata:
     "@lumino/polling": ^2.1.5
     "@lumino/properties": ^2.0.4
     "@lumino/signaling": ^2.1.5
-    "@lumino/widgets": ^2.8.0
+    "@lumino/widgets": ^2.7.5
     react: ^18.2.0
-  checksum: 07988640d0eec3f7c1eac3b79879dfd702e8d02cd59b5cb0ae3f76cddb66cb914592e860115e3ddc9859ae33a748e21cea2d3d3dae19f1448c51307e31893589
+  checksum: 463de8327bf816d730302c7845b6a8fa529c55c68be6cf19749180542629f8d9bfc9399d6b2c91292a39a9bb59bea86b4a3dc7bb73c80faa2c5437a5b7edb91b
   languageName: node
   linkType: hard
 
@@ -3051,7 +3051,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@lumino/commands@npm:^2.3.3, @lumino/commands@npm:^2.3.4":
+"@lumino/commands@npm:^2.3.0, @lumino/commands@npm:^2.3.3, @lumino/commands@npm:^2.3.4":
   version: 2.3.4
   resolution: "@lumino/commands@npm:2.3.4"
   dependencies:
@@ -7490,16 +7490,20 @@ __metadata:
   dependencies:
     "@eslint/js": 9.15.0
     "@jupyterlab/application": ~4.5.0
+    "@jupyterlab/apputils": ~4.6.0
     "@jupyterlab/builder": ~4.5.0
     "@jupyterlab/completer": ~4.5.0
     "@jupyterlab/coreutils": ~6.5.0
+    "@jupyterlab/docmanager": ~4.5.0
     "@jupyterlab/fileeditor": ~4.5.0
     "@jupyterlab/notebook": ~4.5.0
     "@jupyterlab/services": ~7.5.0
     "@jupyterlab/settingregistry": ~4.5.0
     "@jupyterlab/statusbar": ~4.5.0
     "@jupyterlab/testing": ~4.5.0
+    "@jupyterlab/ui-components": ~4.5.0
     "@localpilot/rpc-client": "link:../rpc-client"
+    "@lumino/commands": ^2.3.0
     "@lumino/disposable": ^2.1.0
     "@lumino/signaling": ^2.1.0
     "@lumino/widgets": ^2.5.0

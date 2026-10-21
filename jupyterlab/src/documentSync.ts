@@ -233,6 +233,13 @@ export class DocumentSync implements IDisposable {
     return undefined;
   }
 
+  /** Whether `uri` is a document synced to the core (a code cell or a file editor's file). */
+  isSynced(uri: string): boolean {
+    if (this.cellForUri(uri)) return true;
+    for (const st of this.files.values()) if (sameUri(st.uri, uri)) return true;
+    return false;
+  }
+
   /**
    * The `file://` URI of a synced file editor's document, by its context
    * (`IDocumentWidget.context`); undefined for untracked files and notebooks.

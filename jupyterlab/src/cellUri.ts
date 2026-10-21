@@ -65,3 +65,27 @@ export function cellUri(nbPath: string, index: number, ext: string): string {
 export function concatUri(nbPath: string, ext: string): string {
   return fileUri(`${nbPath}.cells.${ext}`);
 }
+
+/**
+ * The server path (relative to `rootDir`, `/`-separated) of a `file://` URI,
+ * the inverse of `fileUri(absPath(rootDir, path))`; undefined for other
+ * schemes, paths outside the root, and `..` / `.` segments.
+ */
+export function serverPathForUri(rootDir: string, uri: string): string | undefined {
+  if (!uri.startsWith('file://')) return undefined;
+  let path: string;
+  try {
+    path = decodeURIComponent(uri.slice('file://'.length).replace(/[?#].*$/, ''));
+  } catch {
+    return undefined;
+  }
+  // Compare decoded forms; `fileUri` lower-cases a Windows drive letter.
+  const root = decodeURIComponent(fileUri(rootDir).slice('file://'.length)).replace(/\/+$/, '');
+  const norm = (p: string) => p.replace(/^\/([A-Za-z]):/, (_, d: string) => `/${d.toLowerCase()}:`);
+  path = norm(path);
+  if (!path.startsWith(`${norm(root)}/`)) return undefined;
+  const rel = path.slice(root.length + 1).replace(/\/+$/, '');
+  const parts = rel.split('/');
+  if (!rel || parts.some((s) => s === '' || s === '.' || s === '..')) return undefined;
+  return rel;
+}
