@@ -1,5 +1,5 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
-import { Clipboard, ICommandPalette, InputDialog, Notification } from '@jupyterlab/apputils';
+import { Clipboard, ICommandPalette, IThemeManager, InputDialog, Notification } from '@jupyterlab/apputils';
 import type { CodeEditor } from '@jupyterlab/codeeditor';
 import { ICompletionProviderManager } from '@jupyterlab/completer';
 import { IDocumentManager } from '@jupyterlab/docmanager';
@@ -13,6 +13,7 @@ import { Menu } from '@lumino/widgets';
 import { applyEdit, type ApplyEditParams, type EditNotebook } from './chat/applyEdit';
 import chatHtml from './chat/chat-ui.txt';
 import { ChatWidget, type ActiveFile } from './chat/chatWidget';
+import { jupyterThemeVars } from './chat/theme';
 import { WsCoreClient } from './client';
 import { COMMANDS, checkStatus, registerCommands, startOllama, pullModel, type CommandDeps } from './commands';
 import { DocumentSync } from './documentSync';
@@ -70,7 +71,15 @@ const plugin: JupyterFrontEndPlugin<void> = {
   description: 'LocalPilot: local Ollama-backed inline completions and agent chat.',
   autoStart: true,
   requires: [ISettingRegistry],
-  optional: [IStatusBar, INotebookTracker, IEditorTracker, ICompletionProviderManager, IDocumentManager, ICommandPalette],
+  optional: [
+    IStatusBar,
+    INotebookTracker,
+    IEditorTracker,
+    ICompletionProviderManager,
+    IDocumentManager,
+    ICommandPalette,
+    IThemeManager
+  ],
   activate: async (
     app: JupyterFrontEnd,
     registry: ISettingRegistry,
@@ -79,7 +88,8 @@ const plugin: JupyterFrontEndPlugin<void> = {
     editorTracker: IEditorTracker | null,
     completionManager: ICompletionProviderManager | null,
     docManager: IDocumentManager | null,
-    palette: ICommandPalette | null
+    palette: ICommandPalette | null,
+    themeManager: IThemeManager | null
   ) => {
     const serverSettings = app.serviceManager.serverSettings;
     const pluginSettings = await registry.load(PLUGIN_ID);
@@ -182,7 +192,12 @@ const plugin: JupyterFrontEndPlugin<void> = {
       startOllama: () => void startOllama(commandDeps),
       pullModel: (model) => pullModel(commandDeps, model),
       // The core pauses completions while chat generates (spec §5(10)); show it.
-      onChatActiveChanged: (on) => status.setChatActive(on)
+      onChatActiveChanged: (on) => status.setChatActive(on),
+      // JupyterLab's --jp-* theme values under chat-ui's --vscode-* names.
+      themeVars: () => {
+        const style = getComputedStyle(document.body);
+        return jupyterThemeVars((name) => style.getPropertyValue(name));
+      }
     });
     chat.title.icon = chatIcon;
     app.shell.add(chat, 'right', { rank: 1000 });
@@ -193,6 +208,12 @@ const plugin: JupyterFrontEndPlugin<void> = {
         chat.setStatus(s);
       })
     );
+    // Theme switches: re-read once the new theme's CSS has applied (deduplicated by the widget).
+    const themeChanged = () => {
+      chat.themeChanged();
+      setTimeout(() => chat.isDisposed || chat.themeChanged(), 300);
+    };
+    themeManager?.themeChanged.connect(themeChanged);
     const activeFileChanged = () => chat.activeFileChanged();
     app.shell.currentChanged?.connect(activeFileChanged);
     notebookTracker?.activeCellChanged.connect(activeFileChanged);
@@ -202,6 +223,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
     disposables.add({
       isDisposed: false,
       dispose() {
+        themeManager?.themeChanged.disconnect(themeChanged);
         app.shell.currentChanged?.disconnect(activeFileChanged);
         notebookTracker?.activeCellChanged.disconnect(activeFileChanged);
         editorTracker?.currentChanged.disconnect(activeFileChanged);

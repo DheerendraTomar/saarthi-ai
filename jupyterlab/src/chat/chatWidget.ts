@@ -1,6 +1,7 @@
 import type { IDisposable } from '@lumino/disposable';
 import { Widget } from '@lumino/widgets';
 import type { OllamaStatus, WsCoreClient } from '../client';
+import { isSafeCssValue } from './theme';
 
 /** The sidebar widget's id (also what `localpilot:open-chat` activates). */
 export const CHAT_WIDGET_ID = 'localpilot-chat';
@@ -56,6 +57,8 @@ export interface ChatWidgetDeps {
   pullModel: (model: string) => Promise<void>;
   /** Called when the first chat turn starts (true) and when the last one ends (false). */
   onChatActiveChanged?: (active: boolean) => void;
+  /** The host theme as `--vscode-*` custom properties (`jupyterThemeVars`). */
+  themeVars?: () => Record<string, string>;
 }
 
 interface SessionSummary {
@@ -72,9 +75,26 @@ const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e)
 /** The socket closed under the request: reported once, by the disconnect handler. */
 const isDisconnect = (e: unknown) => e instanceof Error && e.name === 'CoreDisconnected';
 
-/** Adds the CSP `<meta>` and `<base target="_blank">` at the top of `<head>`. */
-export function renderHtml(template: string): string {
-  const head = `<meta http-equiv="Content-Security-Policy" content="${CHAT_CSP}"><base target="_blank">`;
+/** Only `--vscode-*` names with values that cannot break out of the `<style>` block. */
+function safeThemeVars(vars: Record<string, string> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(vars ?? {})) {
+    if (/^--vscode-[A-Za-z0-9.-]+$/.test(name) && typeof value === 'string' && isSafeCssValue(value)) out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * Adds the CSP `<meta>`, `<base target="_blank">` and the host theme (as
+ * `--vscode-*` custom properties on `:root`) at the top of `<head>`, before
+ * the bundle's own styles.
+ */
+export function renderHtml(template: string, themeVars?: Record<string, string>): string {
+  const vars = Object.entries(safeThemeVars(themeVars))
+    .map(([name, value]) => `${name}:${value};`)
+    .join('');
+  const theme = vars ? `<style id="lp-host-theme">:root{${vars}}</style>` : '';
+  const head = `<meta http-equiv="Content-Security-Policy" content="${CHAT_CSP}"><base target="_blank">${theme}`;
   const m = /<head[^>]*>/i.exec(template);
   if (!m) return `${head}\n${template}`;
   const at = m.index + m[0].length;
@@ -108,6 +128,8 @@ export class ChatWidget extends Widget {
    */
   private readonly pendingCalls = new Map<string, Map<string, Record<string, unknown>>>();
   private lastActiveFile = '';
+  /** The theme the UI has (srcdoc or the last `ui/theme`), to skip unchanged updates. */
+  private lastTheme = '';
   private readonly subscriptions: IDisposable[] = [];
 
   constructor(
@@ -130,7 +152,9 @@ export class ChatWidget extends Widget {
     } catch (e) {
       template = `<!doctype html><html><head></head><body><p>LocalPilot chat UI is missing (${escapeHtml(errorMessage(e))}). Rebuild the extension.</p></body></html>`;
     }
-    iframe.setAttribute('srcdoc', renderHtml(template));
+    const theme = this.currentTheme();
+    this.lastTheme = JSON.stringify(theme);
+    iframe.setAttribute('srcdoc', renderHtml(template, theme));
     this.node.appendChild(iframe);
     window.addEventListener('message', this.onWindowMessage);
 
@@ -160,6 +184,15 @@ export class ChatWidget extends Widget {
     this.postActiveFile();
   }
 
+  /**
+   * The host theme may have changed: send the UI the new `--vscode-*` values
+   * (`ui/theme`) if they differ. The srcdoc is left alone: resetting it would
+   * reload the frame and lose the draft.
+   */
+  themeChanged(): void {
+    this.postTheme();
+  }
+
   /** Starts a new chat session and shows it (command `localpilot:new-session`). */
   async newSession(): Promise<void> {
     try {
@@ -185,12 +218,19 @@ export class ChatWidget extends Widget {
   private onCoreNotification(method: string, params: unknown): void {
     const p = (params ?? {}) as Record<string, unknown>;
     if (method === 'status') this.status = p as unknown as OllamaStatus;
+    /** A session this tab adopted while its turn waits on an approval (the bridge replays the call). */
+    let adopted: string | undefined;
     if (method === 'chat/toolCall' && typeof p.toolCallId === 'string' && typeof p.sessionId === 'string') {
       this.toolCallSessions.set(p.toolCallId, p.sessionId);
       if (p.requiresApproval === true) {
         let pending = this.pendingCalls.get(p.sessionId);
         if (!pending) this.pendingCalls.set(p.sessionId, (pending = new Map()));
         pending.set(p.toolCallId, { ...p });
+        // The turn is running here too (Stop, chat-active), until its chat/done.
+        if (!this.activeTurns.has(p.sessionId)) {
+          this.startTurn(p.sessionId);
+          adopted = p.sessionId;
+        }
       }
     }
     if (method === 'chat/toolResult' && typeof p.toolCallId === 'string' && typeof p.sessionId === 'string') {
@@ -202,6 +242,7 @@ export class ChatWidget extends Widget {
       for (const [id, sid] of this.toolCallSessions) if (sid === p.sessionId) this.toolCallSessions.delete(id);
     }
     this.post({ ...p, type: method });
+    if (adopted && adopted === this.current) this.post({ type: 'chat/turnState', sessionId: adopted, running: true });
     // A finished turn may have titled the session: refresh the switcher.
     if (method === 'chat/done') void this.postSessionList().catch(() => undefined);
   }
@@ -283,6 +324,8 @@ export class ChatWidget extends Widget {
       if (!isDisconnect(e)) this.postError(`LocalPilot core is not available: ${errorMessage(e)}`);
     }
     if (this.status) this.post({ type: 'status', ...this.status });
+    // The frame may have loaded before the theme's CSS did.
+    this.postTheme(true);
     this.postActiveFile(true);
   }
 
@@ -400,6 +443,23 @@ export class ChatWidget extends Widget {
     if (!force && key === this.lastActiveFile) return;
     this.lastActiveFile = key;
     this.post(msg);
+  }
+
+  private currentTheme(): Record<string, string> {
+    try {
+      return safeThemeVars(this.deps.themeVars?.());
+    } catch {
+      return {};
+    }
+  }
+
+  private postTheme(force = false): void {
+    if (!this.deps.themeVars) return;
+    const vars = this.currentTheme();
+    const key = JSON.stringify(vars);
+    if (!force && key === this.lastTheme) return;
+    this.lastTheme = key;
+    this.post({ type: 'ui/theme', vars });
   }
 
   private postError(message: string): void {

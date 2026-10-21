@@ -7,7 +7,7 @@
     "noEmit": true,
     "rootDir": ".",
     "isolatedModules": true,
-    "types": ["jest"]
+    "types": ["jest", "node"]
   },
   "include": ["src/**/*", "test/*"]
 }

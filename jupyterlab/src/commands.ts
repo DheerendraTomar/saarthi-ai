@@ -13,8 +13,13 @@ export const COMMANDS = {
   restartCore: 'localpilot:restart-core'
 } as const;
 
-/** `localpilot:open-chat`'s keybinding. */
-export const OPEN_CHAT_KEYS = ['Accel Shift L'];
+/**
+ * `localpilot:open-chat`'s default keybinding: Alt+Shift+L (Option+Shift+L on
+ * macOS). Declared under `jupyter.lab.shortcuts` in schema/plugin.json, so it
+ * shows in Settings → Keyboard Shortcuts and can be rebound there; kept here
+ * for tests and docs. (`Accel Shift L` is JupyterLab's `launcher:create`.)
+ */
+export const OPEN_CHAT_KEYS = ['Alt Shift L'];
 
 export const PALETTE_CATEGORY = 'LocalPilot';
 
@@ -139,7 +144,7 @@ export async function pullModel(deps: CommandDeps, model?: string): Promise<void
   }
 }
 
-/** Registers the LocalPilot commands, the open-chat keybinding and the palette items. */
+/** Registers the LocalPilot commands and their palette items (the open-chat shortcut is in the schema). */
 export function registerCommands(deps: CommandDeps): IDisposable {
   const set = new DisposableSet();
   const { commands } = deps;
@@ -182,7 +187,6 @@ export function registerCommands(deps: CommandDeps): IDisposable {
       execute: () => deps.restartCore().catch(report('restarting the core'))
     })
   );
-  set.add(commands.addKeyBinding({ command: COMMANDS.openChat, keys: OPEN_CHAT_KEYS, selector: 'body' }));
   for (const command of Object.values(COMMANDS)) {
     const item = deps.palette?.addItem({ command, category: PALETTE_CATEGORY });
     if (item) set.add(item);

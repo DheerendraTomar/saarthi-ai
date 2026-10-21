@@ -1,5 +1,8 @@
 {
   "jupyter.lab.setting-icon-label": "LocalPilot",
+  "jupyter.lab.shortcuts": [
+    { "command": "localpilot:open-chat", "keys": ["Alt Shift L"], "selector": "body" }
+  ],
   "title": "LocalPilot",
   "description": "LocalPilot: local Ollama-backed inline completions and agent chat. Same keys and defaults as the VS Code extension's localpilot.* settings. Changing a setting the core reads restarts the LocalPilot core on the Jupyter server.",
   "type": "object",

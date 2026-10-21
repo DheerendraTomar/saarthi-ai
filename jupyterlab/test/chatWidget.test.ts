@@ -1,6 +1,9 @@
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { Widget } from '@lumino/widgets';
 import { CoreDisconnected } from '../src/client';
-import { CHAT_WIDGET_ID, ChatWidget, type ChatClient, type ChatWidgetDeps } from '../src/chat/chatWidget';
+import { CHAT_WIDGET_ID, ChatWidget, renderHtml, type ChatClient, type ChatWidgetDeps } from '../src/chat/chatWidget';
+import { THEME_MAP, jupyterThemeVars } from '../src/chat/theme';
 
 // A fake core client: canned answers per method, captured notification
 // handlers and disconnect listeners. The widget's iframe is real (jsdom); its
@@ -61,6 +64,7 @@ function setup(overrides: Partial<ChatWidgetDeps> = {}) {
     startOllama: jest.fn(),
     pullModel: jest.fn(async () => undefined),
     onChatActiveChanged: jest.fn(),
+    themeVars: () => ({ '--vscode-foreground': '#101010' }),
     ...overrides
   };
   const widget = new ChatWidget(client, deps);
@@ -97,6 +101,77 @@ describe('ChatWidget', () => {
     expect(doc).toContain('<body>chat</body>');
     expect(doc).toContain("default-src 'none'");
     expect(doc).toContain('<base target="_blank">');
+    expect(doc).toContain('<style id="lp-host-theme">:root{--vscode-foreground:#101010;}</style>');
+  });
+
+  it('render_html_injects_mapped_theme_vars', () => {
+    const tpl = '<!doctype html><html><head><title>x</title></head><body></body></html>';
+    const doc = renderHtml(tpl, {
+      '--vscode-foreground': 'rgba(0, 0, 0, 0.87)',
+      '--vscode-font-family': '"Fira Sans", system-ui',
+      '--vscode-bad': 'red;}</style><script>alert(1)</script>',
+      color: 'red'
+    });
+    expect(doc).toContain('<style id="lp-host-theme">:root{--vscode-foreground:rgba(0, 0, 0, 0.87);--vscode-font-family:"Fira Sans", system-ui;}</style>');
+    expect(doc).not.toContain('alert');
+    expect(doc).not.toContain('color:red');
+    // Before the page's own styles (the bundle's <style> in <head> reads them).
+    expect(doc.indexOf('lp-host-theme')).toBeLessThan(doc.indexOf('<title>'));
+  });
+
+  it('maps_jupyterlab_theme_variables_onto_vscode_names', () => {
+    const values: Record<string, string> = {
+      '--jp-ui-font-color1': ' rgba(0, 0, 0, 0.87)',
+      '--jp-layout-color1': 'white',
+      '--jp-brand-color1': '#1976d2',
+      '--jp-code-font-family': 'Menlo, monospace'
+    };
+    const vars = jupyterThemeVars((name) => values[name] ?? '');
+    expect(vars['--vscode-foreground']).toBe('rgba(0, 0, 0, 0.87)');
+    expect(vars['--vscode-sideBar-background']).toBe('white');
+    expect(vars['--vscode-button-background']).toBe('#1976d2');
+    expect(vars['--vscode-focusBorder']).toBe('#1976d2');
+    expect(vars['--vscode-editor-font-family']).toBe('Menlo, monospace');
+    expect(vars['--vscode-descriptionForeground']).toBeUndefined(); // empty → keep the bundle's fallback
+    // Every --vscode-* name chat-ui's styles.css reads, except the diff backgrounds (translucent, theme-neutral).
+    const css = readFileSync(join(__dirname, '..', '..', 'chat-ui', 'src', 'styles.css'), 'utf8');
+    const used = new Set([...css.matchAll(/var\((--vscode-[A-Za-z0-9.-]+)/g)].map((m) => m[1]));
+    const mapped = new Set(Object.keys(THEME_MAP));
+    const missing = [...used].filter((n) => !mapped.has(n) && !n.startsWith('--vscode-diffEditor-'));
+    expect(missing).toEqual([]);
+  });
+
+  it('theme_change_posts_ui_theme', () => {
+    let vars: Record<string, string> = { '--vscode-foreground': '#101010' };
+    const { widget, posted } = setup({ themeVars: () => vars });
+    current = widget;
+    widget.themeChanged(); // unchanged since the srcdoc: nothing to send
+    expect(posted).toEqual([]);
+    vars = { '--vscode-foreground': '#eeeeee', '--vscode-sideBar-background': '#111111' };
+    widget.themeChanged();
+    widget.themeChanged();
+    expect(posted).toEqual([{ type: 'ui/theme', vars }]);
+    // srcdoc is not reset (that would reload the frame and lose the draft).
+    expect(widget.iframe.getAttribute('srcdoc')).toContain('--vscode-foreground:#101010');
+  });
+
+  it('adopted_session_with_replayed_pending_call_is_running', async () => {
+    const { client, deps, widget, posted, fromUi } = setup();
+    current = widget;
+    await fromUi({ type: 'ui/ready' });
+    // s1 was started in another tab; the bridge replays its pending call after our chat/history.
+    posted.length = 0;
+    const call = { sessionId: 's1', toolCallId: 'tx', name: 'edit_file', args: { path: 'a.py' }, requiresApproval: true };
+    client.notifyUi('chat/toolCall', call);
+    expect(posted).toEqual([
+      { type: 'chat/toolCall', ...call },
+      { type: 'chat/turnState', sessionId: 's1', running: true }
+    ]);
+    expect(deps.onChatActiveChanged).toHaveBeenLastCalledWith(true);
+    await fromUi({ type: 'chat/stop' });
+    expect(client.calls.at(-1)).toEqual(['chat/stop', { sessionId: 's1' }]);
+    client.notifyUi('chat/done', { sessionId: 's1', stopReason: 'stopped' });
+    expect(deps.onChatActiveChanged).toHaveBeenLastCalledWith(false);
   });
 
   it('chatWidget_relays_send_with_session_and_forwards_tokens', async () => {
@@ -106,10 +181,11 @@ describe('ChatWidget', () => {
     await fromUi({ type: 'ui/ready' });
     // The session list first (the UI keys tool cards by session), then its history.
     expect(client.methods()).toEqual(['chat/listSessions', 'chat/history']);
-    expect(types()).toEqual(['session/list', 'session/history', 'chat/turnState', 'ui/activeFile']);
+    expect(types()).toEqual(['session/list', 'session/history', 'chat/turnState', 'ui/theme', 'ui/activeFile']);
     expect(posted[0]).toEqual({ type: 'session/list', sessions: SESSIONS, current: 's1' });
     expect(posted[1]).toEqual({ type: 'session/history', sessionId: 's1', messages: [{ role: 'user', content: 'hello s1' }] });
-    expect(posted[3]).toEqual({ type: 'ui/activeFile', uri: CELL, selection: { start: { line: 0, character: 1 }, end: { line: 0, character: 3 } } });
+    expect(posted[3]).toEqual({ type: 'ui/theme', vars: { '--vscode-foreground': '#101010' } });
+    expect(posted[4]).toEqual({ type: 'ui/activeFile', uri: CELL, selection: { start: { line: 0, character: 1 }, end: { line: 0, character: 3 } } });
 
     await fromUi({
       type: 'chat/send',
@@ -148,7 +224,7 @@ describe('ChatWidget', () => {
     client.answers.set('chat/listSessions', () => ({ sessions: [] }));
     client.answers.set('chat/newSession', () => ({ sessionId: 'new1' }));
     await fromUi({ type: 'ui/ready' });
-    expect(types()).toEqual(['session/list', 'ui/activeFile']);
+    expect(types()).toEqual(['session/list', 'ui/theme', 'ui/activeFile']);
     await fromUi({ type: 'chat/send', message: 'hi', attachments: [] });
     expect(client.calls.find(([m]) => m === 'chat/send')).toEqual(['chat/send', { sessionId: 'new1', message: 'hi', attachments: [] }]);
     expect(widget.currentSessionId).toBe('new1');

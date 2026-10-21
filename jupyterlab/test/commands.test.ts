@@ -1,4 +1,5 @@
 import { CommandRegistry } from '@lumino/commands';
+import schema from '../schema/plugin.json';
 import { CHAT_WIDGET_ID } from '../src/chat/chatWidget';
 import { COMMANDS, OLLAMA_COMMAND, OPEN_CHAT_KEYS, registerCommands, type CommandDeps, type TerminalConnection } from '../src/commands';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings';
@@ -50,6 +51,14 @@ function setup() {
   return { commands, deps, opened, terminals, running, requests, progress, registered };
 }
 
+describe('open-chat shortcut', () => {
+  it('is_declared_in_the_schema_with_a_free_chord', () => {
+    expect(schema['jupyter.lab.shortcuts']).toEqual([{ command: COMMANDS.openChat, keys: OPEN_CHAT_KEYS, selector: 'body' }]);
+    // JupyterLab's own launcher:create owns Accel Shift L.
+    expect(OPEN_CHAT_KEYS).not.toContain('Accel Shift L');
+  });
+});
+
 describe('commands', () => {
   beforeEach(() => jest.useFakeTimers());
   afterEach(() => jest.useRealTimers());
@@ -57,11 +66,9 @@ describe('commands', () => {
   it('registers_commands_and_the_open_chat_keybinding', async () => {
     const { commands, deps, registered } = setup();
     for (const id of Object.values(COMMANDS)) expect(commands.hasCommand(id)).toBe(true);
-    // Lumino resolves `Accel` per platform (Cmd on macOS, Ctrl elsewhere).
-    expect(OPEN_CHAT_KEYS).toEqual(['Accel Shift L']);
-    expect(commands.keyBindings.map((k) => [k.command, k.keys, k.selector])).toEqual([
-      [COMMANDS.openChat, [CommandRegistry.normalizeKeystroke('Accel Shift L')], 'body']
-    ]);
+    // The keybinding is declared in the settings schema (rebindable), not added here.
+    expect(commands.keyBindings).toHaveLength(0);
+    expect(OPEN_CHAT_KEYS).toEqual(['Alt Shift L']);
 
     await commands.execute(COMMANDS.openChat);
     expect(deps.activateById).toHaveBeenCalledWith(CHAT_WIDGET_ID);
@@ -78,7 +85,6 @@ describe('commands', () => {
 
     registered.dispose();
     expect(commands.hasCommand(COMMANDS.openChat)).toBe(false);
-    expect(commands.keyBindings).toHaveLength(0);
   });
 
   it('start_ollama_runs_ollama_serve_in_a_terminal', async () => {
