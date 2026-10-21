@@ -29,10 +29,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -206,9 +205,34 @@ pub struct FeedbackLog {
     path: PathBuf,
     tx: std_mpsc::Sender<Cmd>,
     memory: Arc<Mutex<Memory>>,
-    /// Test hook: the writer sleeps this long before each append.
+    /// Test hook: while held, the writer waits before each append.
     #[cfg_attr(not(test), allow(dead_code))]
-    write_delay_ms: Arc<AtomicU64>,
+    write_hold: Arc<WriteHold>,
+}
+
+/// A gate the writer waits on before each append (test hook).
+#[derive(Default)]
+struct WriteHold {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+impl WriteHold {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn set(&self, held: bool) {
+        *lock(&self.held) = held;
+        self.released.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut held = lock(&self.held);
+        while *held {
+            held = self
+                .released
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
 }
 
 impl FeedbackLog {
@@ -231,13 +255,13 @@ impl FeedbackLog {
     fn start(path: PathBuf, workspace: Option<PathBuf>) -> Self {
         let (tx, rx) = std_mpsc::channel();
         let memory = Arc::new(Mutex::new(Memory::default()));
-        let write_delay_ms = Arc::new(AtomicU64::new(0));
+        let write_hold = Arc::new(WriteHold::default());
         let writer = Writer {
             meta_path: path.with_file_name(META_FILE),
             path: path.clone(),
             workspace,
             memory: memory.clone(),
-            write_delay_ms: write_delay_ms.clone(),
+            write_hold: write_hold.clone(),
             lines: 0,
             needs_newline: false,
             dir_ready: false,
@@ -252,7 +276,7 @@ impl FeedbackLog {
             path,
             tx,
             memory,
-            write_delay_ms,
+            write_hold,
         }
     }
 
@@ -324,9 +348,8 @@ impl FeedbackLog {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_write_delay(&self, delay: Duration) {
-        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-        self.write_delay_ms.store(ms, Ordering::SeqCst);
+    pub(crate) fn set_write_hold(&self, held: bool) {
+        self.write_hold.set(held);
     }
 }
 
@@ -348,7 +371,7 @@ struct Writer {
     meta_path: PathBuf,
     workspace: Option<PathBuf>,
     memory: Arc<Mutex<Memory>>,
-    write_delay_ms: Arc<AtomicU64>,
+    write_hold: Arc<WriteHold>,
     /// Non-empty lines in the file.
     lines: usize,
     /// The file does not end with a newline (e.g. a torn last write).
@@ -421,10 +444,7 @@ impl Writer {
     }
 
     fn append(&mut self, record: &Record) -> io::Result<()> {
-        let delay = self.write_delay_ms.load(Ordering::SeqCst);
-        if delay > 0 {
-            std::thread::sleep(Duration::from_millis(delay));
-        }
+        self.write_hold.wait();
         self.ensure_dir()?;
         let mut line = Vec::new();
         if self.needs_newline {

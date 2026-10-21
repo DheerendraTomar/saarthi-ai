@@ -209,10 +209,12 @@ v2 additions (model selection, session management, adaptive completions; see
   `acceptedText` for `accepted` / `partial`). `completion/accepted` /
   `completion/rejected` still work and mean `accepted` / `rejected`. Each served
   suggestion's outcome is logged once to `.localpilot/completions.jsonl`
-  (unanswered after 60 s → `rejected`).
+  (unanswered after 60 s → `rejected`); a typed-prefix cache hit is not a new
+  suggestion and is not logged (the original's record carries the outcome).
 - `completion/stats {}` → `{ languages: { [lang]: { served, accepted, partial,
   rejected, typedThrough, acceptRate, learnedMaxLines, learnedNumPredict,
-  examples } }, logPath, adaptive }`; `completion/resetLearning {}` → `{}`
+  learned, examples } }, logPath, adaptive }` (`learned`: the limits were
+  learned, not the configured defaults); `completion/resetLearning {}` → `{}`
   (forgets learned limits and examples; the log is kept).
 - Setting `adaptiveCompletions` (default `true`): per language, the newest 50
   outcomes pick the multi-line cap and `num_predict`, and up to 3 recent
@@ -463,7 +465,10 @@ chat UI, so every client gets them):
      outcome, acceptedText? }`; the existing `completion/rejected` stays.
    - **Learned length:** per language, from the last 50 outcomes, the engine
      picks the multi-line cap and `num_predict` that maximise accepted text
-     (bounded to [16, 2×`completionMaxTokens`] tokens and [1, 8] lines).
+     (bounded to [16, `completionMaxTokens`] tokens — learning only lowers
+     the configured value — and [1, 8] lines). Every 10th served multi-line
+     suggestion per language explores the configured limits so longer
+     lengths keep being sampled.
    - **Style examples:** up to 3 recently accepted (context tail, suggestion)
      pairs from the same language are placed in the stable snippet block of
      the prompt (refreshed on the normal snippet cadence so KV-cache reuse is

@@ -597,6 +597,10 @@ pub struct CompletionLanguageStats {
     pub learned_max_lines: u32,
     /// `num_predict` the policy yields now (configured likewise).
     pub learned_num_predict: u32,
+    /// `learnedMaxLines` / `learnedNumPredict` were learned from outcomes;
+    /// `false`: they are the configured defaults (< 10 eligible outcomes,
+    /// or adaptive completions off).
+    pub learned: bool,
     /// Style examples the next snippet refresh puts in the prompt (0 when
     /// adaptive is off).
     pub examples: u32,

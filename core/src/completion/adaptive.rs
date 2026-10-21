@@ -19,6 +19,10 @@ pub const MIN_OUTCOMES: usize = 10;
 pub const MIN_BUCKET_SAMPLES: usize = 3;
 /// Lower bound of a learned `num_predict` (never 0 tokens).
 pub const MIN_NUM_PREDICT: u32 = 16;
+/// Every this-many-th served multi-line suggestion of a language is
+/// generated with the configured limits instead of the learned ones, so the
+/// longer length buckets keep getting samples (exploration).
+pub const EXPLORE_EVERY: u64 = 10;
 /// Upper bound of a learned multi-line cap.
 pub const MAX_LINES: u32 = 8;
 /// Headroom over the longest accepted text of the chosen bucket.
@@ -44,7 +48,8 @@ pub struct Configured {
 pub struct Learned {
     /// Multi-line cap, in `[1, 8]`.
     pub max_lines: u32,
-    /// `num_predict`, in `[16, 2 × completionMaxTokens]`.
+    /// `num_predict`, in `[16, completionMaxTokens]` (learning only lowers
+    /// it; `completionMaxTokens` below 16 still gives 16).
     pub num_predict: u32,
 }
 
@@ -80,8 +85,19 @@ impl Policy {
     ///    the shortest bucket wins (mostly rejections → 1 line).
     /// 4. `maxLines` = the bucket's upper bound; `numPredict` = 1.5 × the
     ///    longest accepted text of the bucket in tokens (16 if none), bounded
-    ///    to `[16, 2 × completionMaxTokens]` (16 wins if that is empty).
+    ///    to `[16, completionMaxTokens]`: the configured value is the
+    ///    ceiling, learning only lowers it (16 wins if that is empty).
     pub fn from_outcomes(lang: Lang, outcomes: &[Record], configured: Configured) -> Learned {
+        Self::learned_from(lang, outcomes, configured).unwrap_or_else(|| configured.as_learned())
+    }
+
+    /// [`from_outcomes`](Self::from_outcomes), or `None` when there are too
+    /// few outcomes to learn from (the configured values apply).
+    pub fn learned_from(
+        lang: Lang,
+        outcomes: &[Record],
+        configured: Configured,
+    ) -> Option<Learned> {
         let name = lang.as_str();
         let of_lang: Vec<&Record> = outcomes.iter().filter(|r| r.lang == name).collect();
         let window = &of_lang[of_lang.len().saturating_sub(WINDOW)..];
@@ -91,7 +107,7 @@ impl Policy {
             .filter(|r| r.max_lines != Some(1))
             .collect();
         if eligible.len() < MIN_OUTCOMES {
-            return configured.as_learned();
+            return None;
         }
 
         // (served, accepted chars, longest accepted text in tokens)
@@ -118,22 +134,20 @@ impl Policy {
                 best = Some((at, score));
             }
         }
-        let Some((at, score)) = best else {
-            return configured.as_learned();
-        };
+        let (at, score) = best?;
         let at = if score > 0.0 { at } else { 0 };
 
-        let ceiling = configured.max_tokens.saturating_mul(2).max(MIN_NUM_PREDICT);
+        let ceiling = configured.max_tokens.max(MIN_NUM_PREDICT);
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
         )]
         let wanted = (stats[at].2 as f64 * NUM_PREDICT_HEADROOM).ceil() as u32;
-        Learned {
+        Some(Learned {
             max_lines: BUCKETS[at].1.clamp(1, MAX_LINES),
             num_predict: wanted.clamp(MIN_NUM_PREDICT, ceiling),
-        }
+        })
     }
 }
 
@@ -147,7 +161,8 @@ pub struct Example {
 
 /// Up to [`MAX_EXAMPLES`] of the most recent `accepted` records of `lang`
 /// whose suggestion has ≥ 2 lines, newest first, as long as their rendered
-/// block stays within `budget_tokens`.
+/// block stays within `budget_tokens`. A suggestion text already picked is
+/// not picked again (the newest record of it wins).
 ///
 /// An example that does not fit is skipped and older ones are still tried,
 /// so the result is the newest set that fits, not merely a prefix.
@@ -161,6 +176,12 @@ pub fn examples(lang: Lang, outcomes: &[Record], budget_tokens: usize) -> Vec<Ex
             break;
         }
         if r.lang != name || r.outcome != Outcome::Accepted || r.lines < EXAMPLE_MIN_LINES {
+            continue;
+        }
+        if picked
+            .iter()
+            .any(|e: &Example| e.suggestion == r.suggestion)
+        {
             continue;
         }
         let example = Example {
@@ -301,7 +322,7 @@ mod tests {
         let learned = Policy::from_outcomes(Lang::Python, &outcomes, CONF);
         assert_eq!(learned.max_lines, 1);
         assert!(learned.num_predict >= MIN_NUM_PREDICT);
-        assert!(learned.num_predict <= 2 * CONF.max_tokens);
+        assert!(learned.num_predict <= CONF.max_tokens);
 
         // Everything rejected: the shortest bucket, never 0 tokens.
         let all: Vec<Record> = (0..50)
@@ -332,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_long_suggestions_raise_cap_within_bounds() {
+    fn learned_num_predict_never_exceeds_configured() {
         // A 2–4 line habit: cap 4.
         let mid = lines(3, 8);
         let mut outcomes: Vec<Record> = (0..12)
@@ -343,7 +364,8 @@ mod tests {
         assert_eq!(learned.max_lines, 4);
 
         // Long suggestions accepted (generated up to the 32-token limit):
-        // the cap stays 8 and num_predict grows past the configured value.
+        // the cap stays 8 and num_predict stays at the configured value —
+        // learning never raises it past `completionMaxTokens`.
         let long = lines(6, 4); // ~6 lines of ~16 chars ≈ 25 tokens
         let near_limit: String = lines(8, 9); // ≈ 36 tokens
         let mut outcomes: Vec<Record> = (0..15)
@@ -353,12 +375,9 @@ mod tests {
         outcomes.extend((0..10).map(|_| rec("python", "x", Outcome::Rejected)));
         let learned = Policy::from_outcomes(Lang::Python, &outcomes, CONF);
         assert_eq!(learned.max_lines, 8);
-        assert!(
-            CONF.max_tokens < learned.num_predict && learned.num_predict <= 2 * CONF.max_tokens,
-            "{learned:?}"
-        );
+        assert_eq!(learned.num_predict, CONF.max_tokens, "{learned:?}");
 
-        // Huge accepted texts clamp to exactly 2 × completionMaxTokens; a
+        // Huge accepted texts clamp to exactly completionMaxTokens; a
         // partial accept counts only its accepted text.
         let huge = lines(8, 400);
         let mut outcomes: Vec<Record> = (0..20)
@@ -374,9 +393,18 @@ mod tests {
             learned,
             Learned {
                 max_lines: 8,
-                num_predict: 2 * CONF.max_tokens
+                num_predict: CONF.max_tokens
             }
         );
+        // Whatever the configured value, the learned one never exceeds it.
+        for max_tokens in [16, 24, 64, 128] {
+            let conf = Configured {
+                max_tokens,
+                max_lines: 8,
+            };
+            let learned = Policy::from_outcomes(Lang::Python, &outcomes, conf);
+            assert_eq!(learned.num_predict, max_tokens, "{learned:?}");
+        }
         // More than 8 lines counts as the 5–8 bucket; never above 8.
         let over = lines(12, 4);
         let outcomes: Vec<Record> = (0..20)
@@ -453,5 +481,39 @@ mod tests {
         assert!(!got.is_empty() && got.len() < 3);
         assert!(tokens::estimate(&render_examples(Lang::Python, &got)) <= EXAMPLES_TOKENS);
         assert!(examples(Lang::Python, &many, 0).is_empty());
+    }
+
+    #[test]
+    fn examples_contain_no_duplicate_suggestion_text() {
+        // One suggestion logged several times (e.g. a typing run) and two
+        // other ones: each text appears once, the newest record of it wins.
+        let mut outcomes = Vec::new();
+        for (i, text) in ["a\nb", "c\nd", "a\nb", "a\nb", "e\nf", "a\nb"]
+            .iter()
+            .enumerate()
+        {
+            let mut r = rec("python", text, Outcome::Accepted);
+            r.context_tail = format!("# {i}\n");
+            outcomes.push(r);
+        }
+        let got = examples(Lang::Python, &outcomes, EXAMPLES_TOKENS);
+        let texts: Vec<&str> = got.iter().map(|e| e.suggestion.as_str()).collect();
+        assert_eq!(texts, ["a\nb", "e\nf", "c\nd"]);
+        assert_eq!(got[0].context_tail, "# 5\n");
+    }
+
+    #[test]
+    fn learned_from_is_none_only_when_too_few_outcomes() {
+        let few: Vec<Record> = (0..9)
+            .map(|_| rec("python", "a\nb", Outcome::Accepted))
+            .collect();
+        assert_eq!(Policy::learned_from(Lang::Python, &few, CONF), None);
+        // A learned value equal to the configured one is still learned.
+        let long = lines(6, 4);
+        let many: Vec<Record> = (0..20)
+            .map(|_| rec("python", &long, Outcome::Accepted))
+            .collect();
+        let learned = Policy::learned_from(Lang::Python, &many, CONF);
+        assert_eq!(learned.map(|l| l.max_lines), Some(8));
     }
 }

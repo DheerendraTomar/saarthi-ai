@@ -328,3 +328,5 @@ Adaptive completions (learned multi-line cap / `num_predict` and up to 3 style e
 | **after Task 3** | **73.12 / 74.63** | **212.51 / 219.13 / 221.66** | 0.06 | 1/20 |
 
 Typing-mode numbers are unchanged within noise: total p50 is +1.7 ms. All four targets pass (TTFT p50 ≤ 250 ms, TTFT p95 ≤ 600 ms, overhead p95 < 5 ms, RSS 18.2 MB ≤ 30 MB).
+
+**Learned `num_predict` ceiling (final fix wave, 2026-10-21):** the learned `num_predict` was first bounded to `[16, 2 × completionMaxTokens]`, which could have re-introduced the latency the 32-token default avoids (0.5b/64 typing total p50 295 ms > 250 ms, table above). It is now bounded to `[16, completionMaxTokens]`: learning only lowers it, so the typing-mode row of the configured max tokens (0.5b/32: 211 / 212 ms) is the latency bound with adaptive completions on. The 1-in-10 exploration requests run with exactly the configured limits, so they stay within that bound too.

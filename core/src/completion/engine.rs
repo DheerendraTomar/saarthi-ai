@@ -20,8 +20,10 @@
 //! The HTTP stream is dropped when the [`Trimmer`] stops, when the last
 //! waiting requester is cancelled (or dropped), or when completions pause.
 //!
-//! **Outcome log.** With a [`FeedbackLog`] set, every served suggestion is
-//! kept as a pending [`Record`] until `completion/outcome` (or
+//! **Outcome log.** With a [`FeedbackLog`] set, every served suggestion
+//! (except a typed-prefix cache hit: that is the rest of a suggestion
+//! already served, whose own record carries the outcome) is kept as a
+//! pending [`Record`] until `completion/outcome` (or
 //! `completion/accepted|rejected`) names it, then appended with that
 //! outcome. A pending record with no outcome after [`OUTCOME_TIMEOUT`] (or
 //! pushed out by [`PENDING_MEMORY`] newer ones) is appended as `rejected`;
@@ -35,6 +37,12 @@
 //! ([`adaptive::examples`]), and stores them with the snippets. Requests
 //! only read them, so they change exactly when the snippet block does and
 //! the prompt stays byte-stable while typing.
+//!
+//! **Exploration.** Learned limits only ever move towards what was accepted,
+//! so a longer bucket that lost would never be sampled again. Every
+//! [`adaptive::EXPLORE_EVERY`]-th served multi-line suggestion of a language
+//! is therefore generated with the configured limits (bypassing the
+//! completion cache), and its record carries those limits.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -112,6 +120,9 @@ struct Inner {
     /// Served suggestions awaiting their outcome, oldest first.
     pending: Mutex<VecDeque<Pending>>,
     last_status: Mutex<Option<OllamaStatus>>,
+    /// Served multi-line suggestions per language while learned limits were
+    /// in effect (drives exploration).
+    explore_counts: Mutex<HashMap<&'static str, u64>>,
     snippet_refreshes: AtomicUsize,
     next_refresh: AtomicU64,
     next_flight: AtomicU64,
@@ -150,6 +161,8 @@ struct SnippetEntry {
 /// A running generation that requesters wait on.
 struct Flight {
     id: u64,
+    /// `(max_lines, num_predict)` the generation runs with.
+    limits: (u32, u32),
     waiters: usize,
     http_cancel: CancellationToken,
     result: watch::Receiver<Option<Outcome>>,
@@ -189,6 +202,14 @@ pub(crate) struct Prepared {
     pub max_lines: u32,
     /// `num_predict` in effect.
     pub num_predict: u32,
+    /// The document's language.
+    pub lang: Lang,
+    /// Multi-line mode with learned limits available: a served suggestion
+    /// counts towards exploration.
+    pub adapted: bool,
+    /// This request explores: the configured limits replace the learned
+    /// ones and the completion cache is not consulted.
+    pub explore: bool,
 }
 
 #[cfg(test)]
@@ -225,6 +246,7 @@ impl CompletionEngine {
                 feedback: Mutex::new(None),
                 pending: Mutex::new(VecDeque::new()),
                 last_status: Mutex::new(None),
+                explore_counts: Mutex::new(HashMap::new()),
                 snippet_refreshes: AtomicUsize::new(0),
                 next_refresh: AtomicU64::new(0),
                 next_flight: AtomicU64::new(0),
@@ -284,11 +306,12 @@ impl CompletionEngine {
             return Ok(CompletionResult::default());
         };
         let key = prepared.key.clone();
+        let (lang, adapted, explore) = (prepared.lang, prepared.adapted, prepared.explore);
         // Captured before `prepared` moves into the generation.
         let draft = self.feedback_log().is_some().then(|| {
             let path = uri_to_path(&params.uri);
             Draft {
-                lang: Lang::from_path(&path).as_str(),
+                lang: lang.as_str(),
                 ext: path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -304,13 +327,16 @@ impl CompletionEngine {
         });
 
         let mut served_key = key.clone();
-        let cached = self
-            .cache_enabled()
+        // Exploring requests want a fresh generation with their own limits.
+        let cached = (self.cache_enabled() && !explore)
             .then(|| lock(&inner.cache).lookup(&key.0, &key.1, &key.2))
             .flatten();
+        let mut typed_prefix_hit = false;
+        let mut limits = None;
         let text = match cached {
             Some(hit) => {
                 // A typed-prefix hit is stored under the shorter prefix.
+                typed_prefix_hit = hit.entry_prefix != key.1;
                 served_key.1 = hit.entry_prefix;
                 hit.text
             }
@@ -320,6 +346,8 @@ impl CompletionEngine {
                 else {
                     return Ok(CompletionResult::default());
                 };
+                // A joined generation may run with other limits than ours.
+                limits = Some(waiter.limits);
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
@@ -337,8 +365,21 @@ impl CompletionEngine {
         if text.is_empty() || cancel.is_cancelled() {
             return Ok(CompletionResult::default());
         }
+        // Kept for a typed-prefix hit too, so rejecting it evicts the entry.
         remember_served(inner, &params.request_id, served_key);
+        // The rest of a suggestion already served is not a new suggestion:
+        // the original's record carries the outcome, so no record (and no
+        // exploration count) here.
+        if typed_prefix_hit {
+            return Ok(served(text, params.position));
+        }
+        if adapted {
+            *lock(&inner.explore_counts)
+                .entry(lang.as_str())
+                .or_default() += 1;
+        }
         if let Some(draft) = draft {
+            let (max_lines, num_predict) = limits.unwrap_or((draft.max_lines, draft.num_predict));
             let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
             let first_token_at = *lock(&timing.first_token_at);
             let record = Record {
@@ -355,18 +396,12 @@ impl CompletionEngine {
                 ttft_ms: first_token_at.map(|t| ms(t.saturating_duration_since(started_at))),
                 total_ms: ms(started_at.elapsed()),
                 model: Some(settings.completion_model.clone()),
-                max_lines: Some(draft.max_lines),
-                num_predict: Some(draft.num_predict),
+                max_lines: Some(max_lines),
+                num_predict: Some(num_predict),
             };
             self.add_pending(record);
         }
-        let at = params.position;
-        Ok(CompletionResult {
-            items: vec![CompletionItem {
-                text,
-                range: Range { start: at, end: at },
-            }],
-        })
+        Ok(served(text, params.position))
     }
 
     /// Cancels the request `request_id` if it is still being answered; its
@@ -480,12 +515,14 @@ impl CompletionEngine {
                     let recent = log.recent(&name, adaptive::WINDOW);
                     let budget = examples_budget(settings);
                     (
-                        Policy::from_outcomes(lang, &recent, configured),
+                        Policy::learned_from(lang, &recent, configured),
                         adaptive::examples(lang, &recent, budget).len(),
                     )
                 } else {
-                    (configured.as_learned(), 0)
+                    (None, 0)
                 };
+                let is_learned = learned.is_some();
+                let learned = learned.unwrap_or_else(|| configured.as_learned());
                 #[allow(clippy::cast_precision_loss)]
                 let accept_rate = if c.served == 0 {
                     0.0
@@ -501,6 +538,7 @@ impl CompletionEngine {
                     accept_rate,
                     learned_max_lines: learned.max_lines,
                     learned_num_predict: learned.num_predict,
+                    learned: is_learned,
                     examples: u32::try_from(examples).unwrap_or(u32::MAX),
                 };
                 (name, stats)
@@ -521,6 +559,7 @@ impl CompletionEngine {
         if let Some(log) = self.feedback_log() {
             log.reset_learning();
         }
+        lock(&self.inner.explore_counts).clear();
         for slot in lock(&self.inner.snippets_by_uri).values_mut() {
             slot.refresh = None;
             if let Some(entry) = slot.entry.as_mut() {
@@ -721,7 +760,18 @@ impl CompletionEngine {
             settings,
         );
         let mode = stop::mode_for(&window.prefix, &prompt.suffix);
-        let limits = learned.unwrap_or_else(|| configured(settings).as_learned());
+        let adapted = mode == StopMode::MultiLine && learned.is_some();
+        let explore = adapted && {
+            let served = lock(&inner.explore_counts)
+                .get(lang.as_str())
+                .copied()
+                .unwrap_or(0);
+            served % adaptive::EXPLORE_EVERY == adaptive::EXPLORE_EVERY - 1
+        };
+        let limits = match learned {
+            Some(learned) if !explore => learned,
+            _ => configured(settings).as_learned(),
+        };
         let key = (uri.to_owned(), window.prefix, prompt.suffix.clone());
         Some(Prepared {
             key,
@@ -733,6 +783,9 @@ impl CompletionEngine {
                 StopMode::MultiLine => limits.max_lines,
             },
             num_predict: limits.num_predict,
+            lang,
+            adapted,
+            explore,
         })
     }
 }
@@ -809,7 +862,8 @@ async fn refresh(mark: RefreshMark, around: String, budget: usize) {
 }
 
 /// The rendered style examples and learned limits for `uri`'s language
-/// (`""`, `None` with adaptive completions off or no log). Memory only.
+/// (`""`, `None` with adaptive completions off or no log; `None` limits with
+/// too few outcomes). Memory only.
 fn adaptive_view(inner: &Inner, uri: &str, budget: usize) -> (String, Option<Learned>) {
     let settings = &inner.settings;
     if !settings.adaptive_completions {
@@ -820,9 +874,10 @@ fn adaptive_view(inner: &Inner, uri: &str, budget: usize) -> (String, Option<Lea
     };
     let lang = Lang::from_path(&uri_to_path(uri));
     let recent = log.recent(lang.as_str(), adaptive::WINDOW);
-    let learned = Policy::from_outcomes(lang, &recent, configured(settings));
+    // `None` with too few outcomes: the configured limits, no exploration.
+    let learned = Policy::learned_from(lang, &recent, configured(settings));
     let examples = adaptive::examples(lang, &recent, budget.min(examples_budget(settings)));
-    (adaptive::render_examples(lang, &examples), Some(learned))
+    (adaptive::render_examples(lang, &examples), learned)
 }
 
 /// The user's limits, as the adaptive policy starts from them.
@@ -905,16 +960,19 @@ fn join_or_start(
             inner: inner.clone(),
             key: prepared.key,
             flight: flight.id,
+            limits: flight.limits,
             result: flight.result.clone(),
         });
     }
     let id = inner.next_flight.fetch_add(1, Ordering::Relaxed);
     let http_cancel = CancellationToken::new();
     let (tx, rx) = watch::channel(None);
+    let limits = (prepared.max_lines, prepared.num_predict);
     inflight.insert(
         prepared.key.clone(),
         Flight {
             id,
+            limits,
             waiters: 1,
             http_cancel: http_cancel.clone(),
             result: rx.clone(),
@@ -964,6 +1022,7 @@ fn join_or_start(
         inner: inner.clone(),
         key: prepared.key,
         flight: id,
+        limits,
         result: rx,
     })
 }
@@ -1033,6 +1092,8 @@ struct Waiter {
     inner: Arc<Inner>,
     key: Key,
     flight: u64,
+    /// The flight's `(max_lines, num_predict)`.
+    limits: (u32, u32),
     result: watch::Receiver<Option<Outcome>>,
 }
 
@@ -1070,6 +1131,16 @@ impl<'a> Registration<'a> {
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
         lock(&self.inner.requests).remove(self.request_id);
+    }
+}
+
+/// The one-item answer serving `text` at `at`.
+fn served(text: String, at: Position) -> CompletionResult {
+    CompletionResult {
+        items: vec![CompletionItem {
+            text,
+            range: Range { start: at, end: at },
+        }],
     }
 }
 
@@ -1523,9 +1594,11 @@ mod tests {
         let f = fixture(MAIN);
         let log = workspace_log(&f);
         log.flush().await; // initial scan done
-        let slow = Duration::from_millis(1_000);
-        log.set_write_delay(slow);
-        let quick = Duration::from_millis(300);
+        // The writer is held (not slowed): if serving or an outcome waited
+        // on it, they would never return. The bound only catches that, with
+        // a wide margin for loaded machines.
+        log.set_write_hold(true);
+        let quick = Duration::from_secs(5);
 
         serve_cached(&f, "r1", AT).await;
         let t = Instant::now();
@@ -1535,13 +1608,12 @@ mod tests {
         // A serve that expires an older suggestion does not wait either.
         serve_cached(&f, "r2", AT).await;
         f.engine.age_pending(OUTCOME_TIMEOUT);
-        let t = Instant::now();
-        serve_cached(&f, "r3", AT).await;
-        assert!(t.elapsed() < quick, "serve waited {:?}", t.elapsed());
-        assert!(log.records().is_empty(), "the writer is still sleeping");
+        let served = tokio::time::timeout(quick, serve_cached(&f, "r3", AT)).await;
+        assert!(served.is_ok(), "serve waited on the held writer");
+        assert!(log.records().is_empty(), "the writer is still held");
 
         // Shutdown: r3 never got an outcome; it is logged and written.
-        log.set_write_delay(Duration::ZERO);
+        log.set_write_hold(false);
         f.engine.flush_pending().await;
         assert_eq!(
             logged(&log).await,
@@ -1698,6 +1770,7 @@ mod tests {
                 (py.learned_max_lines, py.learned_num_predict, py.examples),
                 if adaptive { (4, 16, 3) } else { (8, 32, 0) }
             );
+            assert_eq!(py.learned, adaptive, "off: the values are the defaults");
         }
     }
 
@@ -1762,7 +1835,9 @@ mod tests {
             (py.learned_max_lines, py.learned_num_predict, py.examples),
             (4, 16, 3)
         );
+        assert!(py.learned);
         let rs = &stats.languages["rust"];
+        assert!(!rs.learned, "1 outcome: the configured defaults");
         assert_eq!((rs.served, rs.partial), (1, 1));
         assert!((rs.accept_rate - 1.0).abs() < 1e-9);
         assert_eq!(
@@ -1774,6 +1849,8 @@ mod tests {
         assert_eq!(wire["languages"]["python"]["learnedMaxLines"], 4);
         assert_eq!(wire["languages"]["python"]["learnedNumPredict"], 16);
         assert_eq!(wire["languages"]["python"]["examples"], 3);
+        assert_eq!(wire["languages"]["python"]["learned"], true);
+        assert_eq!(wire["languages"]["rust"]["learned"], false);
         assert!(wire["languages"]["python"]["acceptRate"].is_f64());
         assert!(wire["logPath"].is_string());
         assert_eq!(wire["adaptive"], true);
@@ -1791,6 +1868,44 @@ mod tests {
         let p = f.engine.prepare(&f.uri, AT).await.unwrap();
         assert!(!p.snippet_block().contains("# Example"));
         assert_eq!((p.max_lines, p.num_predict), (8, 32));
+    }
+
+    #[tokio::test]
+    async fn every_tenth_multi_line_request_explores_the_configured_limits() {
+        let f = fixture("x = foo()\nresult = \n");
+        let log = workspace_log(&f);
+        seed_learning(&log).await;
+        f.engine.refresh_snippets(&f.uri).await;
+        let multi = Position {
+            line: 1,
+            character: 9,
+        };
+        let single = Position {
+            line: 0,
+            character: 8,
+        };
+        let limits = |p: &Prepared| (p.max_lines, p.num_predict);
+        let learned = (LEARNED.max_lines, LEARNED.num_predict);
+        let configured = (8, Settings::default().completion_max_tokens);
+
+        // Served multi-line requests 1–9 run with the learned cap 4.
+        for i in 0..9 {
+            let p = f.engine.prepare(&f.uri, multi).await.unwrap();
+            assert_eq!((limits(&p), p.explore), (learned, false), "request {i}");
+            serve_cached(&f, &format!("m{i}"), multi).await;
+            // Single-line requests neither count nor explore.
+            let p = f.engine.prepare(&f.uri, single).await.unwrap();
+            assert_eq!((p.mode, p.explore), (StopMode::SingleLine, false));
+        }
+        // The 10th uses the configured limits (until one is served).
+        for _ in 0..2 {
+            let p = f.engine.prepare(&f.uri, multi).await.unwrap();
+            assert_eq!((limits(&p), p.explore), (configured, true));
+        }
+        // A reset forgets the count along with what was learned.
+        f.engine.reset_learning();
+        let p = f.engine.prepare(&f.uri, multi).await.unwrap();
+        assert_eq!((limits(&p), p.explore), (configured, false));
     }
 
     #[tokio::test]

@@ -862,6 +862,7 @@ async fn completion_stats_over_stdio() {
     assert_eq!(py["learnedMaxLines"], 8);
     assert_eq!(py["learnedNumPredict"], 32);
     assert_eq!(py["examples"], 0);
+    assert_eq!(py["learned"], false);
 
     let reset = core.call("completion/resetLearning", json!({})).await;
     assert_eq!(reset, json!({}));

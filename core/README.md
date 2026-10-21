@@ -97,7 +97,11 @@ Additions beyond the spec:
   "typedThrough"`: what the user did with a served suggestion.
   `completion/accepted` and `completion/rejected` keep working and mean
   `accepted` / `rejected`. Each served suggestion is appended once to
-  **`<workspace>/.localpilot/completions.jsonl`** when its outcome arrives:
+  **`<workspace>/.localpilot/completions.jsonl`** when its outcome arrives
+  — except a typed-prefix cache hit (the rest of a suggestion already
+  served, after the user typed into it): that is not a new suggestion, gets
+  no record, and an outcome for it is ignored; the original suggestion's
+  record carries the outcome of the whole typing run:
   `{ ts, requestId, lang, ext?, promptHash, contextTail, suggestion, lines,
   outcome, acceptedText?, ttftMs, totalMs, model?, maxLines?, numPredict? }`
   - `ts` Unix ms when served; `lang` lower-case (`"python"`, …, `"other"`);
@@ -122,13 +126,16 @@ Additions beyond the spec:
   (`{ "learningResetAt": ms }`); the log itself is never truncated.
 - **`completion/stats {}`** → `{ languages: { [lang]: { served, accepted,
   partial, rejected, typedThrough, acceptRate, learnedMaxLines,
-  learnedNumPredict, examples } }, logPath, adaptive }`: outcome counts per
+  learnedNumPredict, learned, examples } }, logPath, adaptive }`: outcome counts per
   language since the last learning reset (written outcomes only; the call
   waits for queued ones). `acceptRate` = `(accepted + partial) / served`.
   `learnedMaxLines` / `learnedNumPredict` / `examples` (a count) are what
   the policy yields now, i.e. what the next snippet refresh applies (the
   configured `8` / `completionMaxTokens` / `0` with too few outcomes or when
-  `adaptive` is `false`). `logPath` is `null` before `initialize`.
+  `adaptive` is `false`). `learned` is `true` when those limits were
+  learned from outcomes and `false` when they are the configured defaults
+  (fewer than 10 eligible outcomes, or `adaptive` off). `logPath` is `null`
+  before `initialize`.
 - **`completion/resetLearning {}`** → `{}`: forgets everything learned (counts,
   learned limits, examples — at once, for every open file) and records the
   reset in `completions.meta.json`; the log file keeps every record.
@@ -148,7 +155,17 @@ Additions beyond the spec:
   - Cap = the bucket's upper bound (1, 4 or 8), applied in multi-line mode
     only (single-line mode always stops at the line end). `num_predict` =
     1.5 × the longest accepted text of the bucket in tokens, bounded to
-    [16, 2 × `completionMaxTokens`] (16 when nothing was accepted; never 0).
+    [16, `completionMaxTokens`]: the configured value is the ceiling and
+    learning only lowers it, so adaptive completions never exceed the
+    latency measured for the configured setting (16 when nothing was
+    accepted; never 0).
+  - **Exploration:** a learned cap only moves towards the bucket that won,
+    so the longer buckets would stop getting samples. Every 10th served
+    multi-line suggestion of a language (while learned limits apply) is
+    therefore generated with the configured limits (cap 8,
+    `completionMaxTokens`), bypassing the completion cache; its log record
+    carries those limits. Learning explores the configured length 10% of
+    the time. A learning reset restarts the count.
   - **Style examples:** up to 3 of the most recent `accepted` suggestions of
     the same language with ≥ 2 lines, newest first, each as
     `<comment> Example\n<contextTail><suggestion>\n\n` with the language's

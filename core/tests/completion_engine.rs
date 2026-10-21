@@ -651,3 +651,105 @@ async fn learned_limits_reach_the_model_request() {
     let record = log.records().pop().unwrap();
     assert_eq!((record.max_lines, record.num_predict), (Some(4), Some(16)));
 }
+
+#[tokio::test]
+async fn typed_prefix_hit_creates_no_new_log_record() {
+    let env = setup(add_script()).await;
+    let log = Arc::new(FeedbackLog::for_workspace(&env.root));
+    env.engine.set_feedback_log(log.clone());
+    assert_eq!(texts(&complete(&env, "r1", CURSOR).await), ["a + b"]);
+
+    // The user types into the suggestion: the rest is served from the
+    // cache, twice, without a model call.
+    for (n, (typed, rest)) in [("a", " + b"), ("a ", "+ b")].into_iter().enumerate() {
+        let doc = DOC.replacen("return \n", &format!("return {typed}\n"), 1);
+        env.store
+            .write()
+            .unwrap()
+            .did_open(&env.uri, doc, 2 + n as i32);
+        let at = Position {
+            line: 1,
+            character: 11 + typed.len() as u32,
+        };
+        assert_eq!(texts(&complete(&env, &format!("t{n}"), at).await), [rest]);
+    }
+    assert_eq!(generate_bodies(&env.mock).len(), 1);
+
+    // Outcomes for the typed-prefix hits are ignored; the original record
+    // carries the outcome of the whole typing run.
+    env.engine
+        .on_outcome("t0", Outcome::Partial, Some(" ".to_owned()));
+    env.engine.on_outcome("t1", Outcome::Accepted, None);
+    env.engine.on_outcome("r1", Outcome::Accepted, None);
+    env.engine.flush_pending().await;
+    let records = log.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].request_id, "r1");
+    assert_eq!(records[0].suggestion, "a + b");
+    assert_eq!(records[0].outcome, Outcome::Accepted);
+    let stats = env.engine.stats().await;
+    assert_eq!(stats.languages["python"].served, 1);
+}
+
+#[tokio::test]
+async fn tenth_multi_line_request_is_generated_with_the_configured_limits() {
+    let block: Vec<String> = (0..6).map(|i| format!("v{i} = {i}\n    ")).collect();
+    let mut chunks: Vec<Value> = block.iter().map(|l| generate_chunk(l)).collect();
+    chunks.push(generate_done());
+    let env = setup(Script {
+        generate: vec![chunks],
+        ..Script::default()
+    })
+    .await;
+    let log = Arc::new(FeedbackLog::for_workspace(&env.root));
+    env.engine.set_feedback_log(log.clone());
+    for i in 0..20 {
+        log.submit(seed(
+            &format!("long{i}"),
+            "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6",
+            Outcome::Rejected,
+        ));
+    }
+    for i in 0..10 {
+        log.submit(seed(
+            &format!("two{i}"),
+            &format!("ex{i} = 1\nex{i} += 1"),
+            Outcome::Accepted,
+        ));
+    }
+    log.flush().await;
+    env.engine.refresh_snippets(&env.uri).await;
+
+    // 1–9: learned cap 4 (generated once, then exact cache hits).
+    for i in 1..=9 {
+        let result = complete(&env, &format!("r{i}"), CURSOR).await;
+        assert_eq!(texts(&result)[0].lines().count(), 4, "request {i}");
+        env.engine
+            .on_outcome(&format!("r{i}"), Outcome::Rejected, None);
+    }
+    // 10th: configured limits, a fresh generation despite the cache.
+    let before = generate_bodies(&env.mock).len();
+    let result = complete(&env, "r10", CURSOR).await;
+    assert_eq!(texts(&result)[0].lines().count(), 6);
+    let bodies = generate_bodies(&env.mock);
+    assert_eq!(bodies.len(), before + 1);
+    assert_eq!(bodies[before]["options"]["num_predict"], 32);
+    assert_eq!(bodies[0]["options"]["num_predict"], 16);
+    env.engine.on_outcome("r10", Outcome::Accepted, None);
+    log.flush().await;
+    let record = log.records().pop().unwrap();
+    assert_eq!(record.request_id, "r10");
+    assert_eq!((record.max_lines, record.num_predict), (Some(8), Some(32)));
+
+    // 11th: back to the learned limits.
+    env.store
+        .write()
+        .unwrap()
+        .did_open(&env.uri, DOC.replacen("return \n", "return  \n", 1), 2);
+    let result = complete(&env, "r11", CURSOR).await;
+    env.engine.on_outcome("r11", Outcome::Rejected, None);
+    log.flush().await;
+    let record = log.records().pop().unwrap();
+    assert_eq!(record.request_id, "r11", "{result:?}");
+    assert_eq!((record.max_lines, record.num_predict), (Some(4), Some(16)));
+}
