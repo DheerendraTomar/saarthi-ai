@@ -11,12 +11,6 @@ plugins {
 group = providers.gradleProperty("pluginGroup").get()
 version = providers.gradleProperty("pluginVersion").get()
 
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
-    }
-}
-
 kotlin {
     jvmToolchain(25)
 }
@@ -45,7 +39,8 @@ dependencies {
 }
 
 tasks.test {
-    // CoreProcessTest drives the VS Code fake core (`node vscode/test/fakeCore.mjs`); set LOCALPILOT_TEST_NODE to pick a node binary.
+    // CoreProcessTest drives the VS Code fake core (`node vscode/test/fakeCore.mjs`), so the tests need Node.js >= 20:
+    // found via LOCALPILOT_TEST_NODE, then PATH (node / node.exe), then ~/.nvm; without it those tests are skipped.
     systemProperty("localpilot.fakeCore", layout.projectDirectory.file("../vscode/test/fakeCore.mjs").asFile.absolutePath)
 }
 

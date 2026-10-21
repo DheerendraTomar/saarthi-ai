@@ -30,7 +30,10 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 
-/** Drives [CoreProcess] against the real fake core child process (`node vscode/test/fakeCore.mjs`). */
+/**
+ * Drives [CoreProcess] against the real fake core child process (`node vscode/test/fakeCore.mjs`).
+ * Requires Node.js >= 20 (LOCALPILOT_TEST_NODE, PATH or ~/.nvm); tests that spawn the fake are skipped without it.
+ */
 class CoreProcessTest {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val cores = mutableListOf<CoreProcess>()
@@ -46,13 +49,18 @@ class CoreProcessTest {
         }
     }
 
-    private fun makeCore(env: Map<String, String> = emptyMap(), shutdownTimeoutMs: Long = 2000): Harness {
+    private fun makeCore(
+        env: Map<String, String> = emptyMap(),
+        shutdownTimeoutMs: Long = 2000,
+        command: () -> CoreCommand = { CoreCommand(listOf(node!!, fakeCore), env) },
+    ): Harness {
+        assumeTrue("Node.js not found (set LOCALPILOT_TEST_NODE); skipping fake-core test", node != null)
         val logs = CopyOnWriteArrayList<Pair<CoreLogLevel, String>>()
         val states = CopyOnWriteArrayList<CoreState>()
         val core = CoreProcess(
             scope = scope,
             workspace = workspace,
-            command = { CoreCommand(listOf(node, fakeCore), env) },
+            command = command,
             initSettings = { buildJsonObject { put("completionsEnabled", true) } },
             logLevel = { "info" },
             log = { level, message -> logs.add(level to message) },
@@ -270,16 +278,158 @@ class CoreProcessTest {
         assertEquals(CoreState.CRASHED, core.state.value)
     }
 
+    @Test
+    fun overlapping_restarts_and_starts_leave_exactly_one_child() = test {
+        val h = makeCore()
+        h.core.start()
+        // start() on a running core coalesces instead of spawning a second child.
+        h.core.start()
+        assertEquals(1, h.count("fake-core: initialize"))
+        assertEquals(1, liveFakeCores())
+        val results = listOf(
+            scope.async { h.core.restart() },
+            scope.async { h.core.restart() },
+            scope.async { h.core.start() },
+        )
+        for (r in results) {
+            try {
+                r.await()
+            } catch (_: CoreNotRunning) {
+                // a start() that coalesced onto a core the concurrent restart then stopped
+            }
+        }
+        h.waitForState(CoreState.READY)
+        delay(300) // let any stray child show up
+        assertEquals(1, liveFakeCores())
+        h.core.stop()
+        assertEquals(0, liveFakeCores())
+    }
+
+    @Test
+    fun starts_and_restart_racing_a_slow_spawn_leave_exactly_one_child() = test {
+        val spawnGate = java.util.concurrent.CountDownLatch(1)
+        val h = makeCore(command = {
+            spawnGate.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            CoreCommand(listOf(node!!, fakeCore))
+        })
+        val calls = listOf(scope.async(Dispatchers.IO) { h.core.start() })
+        h.core.state.first { it == CoreState.STARTING }
+        val more = listOf(scope.async(Dispatchers.IO) { h.core.start() }, scope.async(Dispatchers.IO) { h.core.restart() })
+        delay(200)
+        spawnGate.countDown()
+        for (c in calls + more) {
+            try {
+                c.await()
+            } catch (_: CoreNotRunning) {
+                // superseded by the restart
+            }
+        }
+        h.waitForState(CoreState.READY)
+        delay(300)
+        assertEquals(1, liveFakeCores())
+    }
+
+    @Test
+    fun notify_does_not_block_while_spawning() = test {
+        val spawnGate = java.util.concurrent.CountDownLatch(1)
+        val h = makeCore(command = {
+            spawnGate.await(5, java.util.concurrent.TimeUnit.SECONDS) // a slow binary lookup / fork
+            CoreCommand(listOf(node!!, fakeCore))
+        })
+        val started = scope.async(Dispatchers.IO) { h.core.start() }
+        h.core.state.first { it == CoreState.STARTING }
+        val t0 = System.nanoTime()
+        h.core.notify("textDocument/didSave", buildJsonObject { put("uri", "file:///a.py") })
+        val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+        spawnGate.countDown()
+        started.await()
+        assertTrue("notify() blocked for $elapsedMs ms during a spawn", elapsedMs < 500)
+        h.waitForLog("fake-core: textDocument/didSave")
+    }
+
+    @Test
+    fun stop_during_spawn_kills_the_new_child() = test {
+        val spawnGate = java.util.concurrent.CountDownLatch(1)
+        val h = makeCore(command = {
+            spawnGate.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            CoreCommand(listOf(node!!, fakeCore))
+        })
+        val started = scope.async(Dispatchers.IO) { h.core.start() }
+        h.core.state.first { it == CoreState.STARTING }
+        assertEquals(null, h.core.stop())
+        spawnGate.countDown()
+        try {
+            started.await()
+            fail("expected CoreNotRunning")
+        } catch (_: CoreNotRunning) {
+        }
+        assertEquals(CoreState.STOPPED, h.core.state.value)
+        delay(300)
+        assertEquals(0, liveFakeCores())
+    }
+
+    @Test
+    fun no_workspace_never_launches() = test {
+        var launched = false
+        val core = CoreProcess(
+            scope = scope,
+            workspace = null,
+            command = { launched = true; CoreCommand(listOf("unused")) },
+            initSettings = { JsonObject(emptyMap()) },
+            logLevel = { "info" },
+            log = { _, _ -> },
+        )
+        try {
+            core.start()
+            fail("expected CoreNotRunning")
+        } catch (e: CoreNotRunning) {
+            assertTrue(e.message!!, e.message!!.contains("project folder"))
+        }
+        assertEquals(CoreState.CRASHED, core.state.value)
+        assertTrue("command() must not be called without a folder", !launched)
+    }
+
+    @Test
+    fun disposed_core_does_not_launch_again() = test {
+        val h = makeCore()
+        h.core.start()
+        h.core.dispose()
+        h.core.state.first { it == CoreState.STOPPED }
+        try {
+            h.core.start()
+            fail("expected CoreNotRunning")
+        } catch (_: CoreNotRunning) {
+        }
+        assertEquals(1, h.count("fake-core: initialize"))
+    }
+
     companion object {
         val fakeCore: String = System.getProperty("localpilot.fakeCore")
             ?: File("../vscode/test/fakeCore.mjs").absolutePath
 
-        val node: String by lazy {
-            System.getenv("LOCALPILOT_TEST_NODE")
-                ?: System.getenv("PATH").orEmpty().split(File.pathSeparator).map { File(it, "node") }.firstOrNull { it.canExecute() }?.path
-                ?: File(System.getProperty("user.home"), ".nvm/versions/node").listFiles()
-                    ?.sortedByDescending { it.name }?.map { File(it, "bin/node") }?.firstOrNull { it.canExecute() }?.path
-                ?: "node"
+        /** A working `node` binary, or null (fake-core tests are then skipped). */
+        val node: String? by lazy {
+            val names = listOf("node", "node.exe")
+            val candidates = sequence {
+                System.getenv("LOCALPILOT_TEST_NODE")?.let { yield(File(it)) }
+                for (dir in System.getenv("PATH").orEmpty().split(File.pathSeparator)) for (n in names) yield(File(dir, n))
+                File(System.getProperty("user.home"), ".nvm/versions/node").listFiles()
+                    ?.sortedByDescending { it.name }?.forEach { yield(File(it, "bin/node")) }
+            }
+            candidates.firstOrNull { it.isFile && it.canExecute() && runs(it) }?.path
         }
+
+        private fun runs(node: File): Boolean = try {
+            val p = ProcessBuilder(node.path, "--version").redirectErrorStream(true).start()
+            p.inputStream.readAllBytes()
+            p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS) && p.exitValue() == 0
+        } catch (_: Exception) {
+            false
+        }
+
+        /** Live child processes of this JVM running the fake core. */
+        fun liveFakeCores(): Int = ProcessHandle.current().descendants()
+            .filter { it.isAlive && it.info().arguments().map { args -> args.any { a -> a.endsWith("fakeCore.mjs") } }.orElse(false) }
+            .count().toInt()
     }
 }

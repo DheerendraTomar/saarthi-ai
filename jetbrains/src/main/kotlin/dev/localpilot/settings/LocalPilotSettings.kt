@@ -142,7 +142,8 @@ class LocalPilotSettings : PersistentStateComponent<LocalPilotSettingsState> {
         current = state.snapshot()
     }
 
-    /** Replaces the settings and notifies [TOPIC] subscribers if anything changed. */
+    /** Replaces the settings and notifies [TOPIC] subscribers if anything changed (serialized, so each event's `old` is exact). */
+    @Synchronized
     fun update(new: LocalPilotSettingsState) {
         val old = current
         if (old == new) return

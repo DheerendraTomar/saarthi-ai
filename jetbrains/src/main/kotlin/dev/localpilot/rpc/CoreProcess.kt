@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 enum class CoreState { STOPPED, STARTING, READY, CRASHED }
 
-enum class CoreLogLevel { INFO, WARN, ERROR }
+enum class CoreLogLevel { DEBUG, INFO, WARN, ERROR }
 
 /** How to launch the core; the client appends `serve --workspace <root> --log-level <level>`. */
 data class CoreCommand(val command: List<String>, val env: Map<String, String> = emptyMap())
@@ -77,7 +77,8 @@ class RpcException(val error: RpcError) : Exception(error.message) {
  */
 class CoreProcess(
     private val scope: CoroutineScope,
-    private val workspace: Path,
+    /** The project folder; null (no folder open) → the core is never launched and [start] fails with [CoreNotRunning]. */
+    private val workspace: Path?,
     private val command: () -> CoreCommand,
     private val initSettings: () -> JsonObject,
     private val logLevel: () -> String,
@@ -104,6 +105,11 @@ class CoreProcess(
     private var running: Running? = null
     private var ready: CompletableDeferred<InitializeResult>? = null
     private var stopping = false
+    /** A spawn is in progress outside [lock] (between [beginLaunchLocked] and [spawn] installing [running]). */
+    private var spawning = false
+    /** Bumped by every launch and by stop/dispose; a spawn whose generation is stale kills its process. */
+    private var generation = 0L
+    private var disposed = false
     private val restarts = ArrayDeque<Long>()
     private val queued = mutableListOf<Pair<String, JsonElement>>()
     private val notificationHandlers = ConcurrentHashMap<String, CopyOnWriteArrayList<(JsonElement) -> Unit>>()
@@ -142,27 +148,29 @@ class CoreProcess(
         }
     }
 
-    /** Spawns the core (unless it is already starting/running) and sends `initialize`; returns its result. */
+    /**
+     * Spawns the core and sends `initialize`; returns its result. Coalesces with a core that is already
+     * running or being spawned (never two children). Call from a background coroutine: the spawn runs on it.
+     */
     suspend fun start(): InitializeResult {
-        val existing = synchronized(lock) {
-            val r = ready
-            if (running != null && r != null && (_state.value == CoreState.STARTING || _state.value == CoreState.READY)) r
-            else {
-                restarts.clear()
-                launch()
-            }
+        val launch = synchronized(lock) {
+            if (running == null && !spawning) restarts.clear()
+            beginLaunchLocked()
         }
-        return existing.await()
+        spawn(launch)
+        return launch.ready.await()
     }
 
-    /** Stops the running core (if any) and starts a fresh one, with the restart budget reset. */
+    /** Stops the running core (if any) and starts a fresh one, with the restart budget reset. Serialized with [stop]. */
     suspend fun restart(): InitializeResult {
-        stop()
-        val r = synchronized(lock) {
-            restarts.clear()
-            launch()
+        val launch = stopMutex.withLock {
+            stopInternal()
+            synchronized(lock) {
+                restarts.clear()
+                beginLaunchLocked()
+            }.also { spawn(it) }
         }
-        return r.await()
+        return launch.ready.await()
     }
 
     /**
@@ -216,10 +224,15 @@ class CoreProcess(
      * Sends `shutdown`, closes stdin, waits up to [shutdownTimeoutMs] in total for the process to exit,
      * then kills it. Returns the exit code, or null if nothing was running. Never auto-restarts afterwards.
      */
-    suspend fun stop(): Int? = stopMutex.withLock {
+    suspend fun stop(): Int? = stopMutex.withLock { stopInternal() }
+
+    /** Must be called holding [stopMutex]. */
+    private suspend fun stopInternal(): Int? {
         val target = synchronized(lock) {
             val r = running
             if (r == null) {
+                generation++ // a spawn in progress is discarded (its process killed)
+                spawning = false
                 ready?.completeExceptionally(CoreNotRunning("LocalPilot core stopped"))
                 setState(CoreState.STOPPED)
             } else {
@@ -240,10 +253,11 @@ class CoreProcess(
             }
             target.outgoing.close()
             val remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(0)
-            withTimeoutOrNull(remaining) { target.exit.await() } ?: run {
+            return withTimeoutOrNull(remaining) { target.exit.await() } ?: run {
                 log(CoreLogLevel.WARN, "LocalPilot core did not exit within $shutdownTimeoutMs ms of shutdown; killing it")
                 target.process.destroyForcibly()
-                target.exit.await()
+                withTimeoutOrNull(KILL_WAIT_MS) { target.exit.await() }
+                    ?: target.process.takeIf { !it.isAlive }?.exitValue()
             }
         } finally {
             synchronized(lock) { stopping = false }
@@ -255,11 +269,18 @@ class CoreProcess(
      * and kills the process if it has not exited [shutdownTimeoutMs] later.
      */
     fun dispose() {
+        // Not under stopMutex (this must not suspend on the EDT): `disposed` stops any later or in-flight
+        // launch, and a concurrent stop() only adds a second, harmless kill of the same process.
         val target = synchronized(lock) {
+            disposed = true
             stopping = true
+            generation++
+            spawning = false
             running
         } ?: return
-        target.send(RpcMessage.Request(JsonPrimitive(target.nextId.incrementAndGet()), "shutdown", JsonNull))
+        target.pending[target.nextId.incrementAndGet().also {
+            target.send(RpcMessage.Request(JsonPrimitive(it), "shutdown", JsonNull))
+        }] = CompletableDeferred()
         target.outgoing.close()
         val process = target.process
         Thread({
@@ -271,26 +292,65 @@ class CoreProcess(
         }, "LocalPilot core shutdown").apply { isDaemon = true }.start()
     }
 
-    /** Must be called holding [lock]. */
-    private fun launch(): CompletableDeferred<InitializeResult> {
+    private class Launch(val generation: Long, val ready: CompletableDeferred<InitializeResult>, val isNew: Boolean)
+
+    /**
+     * Must be called holding [lock]. Reserves a launch (state STARTING, fresh `ready`) or, when a core is
+     * already running or being spawned, returns that one's `ready` so callers coalesce. Does not spawn.
+     */
+    private fun beginLaunchLocked(): Launch {
+        val current = ready
+        if ((running != null || spawning) && current != null) return Launch(generation, current, isNew = false)
+        if (disposed) {
+            return Launch(generation, CompletableDeferred<InitializeResult>().apply { completeExceptionally(CoreNotRunning("LocalPilot core is disposed")) }, isNew = false)
+        }
         queued.clear()
         setState(CoreState.STARTING)
         val ready = CompletableDeferred<InitializeResult>()
         this.ready = ready
+        spawning = true
+        generation++
+        return Launch(generation, ready, isNew = true)
+    }
+
+    /** Spawns the process for a reserved [launch] — never under [lock], so notify() is never blocked by a spawn. */
+    private fun spawn(launch: Launch) {
+        if (!launch.isNew) return
+        val ws = workspace
         val process = try {
+            if (ws == null) throw CoreNotRunning("LocalPilot needs a project folder: open a folder to start the core.")
             val cmd = command()
-            val argv = cmd.command + listOf("serve", "--workspace", workspace.toString(), "--log-level", logLevel())
-            ProcessBuilder(argv).directory(workspace.toFile()).apply { environment().putAll(cmd.env) }.start()
+            val argv = cmd.command + listOf("serve", "--workspace", ws.toString(), "--log-level", logLevel())
+            ProcessBuilder(argv).directory(ws.toFile()).apply { environment().putAll(cmd.env) }.start()
         } catch (e: Exception) {
-            // Missing / non-executable binary: retrying is pointless.
+            // No folder / missing or non-executable binary: retrying is pointless.
             log(CoreLogLevel.ERROR, "LocalPilot core could not be started: ${e.message}")
-            running = null
-            setState(CoreState.CRASHED)
-            ready.completeExceptionally(e)
-            return ready
+            synchronized(lock) {
+                if (generation == launch.generation) {
+                    spawning = false
+                    setState(CoreState.CRASHED)
+                }
+            }
+            launch.ready.completeExceptionally(e)
+            return
         }
         val r = Running(process)
-        running = r
+        val installed = synchronized(lock) {
+            if (generation == launch.generation && !disposed) {
+                spawning = false
+                running = r
+                true
+            } else {
+                false
+            }
+        }
+        if (!installed) {
+            // stop()/dispose() ran while we were spawning: this child must not outlive it.
+            process.destroyForcibly()
+            launch.ready.completeExceptionally(CoreNotRunning("LocalPilot core stopped"))
+            return
+        }
+        val ready = launch.ready
 
         // Writer: the only code that touches stdin. Closing `outgoing` closes stdin after the queue drains.
         scope.launch(Dispatchers.IO) {
@@ -314,7 +374,7 @@ class CoreProcess(
         // Always drain stderr so a chatty core can never block on a full pipe.
         scope.launch(Dispatchers.IO) {
             try {
-                process.errorStream.bufferedReader(Charsets.UTF_8).forEachLine { if (it.isNotBlank()) log(CoreLogLevel.INFO, it) }
+                process.errorStream.bufferedReader(Charsets.UTF_8).forEachLine { if (it.isNotBlank()) log(CoreLogLevel.DEBUG, it) }
             } catch (_: IOException) {
             }
         }
@@ -332,7 +392,7 @@ class CoreProcess(
         scope.launch {
             try {
                 val raw = r.call("initialize", buildJsonObject {
-                    put("workspaceRoot", workspace.toString())
+                    put("workspaceRoot", ws.toString())
                     put("settings", initSettings())
                 })
                 val result = json.decodeFromJsonElement(InitializeResult.serializer(), raw)
@@ -360,11 +420,11 @@ class CoreProcess(
                 ready.completeExceptionally(e)
             }
         }
-        return ready
     }
 
     private fun handleExit(r: Running, code: Int) {
         // Pending callers are failed last, so when they resume the state already says what happens next.
+        var relaunch: Launch? = null
         val error: Throwable = synchronized(lock) {
             r.outgoing.close()
             if (running !== r) return@synchronized CoreNotRunning("LocalPilot core stopped")
@@ -386,11 +446,12 @@ class CoreProcess(
             } else {
                 restarts.addLast(now)
                 log(CoreLogLevel.WARN, "LocalPilot core exited unexpectedly (exit code $code); restarting (${restarts.size}/$maxRestartsPerMinute this minute)")
-                launch()
+                relaunch = beginLaunchLocked()
             }
             CoreCrashed(code)
         }
         r.rejectAll(error)
+        relaunch?.let { spawn(it) }
     }
 
     private fun receive(r: Running, line: String) {
@@ -444,6 +505,8 @@ class CoreProcess(
         const val METHOD_NOT_FOUND = -32601
         const val INTERNAL_ERROR = -32603
         private const val RESTART_WINDOW_MS = 60_000L
+        /** How long stop() waits for a killed process to be reaped. */
+        private const val KILL_WAIT_MS = 5_000L
         private val json = Json { ignoreUnknownKeys = true }
     }
 }
