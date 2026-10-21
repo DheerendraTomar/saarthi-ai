@@ -7,3 +7,7 @@ dist/
 vscode/out/
 vscode/bin/
 chat-ui/dist/
+jupyterlab/.venv/
+jupyterlab/localpilot_jupyter/bin/
+__pycache__/
+.pytest_cache/
