@@ -1,13 +1,19 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
+import { IEditorTracker } from '@jupyterlab/fileeditor';
+import { INotebookTracker } from '@jupyterlab/notebook';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { IStatusBar } from '@jupyterlab/statusbar';
 import { DisposableSet } from '@lumino/disposable';
 import { WsCoreClient } from './client';
-import { PLUGIN_ID, readSettings, restartCore, watchSettings, type Settings } from './settings';
+import { DocumentSync } from './documentSync';
+import { PLUGIN_ID, fetchStatus, readSettings, restartCore, watchSettings, type Settings } from './settings';
 import { StatusItem } from './status';
 
 export { CoreDisconnected, WsCoreClient, rpcUrl } from './client';
 export type { ConnectionState, InitializeResult, OllamaStatus, WsCoreClientOptions } from './client';
+export * from './cellUri';
+export { CONCAT_DEBOUNCE_MS, DocumentSync } from './documentSync';
+export type { DocumentSyncOptions, SyncClient, SyncNotebookPanel } from './documentSync';
 export * from './settings';
 export { StatusItem } from './status';
 
@@ -26,8 +32,14 @@ const plugin: JupyterFrontEndPlugin<void> = {
   description: 'LocalPilot: local Ollama-backed inline completions and agent chat.',
   autoStart: true,
   requires: [ISettingRegistry],
-  optional: [IStatusBar],
-  activate: async (app: JupyterFrontEnd, registry: ISettingRegistry, statusBar: IStatusBar | null) => {
+  optional: [IStatusBar, INotebookTracker, IEditorTracker],
+  activate: async (
+    app: JupyterFrontEnd,
+    registry: ISettingRegistry,
+    statusBar: IStatusBar | null,
+    notebookTracker: INotebookTracker | null,
+    editorTracker: IEditorTracker | null
+  ) => {
     const serverSettings = app.serviceManager.serverSettings;
     const pluginSettings = await registry.load(PLUGIN_ID);
     let settings: Settings = readSettings(pluginSettings);
@@ -68,6 +80,16 @@ const plugin: JupyterFrontEndPlugin<void> = {
       rank: 100
     });
     if (statusRegistration) disposables.add(statusRegistration);
+
+    // Notebook cells and file editors mirrored into the core's overlay, as
+    // `file://<root_dir>/<path>` (cells as virtual files). Re-opened by the
+    // sync itself after each reconnect; the first didOpens are queued.
+    const rootDir = fetchStatus(serverSettings).then((s) => {
+      if (!s.rootDir) throw new Error('the server did not report rootDir');
+      return s.rootDir;
+    });
+    rootDir.catch((e) => console.error('LocalPilot: document sync disabled', e));
+    disposables.add(new DocumentSync(client, notebookTracker, editorTracker, { rootDir }));
 
     // No beforeunload disposal: it fires before the user can choose "Stay"
     // (JupyterLab prompts on unsaved work). On a real unload the browser closes

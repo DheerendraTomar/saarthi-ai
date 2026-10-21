@@ -196,14 +196,16 @@ async def test_notifications_are_broadcast_and_shutdown_is_not_forwarded(
 async def test_status_and_restart_endpoints(
     jp_fetch: Callable[..., Any], open_tab: Callable[[], Any], localpilot: Bridge
 ) -> None:
+    root_dir = str(localpilot.root_dir)
+    assert Path(root_dir).is_absolute()
     status = json.loads((await jp_fetch("localpilot", "status")).body)
-    assert status == {"core": "stopped", "ollama": None}
+    assert status == {"core": "stopped", "ollama": None, "rootDir": root_dir}
 
     a = await open_tab()
     await init(a)
     await eventually(lambda: localpilot.core.ollama_status, what="ollama status")
     status = json.loads((await jp_fetch("localpilot", "status")).body)
-    assert status == {"core": "ready", "ollama": {"ollama": "ok", "detail": "Ollama is running"}}
+    assert status == {"core": "ready", "ollama": {"ollama": "ok", "detail": "Ollama is running"}, "rootDir": root_dir}
 
     reply = await jp_fetch("localpilot", "restart", method="POST", body=json.dumps({"settings": {"completionModel": "new"}}))
     assert json.loads(reply.body)["core"] == "ready"
@@ -476,16 +478,30 @@ async def test_documents_are_refcounted_per_tab(bridge: Bridge, stub: StubCore) 
         return [(m["method"].split("/")[1], m["params"]["uri"]) for m in stub.sent if m.get("method", "").startswith("textDocument/")]
 
     await send(bridge, a_id, doc("textDocument/didOpen", "file:///u.py"))
-    await send(bridge, b_id, doc("textDocument/didOpen", "file:///u.py"))
+    second_open = doc("textDocument/didOpen", "file:///u.py")
+    second_open["params"].update(version=5, text="b's text")
+    await send(bridge, b_id, second_open)
     await send(bridge, b_id, doc("textDocument/didChange", "file:///u.py"))
     await send(bridge, a_id, doc("textDocument/didSave", "file:///u.py"))
     await send(bridge, a_id, doc("textDocument/didClose", "file:///u.py"))  # b still has it open
     await send(bridge, a_id, doc("textDocument/didOpen", "file:///v.py"))
-    assert doc_traffic() == [("didOpen", "file:///u.py"), ("didChange", "file:///u.py"), ("didSave", "file:///u.py"), ("didOpen", "file:///v.py")]
+    assert doc_traffic() == [
+        ("didOpen", "file:///u.py"),
+        ("didChange", "file:///u.py"),  # b's didOpen, as a full-text change
+        ("didChange", "file:///u.py"),
+        ("didSave", "file:///u.py"),
+        ("didOpen", "file:///v.py"),
+    ]
+    # The second tab's text reaches the core: the overlay holds what that tab sees.
+    assert stub.sent[1] == {
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {"uri": "file:///u.py", "version": 5, "contentChanges": [{"text": "b's text"}]},
+    }
 
     bridge.unregister(b_id)  # last holder of u
     bridge.unregister(a_id)  # last holder of v
-    assert doc_traffic()[4:] == [("didClose", "file:///u.py"), ("didClose", "file:///v.py")]
+    assert doc_traffic()[5:] == [("didClose", "file:///u.py"), ("didClose", "file:///v.py")]
 
 
 async def test_pending_tool_call_replayed_to_the_tab_that_adopts_the_session(bridge: Bridge, stub: StubCore) -> None:

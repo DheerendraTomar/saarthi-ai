@@ -6,6 +6,7 @@ import {
   DEFAULT_SETTINGS,
   RESTART_DEBOUNCE_MS,
   coreInitSettings,
+  fetchStatus,
   readSettings,
   restartCore,
   watchSettings
@@ -52,6 +53,19 @@ describe('settings', () => {
 
   it('always sends completionsEnabled: true to the core', () => {
     expect(coreInitSettings({ ...DEFAULT_SETTINGS, completionsEnabled: false }).completionsEnabled).toBe(true);
+  });
+
+  it('fetchStatus GETs /localpilot/status with the root dir', async () => {
+    const body = { core: 'stopped', ollama: null, rootDir: '/srv/nb' };
+    const fetch = jest.fn(async () => new Response(JSON.stringify(body), { status: 200 }));
+    const server = ServerConnection.makeSettings({
+      baseUrl: 'http://localhost:8888/base/',
+      fetch: fetch as unknown as typeof window.fetch
+    });
+    expect(await fetchStatus(server)).toEqual(body);
+    const [req] = fetch.mock.calls[0] as unknown as [Request];
+    expect(req.url.split('?')[0]).toBe('http://localhost:8888/base/localpilot/status');
+    expect(req.method).toBe('GET');
   });
 
   it('restartCore POSTs the core settings to /localpilot/restart', async () => {

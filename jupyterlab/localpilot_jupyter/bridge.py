@@ -15,8 +15,9 @@ Tab → core
   session whose owner is gone adopt it; a `chat/history` that adopts a session is
   followed (after its response) by a replay of that session's pending `chat/toolCall`.
 - Document sync is refcounted per (uri, tab): `didOpen` is forwarded only for the first
-  tab opening a uri, `didChange`/`didSave` always, `didClose` only when the last tab
-  closes it; a closing tab's documents get a synthesized `didClose`.
+  tab opening a uri (a later tab's `didOpen` becomes a full-text `didChange`, so the
+  core holds that tab's text), `didChange`/`didSave` always, `didClose` only when the
+  last tab closes it; a closing tab's documents get a synthesized `didClose`.
 - Other notifications are forwarded (queued by the core while starting).
 - Responses to core→client requests are forwarded only by the tab the request went to.
 
@@ -45,7 +46,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol, Union
 
 from .commands import run_command
 from .core_process import CoreCrashed, CoreNotRunning, CoreProcess, CoreStopped
@@ -123,7 +124,12 @@ class Bridge:
         return self.core.state if self.core is not None else "stopped"
 
     def status(self) -> dict[str, Any]:
-        return {"core": self.core_state, "ollama": self.core.ollama_status if self.core is not None else None}
+        return {
+            "core": self.core_state,
+            "ollama": self.core.ollama_status if self.core is not None else None,
+            # The core's workspace: clients build `file://` URIs of their documents from it.
+            "rootDir": str(self.root_dir),
+        }
 
     async def restart(self, settings: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Restarts the core (settings change); starts it if it never ran. Returns `status()`."""
@@ -209,8 +215,12 @@ class Bridge:
         if not has_id:
             if method == "exit":
                 return
-            if method.startswith("textDocument/") and not self._track_document(tab_id, method, params):
-                return
+            if method.startswith("textDocument/"):
+                forward = self._track_document(tab_id, method, params)
+                if forward is None:
+                    return
+                if isinstance(forward, str):
+                    line = forward
             if method in REQUEST_ID_METHODS:
                 self._namespace_request_id(tab_id, msg)
                 line = json.dumps(msg)
@@ -290,22 +300,31 @@ class Bridge:
         if isinstance(params, dict) and isinstance(params.get("requestId"), (str, int)):
             params["requestId"] = f"{tab_id}:{params['requestId']}"
 
-    def _track_document(self, tab_id: str, method: str, params: dict[str, Any]) -> bool:
-        """Refcounts open documents per tab; returns whether to forward the notification."""
+    def _track_document(self, tab_id: str, method: str, params: dict[str, Any]) -> Union[bool, str, None]:
+        """Refcounts open documents per tab. Returns True to forward the notification as is,
+        a replacement line to forward instead, or None to drop it."""
         uri = params.get("uri")
         if not isinstance(uri, str):
             return True
         holders = self._docs.get(uri)
         if method == "textDocument/didOpen":
-            first = not holders
             self._docs.setdefault(uri, set()).add(tab_id)
-            return first
+            if not holders:
+                return True
+            # Another tab holds the uri: the core already has it open, so bring its
+            # text up to date with this tab's instead of opening it twice.
+            if not isinstance(params.get("text"), str):
+                return None
+            change: dict[str, Any] = {"uri": uri, "contentChanges": [{"text": params["text"]}]}
+            if "version" in params:
+                change["version"] = params["version"]
+            return json.dumps({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": change})
         if method == "textDocument/didClose":
             if holders is None:
                 return True  # not tracked (opened before a restart): let the core decide
             holders.discard(tab_id)
             if holders:
-                return False
+                return None
             del self._docs[uri]
             return True
         return True

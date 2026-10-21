@@ -81,7 +81,19 @@ export function sameCoreSettings(a: Settings, b: Settings): boolean {
 export interface ServerStatus {
   core: 'stopped' | 'starting' | 'ready' | 'crashed';
   ollama: { ollama: 'ok' | 'down' | 'modelMissing'; detail: string } | null;
+  /** The Jupyter server's `root_dir`, absolute: the core's workspace. */
+  rootDir?: string;
   error?: string;
+}
+
+/** `GET /localpilot/status`. Rejects with a `ResponseError` on a non-2xx answer. */
+export async function fetchStatus(server: ServerConnection.ISettings): Promise<ServerStatus> {
+  const url = URLExt.join(server.baseUrl, 'localpilot', 'status');
+  const response = await ServerConnection.makeRequest(url, { method: 'GET' }, server);
+  if (!response.ok) {
+    throw await ServerConnection.ResponseError.create(response);
+  }
+  return (await response.json()) as ServerStatus;
 }
 
 /**
