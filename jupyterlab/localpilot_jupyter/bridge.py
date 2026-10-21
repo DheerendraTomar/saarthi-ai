@@ -11,9 +11,13 @@ Tab → core
   While the core is stopped/crashed they fail at once with -32603.
 - `completion/request|cancel|accepted|rejected`: `params.requestId` is rewritten to
   `"<tab>:<requestId>"`, so two tabs' request ids never collide in the core.
-- `chat/send` records `sessionId → tab` (ownership). Other `chat/*` requests naming a
-  session whose owner is gone adopt it; a `chat/history` that adopts a session is
-  followed (after its response) by a replay of that session's pending `chat/toolCall`.
+- `chat/send` records `sessionId → tab` (ownership) unless the session has a running
+  turn whose owner is still connected (the core will refuse that send, and the turn's
+  events must keep going to the tab running it). A turn runs from a successful
+  `chat/send` response (which also gives the session to the tab that sent it) until the
+  session's `chat/done`. Other `chat/*` requests naming a session whose owner is gone
+  adopt it; a `chat/history` that adopts a session is followed (after its response) by a
+  replay of that session's pending `chat/toolCall`.
 - Document sync is refcounted per (uri, tab): `didOpen` is forwarded only for the first
   tab opening a uri (a later tab's `didOpen` becomes a full-text `didChange`, so the
   core holds that tab's text), `didChange`/`didSave` always, `didClose` only when the
@@ -105,6 +109,10 @@ class Bridge:
         self._pending_calls: dict[str, tuple[str, str]] = {}
         # forwarded chat/history id → session whose pending call is replayed after the response
         self._replay_after: dict[str, str] = {}
+        # forwarded chat/send id → its session (a successful response starts a turn)
+        self._send_after: dict[str, str] = {}
+        # sessions with a running turn (successful chat/send until chat/done)
+        self._running: set[str] = set()
         # document uri → tabs that have it open
         self._docs: dict[str, set[str]] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -157,6 +165,7 @@ class Bridge:
         for key in [k for k, (tab, _) in self._pending_client.items() if tab == tab_id]:
             del self._pending_client[key]
             self._replay_after.pop(key, None)
+            self._send_after.pop(key, None)
         for uri in [u for u, holders in self._docs.items() if tab_id in holders]:
             self._docs[uri].discard(tab_id)
             if not self._docs[uri]:
@@ -234,6 +243,7 @@ class Bridge:
             self._send_tab(tab_id, _result(id_value, {}))
             return
         replay_session: Optional[str] = None
+        send_session = params.get("sessionId") if method == "chat/send" else None
         if method.startswith("chat/"):
             replay_session = self._track_chat_request(tab_id, method, params)
         if method in REQUEST_ID_METHODS:
@@ -250,10 +260,13 @@ class Bridge:
         self._pending_client[forwarded] = (tab_id, id_value)
         if replay_session is not None:
             self._replay_after[forwarded] = replay_session
+        if isinstance(send_session, str):
+            self._send_after[forwarded] = send_session
         msg["id"] = forwarded
         if not self._send_core(json.dumps(msg)):
             self._pending_client.pop(forwarded, None)
             self._replay_after.pop(forwarded, None)
+            self._send_after.pop(forwarded, None)
             self._send_tab(tab_id, _error(id_value, INTERNAL_ERROR, "LocalPilot core is not running"))
 
     async def _initialize(self, tab_id: str, id_value: Any, params: dict[str, Any]) -> None:
@@ -284,7 +297,10 @@ class Bridge:
             return None
         owner = self._owners.get(session)
         adopting = owner is not None and owner not in self.tabs
-        if method == "chat/send" or owner is None or adopting:
+        # A send into another connected tab's running turn is refused by the core:
+        # it must not take that turn's events away from the tab running it.
+        takes_over = method == "chat/send" and session not in self._running
+        if takes_over or owner is None or adopting:
             self._owners[session] = tab_id
         if method == "chat/approve":
             pending = self._pending_calls.get(session)
@@ -358,6 +374,11 @@ class Bridge:
             self.log.debug("LocalPilot: dropped a core response to unknown id %r", forwarded)
             return
         tab_id, original = self._pending_client.pop(forwarded)
+        sent_session = self._send_after.pop(forwarded, None)
+        if sent_session is not None and "error" not in msg:
+            # The core accepted this tab's turn: it runs, and it is this tab's.
+            self._running.add(sent_session)
+            self._owners[sent_session] = tab_id
         msg["id"] = original
         self._send_tab(tab_id, json.dumps(msg))
         session = self._replay_after.pop(forwarded, None)
@@ -373,6 +394,12 @@ class Bridge:
         call = params.get("toolCallId")
         if isinstance(session, str):
             pending = self._pending_calls.get(session)
+            if method == "chat/done":
+                self._running.discard(session)
+                # The core spawns the turn before answering chat/send, so a turn that ends at
+                # once can finish before that answer: it must not mark the session running.
+                for key in [k for k, s in self._send_after.items() if s == session]:
+                    del self._send_after[key]
             if method == "chat/toolCall" and isinstance(call, str) and params.get("requiresApproval"):
                 self._pending_calls[session] = (call, line)
             elif method == "chat/done" or (
@@ -422,6 +449,8 @@ class Bridge:
             self._send_tab(tab_id, _error(original, INTERNAL_ERROR, "LocalPilot core exited"))
         self._pending_core.clear()
         self._replay_after.clear()
+        self._send_after.clear()
+        self._running.clear()
         self._pending_calls.clear()
         # The next core starts with an empty overlay; tabs re-send didOpen after reconnecting.
         self._docs.clear()

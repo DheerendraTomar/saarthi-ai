@@ -405,6 +405,79 @@ async def chat_send(bridge: Bridge, tab_id: str, session: str, id: int = 2) -> N
     await send(bridge, tab_id, {"id": id, "method": "chat/send", "params": {"sessionId": session, "message": "hi"}})
 
 
+def forwarded_send(stub: StubCore, tab_id: str, id: int) -> dict:
+    return next(m for m in stub.sent if m.get("method") == "chat/send" and m["id"] == f"{tab_id}:{id}")
+
+
+async def test_send_into_another_tabs_running_turn_keeps_the_owner(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})  # a's turn runs
+
+    # b sends into the same session: the core refuses it (-32602)…
+    await chat_send(bridge, b_id, "s1", id=7)
+    stub.emit({"id": forwarded_send(stub, b_id, 7)["id"], "error": {"code": -32602, "message": "a turn is running"}})
+    assert b.received[-1] == {"jsonrpc": "2.0", "id": 7, "error": {"code": -32602, "message": "a turn is running"}}
+
+    # …and a's turn keeps reaching a: tokens, the tool call, the edit and chat/done.
+    stub.emit({"method": "chat/token", "params": {"sessionId": "s1", "delta": "x", "kind": "text"}})
+    stub.emit({"method": "chat/toolCall", "params": {"sessionId": "s1", "toolCallId": "tc1", "name": "edit_file", "requiresApproval": True}})
+    stub.emit(apply_edit(-1, "s1"))
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s1", "stopReason": "done"}})
+    assert [m.get("method") for m in a.received if "method" in m] == [
+        "chat/token",
+        "chat/toolCall",
+        "workspace/applyEdit",
+        "chat/done",
+    ]
+    assert not [m for m in b.received if "method" in m], b.received
+
+    # The turn is over: b's next send takes the session.
+    await chat_send(bridge, b_id, "s1", id=8)
+    stub.emit({"id": forwarded_send(stub, b_id, 8)["id"], "result": {}})
+    stub.emit({"method": "chat/token", "params": {"sessionId": "s1", "delta": "y", "kind": "text"}})
+    assert b.received[-1]["method"] == "chat/token"
+    assert a.received[-1]["method"] == "chat/done"
+
+
+async def test_send_adopts_a_running_session_whose_owner_left(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    bridge.unregister(a_id)
+    await chat_send(bridge, b_id, "s1", id=3)  # refused by the core, but the session is b's now
+    stub.emit({"id": forwarded_send(stub, b_id, 3)["id"], "error": {"code": -32602, "message": "running"}})
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s1", "stopReason": "done"}})
+    assert b.received[-1]["method"] == "chat/done"
+
+
+async def test_racing_sends_leave_the_session_with_the_accepted_one(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    # Both sends reach the bridge before either answer: b's (later) moves ownership…
+    await chat_send(bridge, a_id, "s1", id=2)
+    await chat_send(bridge, b_id, "s1", id=2)
+    # …but the core accepted a's, so the turn and the session are a's.
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    stub.emit({"id": forwarded_send(stub, b_id, 2)["id"], "error": {"code": -32602, "message": "running"}})
+    stub.emit(apply_edit(-1, "s1"))
+    assert a.received[-1]["method"] == "workspace/applyEdit"
+    assert not [m for m in b.received if "method" in m]
+
+
+async def test_a_turn_done_before_its_send_answer_is_not_left_running(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s1", "stopReason": "error"}})
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    await chat_send(bridge, b_id, "s1", id=3)  # not running: b may take it
+    stub.emit({"method": "chat/token", "params": {"sessionId": "s1", "delta": "z", "kind": "text"}})
+    assert b.received[-1]["method"] == "chat/token"
+
+
 async def test_apply_edit_routed_by_session_id(bridge: Bridge, stub: StubCore) -> None:
     a_id, a = await connect(bridge)
     b_id, b = await connect(bridge)
