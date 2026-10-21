@@ -8,6 +8,8 @@ import com.intellij.execution.ui.RunContentDescriptor
 import com.intellij.execution.ui.RunContentManager
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.diagnostic.logger
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 
@@ -25,7 +27,7 @@ interface ConsoleOutput {
 /**
  * A "LocalPilot" tab in the Run tool window (via [RunContentManager]) showing every agent command and its output,
  * like the VS Code host's output channel. Created lazily on the EDT on the first print and recreated if the user
- * closed the tab; text printed before the console exists is buffered.
+ * closed the tab; text printed before the console exists is buffered. Keep one per project: each instance has its own tab.
  */
 class LocalPilotConsole(private val project: Project) : ConsoleOutput {
     private val lock = Any()
@@ -50,6 +52,20 @@ class LocalPilotConsole(private val project: Project) : ConsoleOutput {
     }
 
     private fun create() {
+        try {
+            createNow()
+        } catch (e: Throwable) {
+            // Never leave `creating` stuck (every later print would only grow `pending`): drop the buffer, retry on the next print.
+            synchronized(lock) {
+                creating = false
+                pending.clear()
+            }
+            if (e is ProcessCanceledException) throw e
+            LOG.warn("could not open the LocalPilot console", e)
+        }
+    }
+
+    private fun createNow() {
         val view = TextConsoleBuilderFactory.getInstance().createBuilder(project).console
         val descriptor = RunContentDescriptor(view, null, view.component, "LocalPilot")
         // Closing the tab disposes the console: the next print opens a new one.
@@ -62,6 +78,10 @@ class LocalPilotConsole(private val project: Project) : ConsoleOutput {
             console = view
             creating = false
         }
+    }
+
+    private companion object {
+        private val LOG = logger<LocalPilotConsole>()
     }
 
     private fun contentType(kind: ConsoleOutput.Kind) = when (kind) {

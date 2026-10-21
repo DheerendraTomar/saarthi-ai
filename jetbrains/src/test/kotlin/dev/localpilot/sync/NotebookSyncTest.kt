@@ -36,7 +36,7 @@ class NotebookSyncTest : BasePlatformTestCase() {
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         val workspace = Path.of(ModuleRootManager.getInstance(module).contentRoots.single().path)
         sync = DocumentSyncListener(project, sink, scope, testRootDisposable, workspace)
-        cells = NotebookCellSync(sink, scope)
+        cells = NotebookCellSync(sink, scope, TEST_CONCAT_DEBOUNCE_MS)
         sync.notebookSync = cells
         sync.install()
         sink.take()
@@ -120,13 +120,13 @@ class NotebookSyncTest : BasePlatformTestCase() {
         assertEquals("{\"start\":{\"line\":1,\"character\":5},\"end\":{\"line\":1,\"character\":5}}", c["range"].toString())
         assertEquals("\nz", c["text"]!!.jsonPrimitive.content)
 
-        // Two quick edits: one concat re-send with the final text, ~200 ms later.
+        // Two quick edits (well inside the widened debounce): one concat re-send with the final text, after the debounce.
         edit(document) { insertString(text.indexOf("y = 2") + 5, "3") }
         assertEquals(listOf("didChange .cell2.py v2"), summary(sink.take(), base))
         val concat = awaitCalls(1)
         assertEquals(listOf("didChange .cells.py v2"), summary(concat, base))
         assertEquals("import os\nx = 1\nz\n\ny = 23", text(concat.single().second))
-        Thread.sleep(300)
+        Thread.sleep(TEST_CONCAT_DEBOUNCE_MS + 300)
         PlatformTestUtil.dispatchAllEventsInIdeEventQueue()
         assertEquals(emptyList<Any>(), sink.take())
     }
@@ -260,5 +260,13 @@ class NotebookSyncTest : BasePlatformTestCase() {
         assertEquals("y = 2", target.document.text.substring(target.cell.startOffset, target.cell.endOffset))
         assertNull(cells.cellForUri("$base.cells.r"))
         assertNull(cells.cellForUri("$base.cell1.r"))
+    }
+
+    private companion object {
+        /**
+         * The concat debounce for these tests. Wider than production's 200 ms so that the steps a test takes between
+         * two edits (or between an edit and its `sink.take()`) can never straddle it on a slow CI machine.
+         */
+        const val TEST_CONCAT_DEBOUNCE_MS = 1000L
     }
 }

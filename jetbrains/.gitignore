@@ -1,0 +1,2 @@
+# The chat-ui bundle: copied from chat-ui/dist by scripts/package-jetbrains.sh (Task 6), never committed.
+src/main/resources/chat/

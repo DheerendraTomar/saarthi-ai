@@ -13,6 +13,11 @@ version = providers.gradleProperty("pluginVersion").get()
 
 kotlin {
     jvmToolchain(25)
+    compilerOptions {
+        // Interface default methods stay JVM defaults: no generated bridges overriding the platform's deprecated /
+        // experimental defaults (ToolWindowFactory, StatusBarWidget), which verifyPlugin reported as usages.
+        jvmDefault.set(org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode.NO_COMPATIBILITY)
+    }
 }
 
 repositories {

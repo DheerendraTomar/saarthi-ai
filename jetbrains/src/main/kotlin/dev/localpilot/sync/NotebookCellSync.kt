@@ -48,7 +48,12 @@ data class CellTarget(val file: VirtualFile, val document: Document, val cell: C
  * actions, so they build every message first and then notify in one go with no `checkCanceled` in between — a
  * restart can only happen before anything was sent.
  */
-class NotebookCellSync(private val sink: DocumentSink, private val scope: CoroutineScope) : NotebookSync {
+class NotebookCellSync(
+    private val sink: DocumentSink,
+    private val scope: CoroutineScope,
+    /** Quiet time before the concat doc is re-sent (tests widen it so their "quick edits" never straddle it). */
+    private val concatDebounceMs: Long = CONCAT_DEBOUNCE_MS,
+) : NotebookSync {
     private class Doc(val uri: String) {
         var version = 1
         var open = false
@@ -261,7 +266,7 @@ class NotebookCellSync(private val sink: DocumentSink, private val scope: Corout
         st.concatJob?.cancel()
         val generation = ++st.concatGeneration
         st.concatJob = scope.launch {
-            delay(CONCAT_DEBOUNCE_MS)
+            delay(concatDebounceMs)
             readAction {
                 synchronized(lock) {
                     val concat = st.concat

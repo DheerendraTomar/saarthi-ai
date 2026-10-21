@@ -9,11 +9,72 @@
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+    <!-- The inline-completion API (intellij.platform.lang.impl). -->
+    <depends>com.intellij.modules.lang</depends>
+    <!-- JBCefBrowser / JBCefJSQuery: a bundled plugin in 2026.2. -->
+    <depends>com.intellij.modules.jcef</depends>
+    <!-- No notebooks dependency: NotebookCells parses the Jupyter plugin's `#%%` Document text itself. -->
 
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable parentId="tools" id="dev.localpilot.settings" displayName="LocalPilot"
                                  instance="dev.localpilot.settings.LocalPilotConfigurable"/>
         <notificationGroup id="LocalPilot" displayType="BALLOON"/>
         <postStartupActivity implementation="dev.localpilot.sync.LocalPilotStartup"/>
+        <inline.completion.provider implementation="dev.localpilot.completion.LocalPilotInlineCompletionProvider"/>
+        <toolWindow id="LocalPilot" anchor="right" secondary="false" canCloseContents="false"
+                    icon="AllIcons.Toolwindows.ToolWindowMessages"
+                    factoryClass="dev.localpilot.chat.ChatToolWindowFactory"/>
+        <statusBarWidgetFactory id="dev.localpilot.status" order="first"
+                                implementation="dev.localpilot.status.LocalPilotStatusBarWidgetFactory"/>
     </extensions>
+
+    <actions>
+        <action id="LocalPilot.OpenChat" class="dev.localpilot.actions.OpenChatAction"
+                text="Open LocalPilot Chat" description="Show the LocalPilot chat tool window"
+                icon="AllIcons.Toolwindows.ToolWindowMessages">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift L"/>
+            <keyboard-shortcut keymap="Mac OS X" first-keystroke="meta shift L" replace-all="true"/>
+            <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta shift L" replace-all="true"/>
+        </action>
+        <action id="LocalPilot.NewSession" class="dev.localpilot.actions.NewSessionAction"
+                text="New LocalPilot Chat" description="Start a new LocalPilot chat session"/>
+        <action id="LocalPilot.StartOllama" class="dev.localpilot.actions.StartOllamaAction"
+                text="Start Ollama" description="Open a Run tab running `ollama serve`" icon="AllIcons.Actions.Execute"/>
+        <action id="LocalPilot.Retry" class="dev.localpilot.actions.RetryAction"
+                text="Check Ollama Again" description="Probe Ollama again (restarts a stopped LocalPilot core)"
+                icon="AllIcons.Actions.Refresh"/>
+        <action id="LocalPilot.PullModel" class="dev.localpilot.actions.PullModelAction"
+                text="Pull Model…" description="Pull the completion or chat model with Ollama" icon="AllIcons.Actions.Download"/>
+        <action id="LocalPilot.SelectChatModel" class="dev.localpilot.actions.SelectChatModelAction"
+                text="Select Chat Model…" description="Pick the LocalPilot chat model from the models installed in Ollama"/>
+        <action id="LocalPilot.SelectCompletionModel" class="dev.localpilot.actions.SelectCompletionModelAction"
+                text="Select Completion Model…" description="Pick the LocalPilot completion model from the models installed in Ollama"/>
+        <action id="LocalPilot.ToggleCompletions" class="dev.localpilot.actions.ToggleCompletionsAction"
+                text="Inline Completions" description="Pause or resume LocalPilot inline completions"/>
+        <action id="LocalPilot.ShowCompletionStats" class="dev.localpilot.actions.ShowCompletionStatsAction"
+                text="Show Completion Stats" description="Per-language accept rates and what LocalPilot learned"/>
+        <action id="LocalPilot.ResetCompletionLearning" class="dev.localpilot.actions.ResetCompletionLearningAction"
+                text="Reset Completion Learning…" description="Forget the learned completion lengths and style examples"/>
+        <action id="LocalPilot.RestartCore" class="dev.localpilot.actions.RestartCoreAction"
+                text="Restart LocalPilot Core" description="Restart the LocalPilot core process" icon="AllIcons.Actions.Restart"/>
+
+        <group id="LocalPilot.StatusMenu" text="LocalPilot" popup="true">
+            <reference ref="LocalPilot.OpenChat"/>
+            <reference ref="LocalPilot.NewSession"/>
+            <separator/>
+            <reference ref="LocalPilot.StartOllama"/>
+            <reference ref="LocalPilot.Retry"/>
+            <reference ref="LocalPilot.PullModel"/>
+            <separator/>
+            <reference ref="LocalPilot.SelectChatModel"/>
+            <reference ref="LocalPilot.SelectCompletionModel"/>
+            <reference ref="LocalPilot.ToggleCompletions"/>
+            <separator/>
+            <reference ref="LocalPilot.ShowCompletionStats"/>
+            <reference ref="LocalPilot.ResetCompletionLearning"/>
+            <separator/>
+            <reference ref="LocalPilot.RestartCore"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </group>
+    </actions>
 </idea-plugin>

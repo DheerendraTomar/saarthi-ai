@@ -42,13 +42,13 @@ import java.util.concurrent.TimeUnit
  * - Never throws (except coroutine cancellation, which kills the process): errors come back as `exitCode: -1` with the
  *   reason on stderr.
  *
- * Implements 5b's `CommandRunner` (`chat/HostHooks.kt`) by signature.
+ * The plugin keeps ONE instance per project (`LocalPilotHost.runCommand`): every [LocalPilotConsole] opens its own Run tab.
  */
 class RunCommand(
     private val workspace: Path?,
     private val console: ConsoleOutput = ConsoleOutput.None,
     private val timeoutMs: Long = COMMAND_TIMEOUT_MS,
-) {
+) : CommandRunner {
     constructor(project: Project) : this(workspaceOf(project), LocalPilotConsole(project))
 
     /** Keeps the last `limit` characters of a stream. */
@@ -76,13 +76,14 @@ class RunCommand(
         }
     }
 
-    suspend fun run(params: JsonElement): JsonElement {
+    override suspend fun run(params: JsonElement): JsonElement {
         val obj = params as? JsonObject ?: return result(-1, "", "invalid runCommand request: expected an object")
         val command = (obj["command"] as? JsonPrimitive)?.takeIf { it.isString }?.content
         if (command.isNullOrBlank()) return result(-1, "", "invalid runCommand request: missing \"command\"")
         val cwdParam = (obj["cwd"] as? JsonPrimitive)?.takeIf { it.isString }?.content
         val cwd = try {
-            resolveCwd(cwdParam)
+            // toRealPath / isDirectory touch the filesystem: never on the caller's (possibly UI-adjacent) thread.
+            withContext(Dispatchers.IO) { resolveCwd(cwdParam) }
         } catch (e: IllegalArgumentException) {
             console.print("$ $command\n[not run: ${e.message}]\n", ConsoleOutput.Kind.SYSTEM)
             return result(-1, "", e.message ?: "invalid cwd")

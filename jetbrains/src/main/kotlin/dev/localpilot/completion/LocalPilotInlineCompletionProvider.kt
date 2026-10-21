@@ -84,6 +84,7 @@ class LocalPilotInlineCompletionProvider internal constructor(
     constructor() : this(::productionDeps)
 
     private val seq = AtomicLong()
+    private val listenerLock = Any()
     private val reporter = OutcomeReporter()
 
     override val id: InlineCompletionProviderID = ID
@@ -169,12 +170,14 @@ class LocalPilotInlineCompletionProvider internal constructor(
      */
     private fun installSessionListener(editor: Editor, current: InlineCompletionRequest) {
         val handler = InlineCompletion.getHandlerOrNull(editor) ?: return
-        synchronized(editor) {
+        val project = editor.project?.takeUnless { it.isDisposed } ?: return
+        synchronized(listenerLock) {
             if (editor.getUserData(LISTENING_HANDLER) === handler) return
             editor.putUserData(LISTENING_HANDLER, handler)
         }
-        val disposable = Disposer.newDisposable("LocalPilot inline completion session listener")
-        EditorUtil.disposeWithEditor(editor, disposable)
+        // Gone with the editor or with the project, whichever goes first.
+        val disposable = Disposer.newDisposable(project, "LocalPilot inline completion session listener")
+        EditorUtil.disposeWithEditor(editor) { Disposer.dispose(disposable) }
         // The platform announced `current` before this listener existed: start from it.
         handler.addEventListener(SessionListener(editor, current), disposable)
     }
@@ -198,9 +201,10 @@ class LocalPilotInlineCompletionProvider internal constructor(
                 is InlineCompletionEventType.Show -> started()
                 is InlineCompletionEventType.Change -> {
                     // The platform truncates the shown text in place: on typing (a DocumentChange event) and on
-                    // Insert Next Word / Line. Any other event that takes text from the suggestion is a partial
-                    // accept (the PartialAccept event classes themselves are internal API).
-                    run?.update(event.elements.joinToString("") { it.text }, event.event !is InlineCompletionEvent.DocumentChange)
+                    // Insert Next Word / Line. Only those two actions count as a chunk (a partial accept); other
+                    // truncations (e.g. a matching lookup item) do not.
+                    val chunk = event.event is InlineCompletionEvent.InsertNextWord || event.event is InlineCompletionEvent.InsertNextLine
+                    run?.update(event.elements.joinToString("") { it.text }, chunk)
                 }
                 // Insert comes before Hide (and before the insert handler runs): it is what reports a Tab accept.
                 is InlineCompletionEventType.Insert -> if (run != null) inserted = true

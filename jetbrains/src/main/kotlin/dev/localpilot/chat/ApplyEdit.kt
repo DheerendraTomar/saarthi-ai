@@ -58,13 +58,13 @@ import java.nio.file.Path
  * - Never throws (except coroutine cancellation): failures are returned as `{ applied: false, error }`; a save
  *   failure after a successful edit is `{ applied: true, error }` as in VS Code.
  *
- * Implements 5b's `EditApplier` (`chat/HostHooks.kt`) by signature.
+ * Implements 5b's [EditApplier] (`chat/HostHooks.kt`).
  */
 class ApplyEdit(
     private val project: Project,
     private val workspace: Path? = workspaceOf(project),
     private val cellForUri: (String) -> CellTarget? = { DocumentSyncService.getInstance(project).notebookCells?.cellForUri(it) },
-) {
+) : EditApplier {
     private class EditFailure(message: String) : Exception(message)
 
     private sealed interface Op {
@@ -76,7 +76,7 @@ class ApplyEdit(
     private class CellEdit(override val uri: String, val range: Range, val newText: String) : Op
     private class Create(override val uri: String, val path: Path, val content: String) : Op
 
-    suspend fun apply(params: JsonElement): JsonElement {
+    override suspend fun apply(params: JsonElement): JsonElement {
         return try {
             val (ops, save) = parse(params)
             val prepared = withContext(Dispatchers.IO) { prepare(ops) }
