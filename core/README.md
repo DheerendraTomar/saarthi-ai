@@ -151,8 +151,10 @@ Additions beyond the spec:
     [16, 2 × `completionMaxTokens`] (16 when nothing was accepted; never 0).
   - **Style examples:** up to 3 of the most recent `accepted` suggestions of
     the same language with ≥ 2 lines, newest first, each as
-    `<comment> Example\n<contextTail>\n<suggestion>\n\n` (the language's
-    line comment), ≤ 300 tokens together. They lead the snippet block and
+    `<comment> Example\n<contextTail><suggestion>\n\n` with the language's
+    line comment, ≤ 300 tokens together. The suggestion continues the tail
+    with no inserted line break; a full 200-character tail starts after its
+    first line break so it never opens mid-line. They lead the snippet block and
     take their tokens out of the snippet budget (768 by default), so the
     prompt stays within `completionContextTokens`.
   - Learned limits and examples are computed only when a file's snippet block
@@ -162,6 +164,9 @@ Additions beyond the spec:
     record are the values that were in effect.
   - `adaptiveCompletions: false`: configured limits and no examples; outcomes
     are still logged.
+  - The completion cache is keyed by document position, not by limits: a
+    suggestion cached before a change of learned limits (or a reset) may
+    be served once more.
 - **One Ollama status shape everywhere: `{ ollama, detail }`**, with
   `ollama` one of `"ok" | "down" | "modelMissing"`. It is
   `InitializeResult.ollamaStatus`, the `ollama/status` result and the params

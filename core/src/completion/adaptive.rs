@@ -8,7 +8,7 @@
 use crate::index::symbols::Lang;
 use crate::tokens;
 
-use super::feedback::{Outcome, Record};
+use super::feedback::{CONTEXT_TAIL_CHARS, Outcome, Record};
 use super::prompt;
 
 /// Outcomes per language the policy looks at (the newest ones).
@@ -164,7 +164,7 @@ pub fn examples(lang: Lang, outcomes: &[Record], budget_tokens: usize) -> Vec<Ex
             continue;
         }
         let example = Example {
-            context_tail: r.context_tail.clone(),
+            context_tail: whole_lines(&r.context_tail).to_owned(),
             suggestion: r.suggestion.clone(),
         };
         let cost = tokens::estimate(&render_one(comment, &example));
@@ -174,6 +174,16 @@ pub fn examples(lang: Lang, outcomes: &[Record], budget_tokens: usize) -> Vec<Ex
         }
     }
     picked
+}
+
+/// `tail` from its first line start: a tail cut at the full
+/// [`CONTEXT_TAIL_CHARS`] most likely begins mid-line, so it starts after
+/// its first `\n` (if it has one); a shorter tail is the start of the file.
+fn whole_lines(tail: &str) -> &str {
+    if tail.chars().count() < CONTEXT_TAIL_CHARS {
+        return tail;
+    }
+    tail.find('\n').map_or(tail, |i| &tail[i + 1..])
 }
 
 /// The text the user kept: the whole suggestion if `accepted`, the
@@ -187,7 +197,8 @@ fn accepted_text(r: &Record) -> &str {
 }
 
 /// The examples as they go into the snippet block:
-/// `<comment> Example\n<contextTail>\n<suggestion>\n\n` each.
+/// `<comment> Example\n<contextTail><suggestion>\n\n` each — the
+/// suggestion continues the tail, exactly as it did in the file.
 pub fn render_examples(lang: Lang, examples: &[Example]) -> String {
     let comment = prompt::line_comment(lang);
     examples
@@ -197,10 +208,7 @@ pub fn render_examples(lang: Lang, examples: &[Example]) -> String {
 }
 
 fn render_one(comment: &str, e: &Example) -> String {
-    format!(
-        "{comment} Example\n{}\n{}\n\n",
-        e.context_tail, e.suggestion
-    )
+    format!("{comment} Example\n{}{}\n\n", e.context_tail, e.suggestion)
 }
 
 #[cfg(test)]
@@ -219,7 +227,7 @@ mod tests {
             lang: lang.to_owned(),
             ext: None,
             prompt_hash: "0".repeat(16),
-            context_tail: "def f(x):\n".to_owned(),
+            context_tail: "def f(x):\n    ".to_owned(),
             suggestion: suggestion.to_owned(),
             lines: super::super::feedback::line_count(suggestion),
             outcome,
@@ -409,12 +417,27 @@ mod tests {
         let got = examples(Lang::Python, &outcomes, EXAMPLES_TOKENS);
         let texts: Vec<&str> = got.iter().map(|e| e.suggestion.as_str()).collect();
         assert_eq!(texts, ["new3\nnew3", "new2\nnew2", "new1\nnew1"]);
-        assert_eq!(got[0].context_tail, "def f(x):\n");
+        assert_eq!(got[0].context_tail, "def f(x):\n    ");
 
         let block = render_examples(Lang::Python, &got);
-        assert!(block.starts_with("# Example\ndef f(x):\n\nnew3\nnew3\n\n"));
+        // The suggestion continues the tail: no line break between them.
+        assert!(block.starts_with("# Example\ndef f(x):\n    new3\nnew3\n\n"));
         let rust = render_examples(Lang::Rust, &examples(Lang::Rust, &outcomes, 300));
-        assert_eq!(rust, "// Example\ndef f(x):\n\nrust\nrust\n\n");
+        assert_eq!(rust, "// Example\ndef f(x):\n    rust\nrust\n\n");
+
+        // A full-length tail starts after its first line break (no
+        // mid-line fragment); a shorter one is kept whole.
+        let mut cut = ex("a\nb");
+        cut.context_tail = format!("{}\ndef g():\n    ", "z".repeat(CONTEXT_TAIL_CHARS - 14));
+        assert_eq!(cut.context_tail.chars().count(), CONTEXT_TAIL_CHARS);
+        let got = examples(Lang::Python, &[cut], EXAMPLES_TOKENS);
+        assert_eq!(got[0].context_tail, "def g():\n    ");
+        let mut short = ex("a\nb");
+        short.context_tail = "x = 1\ny = ".to_owned();
+        assert_eq!(
+            examples(Lang::Python, &[short], 300)[0].context_tail,
+            "x = 1\ny = "
+        );
 
         // Within the budget: a too-large newest example is skipped, the
         // rest still fit; the whole block never exceeds the budget.

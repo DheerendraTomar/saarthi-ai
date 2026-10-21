@@ -592,7 +592,7 @@ fn seed(id: &str, suggestion: &str, outcome: Outcome) -> feedback::Record {
         lang: "python".to_owned(),
         ext: Some("py".to_owned()),
         prompt_hash: "0".repeat(16),
-        context_tail: format!("# ctx {id}"),
+        context_tail: format!("# ctx {id}\n"),
         suggestion: suggestion.to_owned(),
         lines: feedback::line_count(suggestion),
         outcome,
