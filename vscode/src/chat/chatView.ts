@@ -38,7 +38,8 @@ export interface ChatViewDeps {
 }
 
 /** The settings the chat UI's settings panel edits with `settings/set` (the completion model goes through `model/select`). */
-const PANEL_NUMBERS = ["completionMaxTokens", "completionDebounceMs", "completionContextTokens"] as const;
+/** Panel number settings and their minimums (as in package.json). */
+const PANEL_NUMBERS = { completionMaxTokens: 1, completionDebounceMs: 0, completionContextTokens: 256 } as const;
 const PANEL_BOOLEANS = ["adaptiveCompletions"] as const;
 
 /** What `chat/deleteSession` / `chat/clearSessions` did, for the palette commands. */
@@ -339,6 +340,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     try {
       await this.postSessionList();
       if (this.current) await this.postHistory(this.current);
+      // Turns running in other sessions too, so the UI keeps their delete buttons disabled.
+      for (const sessionId of this.activeTurns) {
+        if (sessionId !== this.current) this.post({ type: "chat/turnState", sessionId, running: true });
+      }
     } catch (e) {
       this.post({ type: "session/list", sessions: [], current: this.current });
       if (!isCrash(e)) this.postError(`LocalPilot core is not available: ${errorMessage(e)}`);
@@ -461,9 +466,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async applySettings(patch: unknown): Promise<void> {
     const p = (typeof patch === "object" && patch !== null ? patch : {}) as Record<string, unknown>;
     const writes: Array<[keyof Settings, unknown]> = [];
-    for (const key of PANEL_NUMBERS) {
+    for (const [key, min] of Object.entries(PANEL_NUMBERS) as Array<[keyof typeof PANEL_NUMBERS, number]>) {
       const v = p[key];
-      if (typeof v === "number" && Number.isFinite(v) && v >= 0) writes.push([key, Math.round(v)]);
+      if (typeof v === "number" && Number.isFinite(v)) writes.push([key, Math.max(min, Math.round(v))]);
     }
     for (const key of PANEL_BOOLEANS) if (typeof p[key] === "boolean") writes.push([key, p[key]]);
     for (const [key, value] of writes) {

@@ -551,11 +551,12 @@ describe("ChatViewProvider v2 relays", () => {
     ui.send({
       type: "settings/set",
       // completionModel goes through model/select; unknown keys and wrong types are dropped.
-      patch: { completionMaxTokens: 64, adaptiveCompletions: false, completionModel: "x", chatModel: "y", completionDebounceMs: "fast" },
+      patch: { completionMaxTokens: 64, adaptiveCompletions: false, completionModel: "x", chatModel: "y", completionDebounceMs: "fast", completionContextTokens: 10 },
     });
     await waitFor(() => ui.posted.some((m) => m.type === "settings/current"), 5000, "settings/current after set");
     expect(registry.configUpdates).toEqual([
       { key: "localpilot.completionMaxTokens", value: 64, target: 2 },
+      { key: "localpilot.completionContextTokens", value: 256, target: 1 }, // raised to the minimum
       { key: "localpilot.adaptiveCompletions", value: false, target: 1 },
     ]);
     expect(ui.posted).toEqual([
@@ -565,7 +566,7 @@ describe("ChatViewProvider v2 relays", () => {
           completionModel: "qwen2.5-coder:0.5b-base",
           completionMaxTokens: 64,
           completionDebounceMs: 120,
-          completionContextTokens: 3584,
+          completionContextTokens: 256,
           adaptiveCompletions: false,
         },
       },
@@ -635,6 +636,24 @@ describe("ChatViewProvider v2 relays", () => {
       { type: "session/deleted", sessionId: "s1", next: "s3" },
       { type: "ui/error", message: "1 session with a running reply was kept." },
       { type: "session/list", sessions: [sessions[0]], current: "s3" },
+    ]);
+  });
+
+  it("ready_reports_turns_running_in_other_sessions", async () => {
+    const { provider, ui } = v2Setup(defaultResponder);
+    ui.send({ type: "ui/ready" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/history"), 5000, "ready");
+    ui.send({ type: "chat/send", message: "go", attachments: [] }); // s2 runs
+    ui.send({ type: "chat/switchSession", sessionId: "s1" });
+    await waitFor(() => ui.posted.some((m) => m.type === "session/history" && m.sessionId === "s1"), 5000, "switch");
+    // The webview reloads (e.g. the view was re-created): it hears that s2 is still running.
+    const again = fakeWebviewView();
+    provider.resolveWebviewView(again.view);
+    again.send({ type: "ui/ready" });
+    await waitFor(() => again.posted.some((m) => m.type === "status" || m.type === "ui/activeFile"), 5000, "ready again");
+    expect(again.posted.filter((m) => m.type === "chat/turnState")).toEqual([
+      { type: "chat/turnState", sessionId: "s1", running: false },
+      { type: "chat/turnState", sessionId: "s2", running: true },
     ]);
   });
 

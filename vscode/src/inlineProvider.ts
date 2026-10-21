@@ -119,7 +119,7 @@ function hasWholeWord(gained: string, suggestion: string): boolean {
  * accept: once the text between the item's surroundings stops being a prefix
  * of the suggestion, or {@link OUTCOME_IDLE_MS} pass without progress, the
  * outcome goes out as `completion/outcome`:
- * - `typedThrough`: the whole suggestion arrived one key at a time;
+ * - `typedThrough`: the whole suggestion (up to trailing whitespace) arrived one key at a time;
  * - `partial` (with `acceptedText`): part of it arrived through accept-next-word/line
  *   (a multi-character edit with a word in it), or at least one whole word of it was typed;
  * - otherwise `completion/rejected`.
@@ -276,7 +276,9 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
     if (!this.markReported(t.requestId)) return;
     const { requestId, gained, suggestion } = t;
     const progressed = gained.length > t.baseline;
-    if (progressed && gained === suggestion && !t.chunked) {
+    // Trailing whitespace/newlines are not required (Enter auto-indents differently).
+    const whole = gained.trimEnd() === suggestion.trimEnd();
+    if (progressed && whole && !t.chunked) {
       this.client.notify("completion/outcome", { requestId, outcome: "typedThrough" });
     } else if (progressed && (t.chunked || hasWholeWord(gained, suggestion))) {
       this.client.notify("completion/outcome", { requestId, outcome: "partial", acceptedText: gained });

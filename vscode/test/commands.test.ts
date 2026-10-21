@@ -8,7 +8,7 @@ import {
   type CommandDeps,
 } from "../src/commands";
 import { ModelCatalog } from "../src/models";
-import { DEFAULT_SETTINGS, readSettings } from "../src/settings";
+import { readSettings } from "../src/settings";
 import { FakeChatClient } from "./helpers/webview";
 import { configValues, registry, resetMock, window, workspaceConfigKeys } from "./mocks/vscode";
 
@@ -184,6 +184,5 @@ describe("session and learning commands", () => {
     ]);
     expect(picks[0].items[0].detail).toBe("accepted 4 · partial 1 · typed through 1 · rejected 4 — learned: 4 lines, 48 tokens, 2 examples");
     expect(registry.executed.map((e) => e.command)).toEqual(["vscode.open"]);
-    void DEFAULT_SETTINGS;
   });
 });

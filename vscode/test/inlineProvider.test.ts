@@ -272,5 +272,17 @@ describe("InlineProvider", () => {
     provider.onDidChangeTextDocument(changeEvent(fdoc, "y = fx", range(0, 5, 0, 5), "x") as never);
     expect((client.of("completion/rejected") as unknown[]).slice(before)).toContainEqual({ requestId: "8" });
     expect((client.of("completion/outcome") as Array<{ requestId: string }>).filter((o) => o.requestId === "8")).toEqual([]);
+
+    // A suggestion ending in a newline: typing its text and then Enter (auto-indented) is still typed through.
+    client.respond = async (_m, params) => {
+      const { position } = params as { position: { line: number; character: number } };
+      return { items: [{ text: "go()\n", range: { start: position, end: position } }] };
+    };
+    fdoc.text = "z = ";
+    await ask(4); // #9
+    let typed = "z = ";
+    for (const ch of "go()") provider.onDidChangeTextDocument(changeEvent(fdoc, (typed += ch), range(0, typed.length - 1, 0, typed.length - 1), ch) as never);
+    provider.onDidChangeTextDocument(changeEvent(fdoc, typed + "\n    ", range(0, typed.length, 0, typed.length), "\n    ") as never);
+    expect(client.of("completion/outcome")).toContainEqual({ requestId: "9", outcome: "typedThrough" });
   });
 });
