@@ -80,7 +80,8 @@ Additions beyond the spec:
   supportsInsert, supportsTools }] }`: the models installed in Ollama, in
   `/api/tags` order. The capabilities come from one `/api/show` per model
   (`"insert"` = fill-in-the-middle, usable for completions; `"tools"` = usable
-  for agent chat); if `/api/show` fails for a model both are `false`.
+  for agent chat); if `/api/show` fails for a model, or takes over 3 s, both
+  are `false` (at most 8 `/api/show` calls run at once).
   `family` is omitted when Ollama reports none. Ollama unreachable (or not
   answering within 10 s) fails with `-32000`, never an empty list.
 - **`chat/deleteSession { sessionId }`** → `{}`: removes
@@ -91,6 +92,20 @@ Additions beyond the spec:
 - **`chat/clearSessions {}`** → `{ deleted, skipped }`: deletes every saved
   session file (unreadable ones too) except those of sessions with a running
   turn; `skipped` lists the ids of all sessions with a running turn.
+- **`completion/outcome { requestId, outcome, acceptedText? }`**
+  (notification), `outcome` one of `"accepted" | "partial" | "rejected" |
+  "typedThrough"`: what the user did with a served suggestion.
+  `completion/accepted` and `completion/rejected` keep working and mean
+  `accepted` / `rejected`. Each served suggestion is appended once to
+  **`<workspace>/.localpilot/completions.jsonl`** when its outcome arrives:
+  `{ ts, requestId, lang, promptHash, contextTail, suggestion, lines, outcome,
+  acceptedText?, ttftMs, totalMs }` (`ts` Unix ms; `lang` lower-case, e.g.
+  `"python"`, `"other"`; `promptHash` = first 16 hex digits of SHA-256 of
+  prompt `\0` suffix; `contextTail` = at most 200 characters before the cursor
+  — no other file content is logged; `ttftMs` is `null` for a cache hit or a
+  joined generation). A suggestion with no outcome within 60 s (or once 64
+  newer ones are waiting) is logged as `rejected`; a later outcome for it is
+  ignored. The file is rotated past 10 000 lines, keeping the newest 5 000.
 - **One Ollama status shape everywhere: `{ ollama, detail }`**, with
   `ollama` one of `"ok" | "down" | "modelMissing"`. It is
   `InitializeResult.ollamaStatus`, the `ollama/status` result and the params
@@ -116,7 +131,7 @@ Behaviour to rely on:
   `.localpilot/` (any path component, case-insensitive), whatever the user's
   approvals. `read_file` refuses files over 1 MB on disk (the index limit).
 - The core's state lives in `<workspace>/.localpilot/` (`core.log`,
-  `sessions/`); it creates `.localpilot/.gitignore` (`*`) together with the log.
+  `sessions/`, `completions.jsonl`); it creates `.localpilot/.gitignore` (`*`) together with the log.
 - **Notifications that arrive before `initialize` has been handled are dropped**
   (logged), so send `didOpen` etc. after the `initialize` response. Requests
   other than `initialize` / `shutdown` before then fail with `-32600`; a second

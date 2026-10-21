@@ -47,6 +47,8 @@ pub struct Script {
     pub pull: Vec<Value>,
     /// Sleep before each streamed line.
     pub chunk_delay: Duration,
+    /// Sleep before answering each `/api/show`.
+    pub show_delay: Duration,
     /// Every endpoint answers this status with `{"error": …}`. For 404 the
     /// message is Ollama's: `model "<model>" not found, try pulling it first`.
     pub fail_with: Option<u16>,
@@ -65,6 +67,7 @@ impl Default for Script {
             chat: Vec::new(),
             pull: Vec::new(),
             chunk_delay: Duration::ZERO,
+            show_delay: Duration::ZERO,
             fail_with: None,
             refuse_connections: false,
         }
@@ -126,6 +129,8 @@ struct Shared {
     generate_calls: AtomicUsize,
     chat_calls: AtomicUsize,
     disconnected: AtomicBool,
+    shows_running: AtomicUsize,
+    max_shows_running: AtomicUsize,
 }
 
 pub struct MockOllama {
@@ -144,6 +149,8 @@ impl MockOllama {
             generate_calls: AtomicUsize::new(0),
             chat_calls: AtomicUsize::new(0),
             disconnected: AtomicBool::new(false),
+            shows_running: AtomicUsize::new(0),
+            max_shows_running: AtomicUsize::new(0),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -180,6 +187,11 @@ impl MockOllama {
     /// `(path, JSON body)` of every request so far; GETs record `Value::Null`.
     pub fn received_requests(&self) -> Vec<(String, Value)> {
         self.shared.requests.lock().unwrap().clone()
+    }
+
+    /// The most `/api/show` requests ever being answered at once.
+    pub fn max_concurrent_shows(&self) -> usize {
+        self.shared.max_shows_running.load(Ordering::SeqCst)
     }
 
     /// True once a client hung up before a streamed response was complete.
@@ -309,6 +321,14 @@ async fn show(State(shared): State<Arc<Shared>>, req: Request) -> Response {
     if let Some(resp) = failure(&shared, &body) {
         return resp;
     }
+    let running = shared.shows_running.fetch_add(1, Ordering::SeqCst) + 1;
+    shared
+        .max_shows_running
+        .fetch_max(running, Ordering::SeqCst);
+    if !shared.script.show_delay.is_zero() {
+        tokio::time::sleep(shared.script.show_delay).await;
+    }
+    shared.shows_running.fetch_sub(1, Ordering::SeqCst);
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     match shared.script.model_info.get(model) {
         Some(info) => axum::Json(json!({

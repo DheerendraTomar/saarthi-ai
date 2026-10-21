@@ -22,6 +22,12 @@ use super::{OllamaError, OllamaState, OllamaStatus, Result};
 use crate::protocol::OllamaModel;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-model `/api/show` limit in [`OllamaClient::list_models`]. Two stalled
+/// batches of [`SHOW_CONCURRENCY`] still fit in the handler's 10 s
+/// `ollama/models` timeout.
+pub const SHOW_TIMEOUT: Duration = Duration::from_secs(3);
+/// Concurrent `/api/show` calls in [`OllamaClient::list_models`].
+pub const SHOW_CONCURRENCY: usize = 8;
 /// Parsed lines buffered between the body reader task and the consumer.
 const STREAM_BUFFER: usize = 16;
 
@@ -99,8 +105,9 @@ impl OllamaClient {
     }
 
     /// The installed models with size, family and capabilities: `GET
-    /// /api/tags`, then one `POST /api/show` per distinct model (in
-    /// parallel). A model whose `/api/show` fails is reported with both
+    /// /api/tags`, then one `POST /api/show` per distinct model (at most
+    /// [`SHOW_CONCURRENCY`] at a time, each cut off after [`SHOW_TIMEOUT`]).
+    /// A model whose `/api/show` fails or times out is reported with both
     /// capabilities `false`; only a failing `/api/tags` is an error.
     pub async fn list_models(&self) -> Result<Vec<OllamaModel>> {
         let body: ModelList = self.get_json("/api/tags").await?;
@@ -108,8 +115,14 @@ impl OllamaClient {
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        let shows = futures::future::join_all(names.iter().map(|name| self.capabilities(name)));
-        let capabilities: HashMap<&str, Vec<String>> = names.into_iter().zip(shows.await).collect();
+        // Collected first: a lazily mapped stream trips the `Send` check of the
+        // async-trait handler that awaits this.
+        let pending: Vec<_> = names.iter().map(|name| self.capabilities(name)).collect();
+        let shows: Vec<Vec<String>> = stream::iter(pending)
+            .buffered(SHOW_CONCURRENCY)
+            .collect()
+            .await;
+        let capabilities: HashMap<&str, Vec<String>> = names.into_iter().zip(shows).collect();
         Ok(entries
             .iter()
             .map(|entry| {
@@ -132,7 +145,8 @@ impl OllamaClient {
             .collect())
     }
 
-    /// `capabilities` from `POST /api/show`; empty if the call fails.
+    /// `capabilities` from `POST /api/show`; empty if the call fails or
+    /// takes longer than [`SHOW_TIMEOUT`].
     async fn capabilities(&self, model: &str) -> Vec<String> {
         let request = self
             .http
@@ -147,9 +161,13 @@ impl OllamaClient {
             serde_json::from_slice::<ShowBody>(&bytes)
                 .map_err(|err| OllamaError::Other(format!("unexpected /api/show response: {err}")))
         };
-        match shown.await {
-            Ok(body) => body.capabilities,
-            Err(err) => {
+        match tokio::time::timeout(SHOW_TIMEOUT, shown).await {
+            Ok(Ok(body)) => body.capabilities,
+            Err(_) => {
+                tracing::warn!(model, "model capabilities timed out");
+                Vec::new()
+            }
+            Ok(Err(err)) => {
                 tracing::warn!(model, %err, "cannot read model capabilities");
                 Vec::new()
             }

@@ -488,3 +488,62 @@ async fn models_lists_installed_with_capabilities() {
         Err(OllamaError::Down(_))
     ));
 }
+
+#[tokio::test]
+async fn models_show_timeout_reports_no_capabilities() {
+    let mock = MockOllama::start(Script {
+        models: vec!["slow:latest".to_owned()],
+        model_info: HashMap::from([(
+            "slow:latest".to_owned(),
+            info(7, "llama", &["completion", "insert", "tools"]),
+        )]),
+        show_delay: Duration::from_secs(30),
+        ..Script::default()
+    })
+    .await;
+    let started = Instant::now();
+    let models = tokio::time::timeout(Duration::from_secs(10), client(&mock).list_models())
+        .await
+        .expect("a stalled /api/show is cut off")
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].name, "slow:latest");
+    assert_eq!(models[0].size_bytes, 7);
+    assert!(!models[0].supports_insert && !models[0].supports_tools);
+}
+
+#[tokio::test]
+async fn models_show_fan_out_is_capped_and_ordered() {
+    let names: Vec<String> = (0..20).map(|i| format!("m{i:02}:latest")).rev().collect();
+    let mock = MockOllama::start(Script {
+        models: names.clone(),
+        model_info: names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let caps: &[&str] = if i % 2 == 0 { &["insert"] } else { &["tools"] };
+                (n.clone(), info(i as u64, "f", caps))
+            })
+            .collect(),
+        show_delay: Duration::from_millis(50),
+        ..Script::default()
+    })
+    .await;
+    let models = client(&mock).list_models().await.unwrap();
+    let listed: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(listed, names, "the /api/tags order");
+    for (i, m) in models.iter().enumerate() {
+        assert_eq!(m.size_bytes, i as u64);
+        assert_eq!(
+            (m.supports_insert, m.supports_tools),
+            (i % 2 == 0, i % 2 == 1)
+        );
+    }
+    let max = mock.max_concurrent_shows();
+    assert!((2..=8).contains(&max), "{max} concurrent /api/show");
+}
