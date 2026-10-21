@@ -313,3 +313,18 @@ Cross-check with workspace `core/` (42 files instead of 49): the same cells with
 **Decision:** `completionModel` = `qwen2.5-coder:0.5b-base`, `completionMaxTokens` = **32** (was 1.5b / 64). Typing total 211 / 212 ms meets the target with ≈ 40 ms headroom at p50. Applied to the `Settings` defaults (so `bench` defaults to it as well) and the core README.
 
 **Trade-off:** fewer tokens means shorter multi-line suggestions. 32 tokens is roughly 2–4 short lines of code (64 was 4–8), so the 8-line cap is rarely reached; single-line completions (text after the cursor) are unaffected in practice. The 0.5b model also gives lower-quality suggestions than 1.5b. Users who prefer longer or better suggestions can set `completionModel` / `completionMaxTokens` and accept the latency in the table.
+
+## Adaptive completions sanity check (2026-10-21, v2 Task 3)
+
+Adaptive completions (learned multi-line cap / `num_predict` and up to 3 style examples) change only the stable block and the generation limits, and only at snippet-refresh time:
+
+- **Examples add ≤ 300 tokens to the stable block**, and they take those tokens out of the existing 768-token snippet budget, not on top of it, so the whole prompt stays within `completionContextTokens`. The bound is enforced in `adaptive::examples` and asserted by `examples_are_recent_accepted_same_language_within_budget` and `prompt_with_examples_is_byte_stable_across_keystrokes`, which also asserts that the block is byte-identical across keystrokes even when new outcomes arrive between them.
+- **What the bench does not cover:** the bench builds its engine without an outcome log, so its runs never include learned limits or examples. The run below checks that the default path did not regress; it does not measure examples. With examples present, the prompt prefix is still stable while typing, so the KV-cache behaviour is the same. The only added cost is evaluating up to 300 more tokens once per refresh.
+- Run: `bench --workspace /Users/dst/projects/ollama --file core/src/handlers.rs --n 20 --mode typing` (defaults: 0.5b, 32 tokens). The file has grown to 653 lines, so the bench now types `state` after line 327 instead of the earlier line 279 target.
+
+| run | TTFT p50 / p95 | total p50 / p95 / max | core overhead p95 | empty |
+|---|---|---|---|---|
+| before (0.5b / 32, table above) | 78.18 / 79.04 | 210.80 / 212.35 / 212.4 | — | 0 |
+| **after Task 3** | **73.12 / 74.63** | **212.51 / 219.13 / 221.66** | 0.06 | 1/20 |
+
+Typing-mode numbers are unchanged within noise: total p50 is +1.7 ms. All four targets pass (TTFT p50 ≤ 250 ms, TTFT p95 ≤ 600 ms, overhead p95 < 5 ms, RSS 18.2 MB ≤ 30 MB).

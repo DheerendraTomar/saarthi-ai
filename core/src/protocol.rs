@@ -42,6 +42,8 @@ pub mod methods {
     pub const OLLAMA_STATUS: &str = "ollama/status";
     pub const OLLAMA_PULL: &str = "ollama/pull";
     pub const OLLAMA_MODELS: &str = "ollama/models";
+    pub const COMPLETION_STATS: &str = "completion/stats";
+    pub const COMPLETION_RESET_LEARNING: &str = "completion/resetLearning";
     pub const BENCH_RUN: &str = "bench/run";
     pub const SHUTDOWN: &str = "shutdown";
 
@@ -565,6 +567,44 @@ pub struct OllamaModel {
     /// Tool calling (`tools` capability): usable as agent chat model.
     pub supports_tools: bool,
 }
+
+/// Result of `completion/stats {}`: per-language outcome counts since the
+/// last learning reset and the adaptive values the engine applies.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionStatsResult {
+    /// Keyed by the log's language name (`python`, `rust`, …, `other`).
+    pub languages: std::collections::BTreeMap<String, CompletionLanguageStats>,
+    /// The outcome log file; `null` before `initialize`.
+    pub log_path: Option<String>,
+    /// The `adaptiveCompletions` setting.
+    pub adaptive: bool,
+}
+
+/// One language of [`CompletionStatsResult`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionLanguageStats {
+    pub served: u64,
+    pub accepted: u64,
+    pub partial: u64,
+    pub rejected: u64,
+    pub typed_through: u64,
+    /// `(accepted + partial) / served`; 0 when nothing was served.
+    pub accept_rate: f64,
+    /// Multi-line cap the policy yields now (the configured 8 with < 10
+    /// outcomes or when adaptive is off).
+    pub learned_max_lines: u32,
+    /// `num_predict` the policy yields now (configured likewise).
+    pub learned_num_predict: u32,
+    /// Style examples the next snippet refresh puts in the prompt (0 when
+    /// adaptive is off).
+    pub examples: u32,
+}
+
+/// `completion/resetLearning` responds `{}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionResetLearningResult {}
 
 /// Notification `ollama/pullProgress`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

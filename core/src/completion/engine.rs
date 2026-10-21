@@ -27,6 +27,14 @@
 //! pushed out by [`PENDING_MEMORY`] newer ones) is appended as `rejected`;
 //! expiry is checked lazily whenever a suggestion is served or an outcome
 //! arrives. Log I/O happens after every engine lock is released.
+//!
+//! **Adaptive limits and style examples.** With `adaptiveCompletions` on and
+//! a log set, every snippet refresh also computes, from the log's in-memory
+//! view of the uri's language, the learned multi-line cap and `num_predict`
+//! ([`Policy::from_outcomes`]) and up to 3 style examples
+//! ([`adaptive::examples`]), and stores them with the snippets. Requests
+//! only read them, so they change exactly when the snippet block does and
+//! the prompt stays byte-stable while typing.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -38,6 +46,7 @@ use futures::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use super::adaptive::{self, Configured, Learned, Policy};
 use super::cache::{self, CompletionCache};
 use super::feedback::{self, FeedbackLog, Outcome as LogOutcome, Record};
 use super::prompt::{self, FimPrompt, WINDOW_BUDGET};
@@ -49,9 +58,13 @@ use crate::ollama::{
     GenerateRequest, OllamaClient, OllamaError, OllamaState, OllamaStatus, Options,
 };
 use crate::overlay::{CursorWindow, DocumentStore, uri_to_path};
-use crate::protocol::{CompletionItem, CompletionRequestParams, CompletionResult, Position, Range};
+use crate::protocol::{
+    CompletionItem, CompletionLanguageStats, CompletionRequestParams, CompletionResult,
+    CompletionStatsResult, Position, Range,
+};
 use crate::rpc::RpcError;
 use crate::settings::Settings;
+use crate::tokens;
 
 /// A uri's snippets are recomputed at request time once they are this old.
 pub const SNIPPET_TTL: Duration = Duration::from_secs(60);
@@ -127,6 +140,10 @@ struct SnippetSlot {
 
 struct SnippetEntry {
     snippets: Arc<Vec<Snippet>>,
+    /// Rendered style examples; they lead the snippet block.
+    examples: Arc<str>,
+    /// Learned limits for the uri's language; `None`: the configured ones.
+    learned: Option<Learned>,
     computed_at: Instant,
 }
 
@@ -167,6 +184,11 @@ pub(crate) struct Prepared {
     pub prompt: FimPrompt,
     pub mode: StopMode,
     pub crlf: bool,
+    /// Line cap in effect: 1 in single-line mode, else the learned (or
+    /// configured) multi-line cap.
+    pub max_lines: u32,
+    /// `num_predict` in effect.
+    pub num_predict: u32,
 }
 
 #[cfg(test)]
@@ -276,10 +298,8 @@ impl CompletionEngine {
                     &prepared.prompt.suffix,
                 ),
                 context_tail: feedback::context_tail(&key.1),
-                max_lines: match prepared.mode {
-                    StopMode::SingleLine => 1,
-                    StopMode::MultiLine => u32::try_from(stop::MAX_LINES).unwrap_or(u32::MAX),
-                },
+                max_lines: prepared.max_lines,
+                num_predict: prepared.num_predict,
             }
         });
 
@@ -336,7 +356,7 @@ impl CompletionEngine {
                 total_ms: ms(started_at.elapsed()),
                 model: Some(settings.completion_model.clone()),
                 max_lines: Some(draft.max_lines),
-                num_predict: Some(settings.completion_max_tokens),
+                num_predict: Some(draft.num_predict),
             };
             self.add_pending(record);
         }
@@ -434,6 +454,80 @@ impl CompletionEngine {
     /// The outcome log, if one is set.
     pub fn feedback_log(&self) -> Option<Arc<FeedbackLog>> {
         lock(&self.inner.feedback).clone()
+    }
+
+    /// `completion/stats`: outcome counts per language since the last
+    /// learning reset, with the limits and example count the policy yields
+    /// now (what the next snippet refresh applies). Waits for queued
+    /// outcomes to be written first.
+    pub async fn stats(&self) -> CompletionStatsResult {
+        let settings = &self.inner.settings;
+        let adaptive = settings.adaptive_completions;
+        let Some(log) = self.feedback_log() else {
+            return CompletionStatsResult {
+                adaptive,
+                ..CompletionStatsResult::default()
+            };
+        };
+        log.flush().await;
+        let configured = configured(settings);
+        let languages = log
+            .stats()
+            .into_iter()
+            .map(|(name, c)| {
+                let (learned, examples) = if adaptive {
+                    let lang = Lang::from_name(&name);
+                    let recent = log.recent(&name, adaptive::WINDOW);
+                    let budget = examples_budget(settings);
+                    (
+                        Policy::from_outcomes(lang, &recent, configured),
+                        adaptive::examples(lang, &recent, budget).len(),
+                    )
+                } else {
+                    (configured.as_learned(), 0)
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let accept_rate = if c.served == 0 {
+                    0.0
+                } else {
+                    (c.accepted + c.partial) as f64 / c.served as f64
+                };
+                let stats = CompletionLanguageStats {
+                    served: c.served,
+                    accepted: c.accepted,
+                    partial: c.partial,
+                    rejected: c.rejected,
+                    typed_through: c.typed_through,
+                    accept_rate,
+                    learned_max_lines: learned.max_lines,
+                    learned_num_predict: learned.num_predict,
+                    examples: u32::try_from(examples).unwrap_or(u32::MAX),
+                };
+                (name, stats)
+            })
+            .collect();
+        CompletionStatsResult {
+            languages,
+            log_path: Some(log.path().to_string_lossy().into_owned()),
+            adaptive,
+        }
+    }
+
+    /// `completion/resetLearning`: forgets what the log taught (the log
+    /// file keeps every record) and drops the learned limits and examples
+    /// of every uri at once. Refreshes already running are discarded so
+    /// they cannot store values computed before the reset.
+    pub fn reset_learning(&self) {
+        if let Some(log) = self.feedback_log() {
+            log.reset_learning();
+        }
+        for slot in lock(&self.inner.snippets_by_uri).values_mut() {
+            slot.refresh = None;
+            if let Some(entry) = slot.entry.as_mut() {
+                entry.examples = Arc::from("");
+                entry.learned = None;
+            }
+        }
     }
 
     /// Queues `record` until its outcome arrives, logging expired ones.
@@ -592,21 +686,20 @@ impl CompletionEngine {
         }
 
         // Serve what is cached, even if stale; refresh in the background.
-        let (snippets, mark) = {
+        let (snippets, examples, learned, mark) = {
             let mut map = lock(&inner.snippets_by_uri);
             let slot = map.entry(uri.to_owned()).or_default();
             let fresh = slot
                 .entry
                 .as_ref()
                 .is_some_and(|e| e.computed_at.elapsed() <= SNIPPET_TTL);
-            let snippets = slot
-                .entry
-                .as_ref()
-                .map(|e| e.snippets.clone())
-                .unwrap_or_default();
+            let entry = slot.entry.as_ref();
+            let snippets = entry.map(|e| e.snippets.clone()).unwrap_or_default();
+            let examples = entry.map_or_else(|| Arc::from(""), |e| e.examples.clone());
+            let learned = entry.and_then(|e| e.learned);
             // Claimed under the same lock as the check: one refresh per uri.
             let mark = (!fresh && slot.refresh.is_none()).then(|| claim_refresh(inner, slot, uri));
-            (snippets, mark)
+            (snippets, examples, learned, mark)
         };
         if let Some(mark) = mark {
             let budget = prompt::snippet_budget(settings);
@@ -614,14 +707,32 @@ impl CompletionEngine {
         }
 
         let lang = Lang::from_path(&uri_to_path(uri));
-        let prompt = prompt::build(&snippets, &window.prefix, &window.suffix, lang, settings);
+        let (examples, learned) = if settings.adaptive_completions {
+            (&*examples, learned)
+        } else {
+            ("", None)
+        };
+        let prompt = prompt::build(
+            examples,
+            &snippets,
+            &window.prefix,
+            &window.suffix,
+            lang,
+            settings,
+        );
         let mode = stop::mode_for(&window.prefix, &prompt.suffix);
+        let limits = learned.unwrap_or_else(|| configured(settings).as_learned());
         let key = (uri.to_owned(), window.prefix, prompt.suffix.clone());
         Some(Prepared {
             key,
             prompt,
             mode,
             crlf: window.crlf,
+            max_lines: match mode {
+                StopMode::SingleLine => 1,
+                StopMode::MultiLine => limits.max_lines,
+            },
+            num_predict: limits.num_predict,
         })
     }
 }
@@ -668,7 +779,12 @@ impl Drop for RefreshMark {
 /// cursor (off the async threads: it reads files) and stores them if this
 /// refresh is still the newest for a uri that was not invalidated meanwhile.
 /// A failed computation keeps the previous snippets.
+///
+/// The adaptive values (learned limits and style examples) are computed here
+/// too, from the log's memory; examples take their tokens out of `budget`.
 async fn refresh(mark: RefreshMark, around: String, budget: usize) {
+    let (examples, learned) = adaptive_view(&mark.inner, &mark.uri, budget);
+    let budget = budget.saturating_sub(tokens::estimate(&examples));
     let task_inner = mark.inner.clone();
     let task_uri = mark.uri.clone();
     let computed = tokio::task::spawn_blocking(move || {
@@ -685,9 +801,42 @@ async fn refresh(mark: RefreshMark, around: String, budget: usize) {
         slot.refresh = None;
         slot.entry = Some(SnippetEntry {
             snippets: Arc::new(snippets),
+            examples: Arc::from(examples),
+            learned,
             computed_at: Instant::now(),
         });
     }
+}
+
+/// The rendered style examples and learned limits for `uri`'s language
+/// (`""`, `None` with adaptive completions off or no log). Memory only.
+fn adaptive_view(inner: &Inner, uri: &str, budget: usize) -> (String, Option<Learned>) {
+    let settings = &inner.settings;
+    if !settings.adaptive_completions {
+        return (String::new(), None);
+    }
+    let Some(log) = lock(&inner.feedback).clone() else {
+        return (String::new(), None);
+    };
+    let lang = Lang::from_path(&uri_to_path(uri));
+    let recent = log.recent(lang.as_str(), adaptive::WINDOW);
+    let learned = Policy::from_outcomes(lang, &recent, configured(settings));
+    let examples = adaptive::examples(lang, &recent, budget.min(examples_budget(settings)));
+    (adaptive::render_examples(lang, &examples), Some(learned))
+}
+
+/// The user's limits, as the adaptive policy starts from them.
+fn configured(settings: &Settings) -> Configured {
+    Configured {
+        max_tokens: settings.completion_max_tokens,
+        max_lines: u32::try_from(stop::MAX_LINES).unwrap_or(u32::MAX),
+    }
+}
+
+/// Token budget of the style examples: at most 300, never more than the
+/// snippet block's budget.
+fn examples_budget(settings: &Settings) -> usize {
+    prompt::snippet_budget(settings).min(adaptive::EXAMPLES_TOKENS)
 }
 
 fn compute_snippets(inner: &Inner, uri: &str, window: &str, budget: usize) -> Vec<Snippet> {
@@ -780,7 +929,7 @@ fn join_or_start(
         raw: false,
         stream: true,
         options: Options {
-            num_predict: settings.completion_max_tokens,
+            num_predict: prepared.num_predict,
             temperature: 0.0,
             stop: Vec::new(),
             num_ctx: None,
@@ -788,7 +937,8 @@ fn join_or_start(
         keep_alive: Some(settings.keep_alive.clone()),
     };
     let trimmer = Trimmer::new(prepared.mode, &request.suffix.clone().unwrap_or_default())
-        .with_crlf(prepared.crlf);
+        .with_crlf(prepared.crlf)
+        .with_max_lines(usize::try_from(prepared.max_lines).unwrap_or(stop::MAX_LINES));
     let task_inner = inner.clone();
     let key = prepared.key.clone();
     tokio::spawn(async move {
@@ -939,6 +1089,7 @@ struct Draft {
     prompt_hash: String,
     context_tail: String,
     max_lines: u32,
+    num_predict: u32,
 }
 
 /// `acceptedText` as logged: only for `accepted` / `partial`, and at most as
@@ -1002,6 +1153,10 @@ mod tests {
     }
 
     fn fixture(main: &str) -> Fixture {
+        fixture_with(main, |_| {})
+    }
+
+    fn fixture_with(main: &str, tweak: impl FnOnce(&mut Settings)) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root: PathBuf = dir.path().canonicalize().unwrap();
         std::fs::write(root.join("util.py"), UTIL).unwrap();
@@ -1012,7 +1167,9 @@ mod tests {
         let store = Arc::new(RwLock::new(store));
         let index = Arc::new(RwLock::new(WorkspaceIndex::build(&root)));
         let ollama = OllamaClient::new("http://127.0.0.1:9".to_owned(), "30m".to_owned());
-        let engine = CompletionEngine::new(ollama, store.clone(), index, Settings::default());
+        let mut settings = Settings::default();
+        tweak(&mut settings);
+        let engine = CompletionEngine::new(ollama, store.clone(), index, settings);
         Fixture {
             engine,
             store,
@@ -1402,6 +1559,238 @@ mod tests {
         serve_cached(&f, "r1", AT).await;
         f.engine.on_accepted("r1");
         assert!(!f._dir.path().join(".localpilot").exists());
+    }
+
+    /// A logged python outcome as the adaptive policy sees it.
+    fn outcome_record(id: &str, suggestion: &str, outcome: LogOutcome) -> Record {
+        Record {
+            ts: feedback::now_ms(),
+            request_id: id.to_owned(),
+            lang: "python".to_owned(),
+            ext: Some("py".to_owned()),
+            prompt_hash: "0".repeat(16),
+            context_tail: format!("# ctx {id}"),
+            suggestion: suggestion.to_owned(),
+            lines: feedback::line_count(suggestion),
+            outcome,
+            accepted_text: None,
+            ttft_ms: None,
+            total_ms: 1,
+            model: None,
+            max_lines: Some(8),
+            num_predict: Some(32),
+        }
+    }
+
+    /// 20 rejected 6-line suggestions and 10 accepted 2-line ones: the
+    /// policy learns a 4-line cap and 16 tokens, with 3 examples.
+    async fn seed_learning(log: &FeedbackLog) {
+        let long = "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6";
+        for i in 0..20 {
+            log.submit(outcome_record(
+                &format!("long{i}"),
+                long,
+                LogOutcome::Rejected,
+            ));
+        }
+        for i in 0..10 {
+            let two = format!("ex{i} = 1\nex{i} += 1");
+            log.submit(outcome_record(
+                &format!("two{i}"),
+                &two,
+                LogOutcome::Accepted,
+            ));
+        }
+        log.flush().await;
+    }
+
+    const LEARNED: adaptive::Learned = adaptive::Learned {
+        max_lines: 4,
+        num_predict: adaptive::MIN_NUM_PREDICT,
+    };
+
+    #[tokio::test]
+    async fn prompt_with_examples_is_byte_stable_across_keystrokes() {
+        let f = fixture(MAIN);
+        let log = workspace_log(&f);
+        seed_learning(&log).await;
+        f.engine.refresh_snippets(&f.uri).await;
+
+        let at = |character| Position { line: 3, character };
+        let first = f.engine.prepare(&f.uri, at(11)).await.unwrap();
+        let block = first.snippet_block().to_owned();
+        assert!(
+            block.starts_with("# Example\n# ctx two9\nex9 = 1\nex9 += 1\n\n"),
+            "{block:?}"
+        );
+        assert_eq!(block.matches("# Example\n").count(), 3);
+        assert!(block.contains("# Path: util.py\n"), "snippets still follow");
+        assert!(tokens::estimate(&block) <= prompt::snippet_budget(&Settings::default()));
+        assert_eq!(
+            (first.max_lines, first.num_predict),
+            (LEARNED.max_lines, LEARNED.num_predict)
+        );
+
+        // New outcomes arrive between keystrokes (a fresh accepted example
+        // and a served-and-accepted suggestion): the prompt only grows by
+        // the typed character.
+        log.submit(outcome_record(
+            "fresh",
+            "NEW = 1\nNEW += 1",
+            LogOutcome::Accepted,
+        ));
+        log.flush().await;
+        let mut prev = first;
+        for n in 0..5u32 {
+            type_char(&f, at(11 + n), 2 + n as i32);
+            let next = f.engine.prepare(&f.uri, at(12 + n)).await.unwrap();
+            assert_eq!(next.prompt.prompt, format!("{}t", prev.prompt.prompt));
+            assert_eq!(next.snippet_block(), block);
+            prev = next;
+        }
+        assert_eq!(f.engine.snippet_refresh_count(), 1);
+
+        // Only a snippet refresh picks up the new example.
+        f.engine.refresh_snippets(&f.uri).await;
+        let after = f.engine.prepare(&f.uri, at(16)).await.unwrap();
+        assert!(
+            after
+                .snippet_block()
+                .starts_with("# Example\n# ctx fresh\nNEW = 1\n")
+        );
+        assert_ne!(after.snippet_block(), block);
+    }
+
+    #[tokio::test]
+    async fn adaptive_off_ignores_learned_but_still_logs() {
+        for adaptive in [true, false] {
+            let f = fixture_with(MAIN, |s| s.adaptive_completions = adaptive);
+            let log = workspace_log(&f);
+            seed_learning(&log).await;
+            f.engine.refresh_snippets(&f.uri).await;
+            let p = f.engine.prepare(&f.uri, AT).await.unwrap();
+            let configured = (8, Settings::default().completion_max_tokens);
+            let want = if adaptive {
+                (LEARNED.max_lines, LEARNED.num_predict)
+            } else {
+                configured
+            };
+            assert_eq!((p.max_lines, p.num_predict), want, "adaptive {adaptive}");
+            assert_eq!(p.snippet_block().contains("# Example"), adaptive);
+            assert!(p.snippet_block().contains("# Path: util.py"));
+
+            // Logged either way, with the limits that were in effect.
+            serve_cached(&f, "r1", AT).await;
+            f.engine.on_outcome("r1", LogOutcome::Accepted, None);
+            log.flush().await;
+            let last = log.records().pop().unwrap();
+            assert_eq!(last.request_id, "r1");
+            assert_eq!(
+                (last.max_lines, last.num_predict),
+                (Some(want.0), Some(want.1))
+            );
+
+            let stats = f.engine.stats().await;
+            assert_eq!(stats.adaptive, adaptive);
+            let py = &stats.languages["python"];
+            assert_eq!(py.served, 31);
+            assert_eq!(
+                (py.learned_max_lines, py.learned_num_predict, py.examples),
+                if adaptive { (4, 16, 3) } else { (8, 32, 0) }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_line_mode_keeps_one_line_and_logs_it() {
+        let f = fixture("x = foo()\n");
+        let log = workspace_log(&f);
+        seed_learning(&log).await;
+        f.engine.refresh_snippets(&f.uri).await;
+        // Inside `()`: code follows the cursor on its line.
+        let p = f
+            .engine
+            .prepare(
+                &f.uri,
+                Position {
+                    line: 0,
+                    character: 8,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.mode, StopMode::SingleLine);
+        assert_eq!((p.max_lines, p.num_predict), (1, LEARNED.num_predict));
+    }
+
+    #[tokio::test]
+    async fn stats_and_reset_roundtrip() {
+        let f = fixture(MAIN);
+        // No log: nothing to report.
+        let empty = f.engine.stats().await;
+        assert!(empty.languages.is_empty() && empty.log_path.is_none() && empty.adaptive);
+
+        let log = workspace_log(&f);
+        seed_learning(&log).await;
+        let mut rust = outcome_record("rs", "x", LogOutcome::Partial);
+        rust.lang = "rust".to_owned();
+        rust.accepted_text = Some("x".to_owned());
+        log.submit(rust);
+        f.engine.refresh_snippets(&f.uri).await;
+        serve_cached(&f, "r1", AT).await;
+        // `stats` waits for outcomes still queued for the writer.
+        f.engine.on_outcome("r1", LogOutcome::TypedThrough, None);
+
+        let stats = f.engine.stats().await;
+        assert_eq!(
+            stats.log_path.as_deref(),
+            Some(log.path().to_string_lossy().as_ref())
+        );
+        let py = &stats.languages["python"];
+        assert_eq!(
+            (
+                py.served,
+                py.accepted,
+                py.partial,
+                py.rejected,
+                py.typed_through
+            ),
+            (31, 10, 0, 20, 1)
+        );
+        assert!((py.accept_rate - 10.0 / 31.0).abs() < 1e-9);
+        assert_eq!(
+            (py.learned_max_lines, py.learned_num_predict, py.examples),
+            (4, 16, 3)
+        );
+        let rs = &stats.languages["rust"];
+        assert_eq!((rs.served, rs.partial), (1, 1));
+        assert!((rs.accept_rate - 1.0).abs() < 1e-9);
+        assert_eq!(
+            (rs.learned_max_lines, rs.learned_num_predict, rs.examples),
+            (8, 32, 0)
+        );
+        let wire = serde_json::to_value(&stats).unwrap();
+        assert_eq!(wire["languages"]["python"]["typedThrough"], 1);
+        assert_eq!(wire["languages"]["python"]["learnedMaxLines"], 4);
+        assert_eq!(wire["languages"]["python"]["learnedNumPredict"], 16);
+        assert_eq!(wire["languages"]["python"]["examples"], 3);
+        assert!(wire["languages"]["python"]["acceptRate"].is_f64());
+        assert!(wire["logPath"].is_string());
+        assert_eq!(wire["adaptive"], true);
+
+        // Reset: the learning view and the engine's learned cache are
+        // cleared at once; the log file keeps every record.
+        f.engine.reset_learning();
+        let p = f.engine.prepare(&f.uri, AT).await.unwrap();
+        assert!(!p.snippet_block().contains("# Example"));
+        assert_eq!((p.max_lines, p.num_predict), (8, 32));
+        let stats = f.engine.stats().await;
+        assert!(stats.languages.is_empty(), "{:?}", stats.languages);
+        assert_eq!(log.records().len(), 32);
+        f.engine.refresh_snippets(&f.uri).await;
+        let p = f.engine.prepare(&f.uri, AT).await.unwrap();
+        assert!(!p.snippet_block().contains("# Example"));
+        assert_eq!((p.max_lines, p.num_predict), (8, 32));
     }
 
     #[tokio::test]

@@ -32,7 +32,8 @@ pub fn mode_for(_prefix: &str, suffix: &str) -> StopMode {
 ///
 /// Rules (applied to complete lines only):
 /// - `SingleLine`: stop at the first `\n`.
-/// - `MultiLine`: stop after [`MAX_LINES`] lines; before a blank line that
+/// - `MultiLine`: stop after [`MAX_LINES`] lines (or the cap set with
+///   [`with_max_lines`](Trimmer::with_max_lines)); before a blank line that
 ///   follows non-blank content whose brackets (`{([` vs `})]`) are balanced
 ///   (or over-closed) relative to the completion start; or before a line
 ///   equal (trimmed) to the first non-empty line of the suffix.
@@ -45,6 +46,8 @@ pub struct Trimmer {
     crlf: bool,
     /// First non-empty suffix line, trimmed; `None` if the suffix is blank.
     suffix_line: Option<String>,
+    /// Multi-line cap, at least 1.
+    max_lines: usize,
     /// Normalized (`\r`-free) text received so far.
     buf: String,
     /// Byte offset in `buf` where the current, incomplete line starts.
@@ -70,6 +73,7 @@ impl Trimmer {
             mode,
             crlf: suffix.contains("\r\n"),
             suffix_line,
+            max_lines: MAX_LINES,
             buf: String::new(),
             line_start: 0,
             lines: 0,
@@ -82,6 +86,13 @@ impl Trimmer {
     /// Overrides the line-ending style of the output.
     pub fn with_crlf(mut self, crlf: bool) -> Self {
         self.crlf = crlf;
+        self
+    }
+
+    /// Overrides the multi-line cap (the adaptive policy's learned value);
+    /// clamped to `[1, MAX_LINES]`.
+    pub fn with_max_lines(mut self, max_lines: usize) -> Self {
+        self.max_lines = max_lines.clamp(1, MAX_LINES);
         self
     }
 
@@ -136,7 +147,7 @@ impl Trimmer {
         self.seen_content |= !blank;
         self.lines += 1;
         self.line_start = end + 1;
-        (self.lines >= MAX_LINES).then_some(end)
+        (self.lines >= self.max_lines).then_some(end)
     }
 
     fn duplicates_suffix(&self, line: &str) -> bool {
@@ -209,6 +220,13 @@ mod tests {
         assert!(stopped);
         assert_eq!(text.lines().count(), MAX_LINES);
         assert_eq!(text.lines().last(), Some("x7 = 7"));
+
+        // A learned cap stops earlier; it is clamped to [1, 8].
+        for (cap, want) in [(3, 3), (1, 1), (0, 1), (20, MAX_LINES)] {
+            let mut t = Trimmer::new(StopMode::MultiLine, "").with_max_lines(cap);
+            let done = deltas.iter().find_map(|d| t.push(d)).expect("stops");
+            assert_eq!(done.lines().count(), want, "cap {cap}");
+        }
     }
 
     #[test]

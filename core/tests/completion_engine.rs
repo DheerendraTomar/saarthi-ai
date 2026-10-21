@@ -583,3 +583,71 @@ async fn served_suggestion_logged_on_outcome_with_bounded_context_tail() {
     assert_eq!(hit.ttft_ms, None);
     assert_eq!(hit.accepted_text, None);
 }
+
+/// A python outcome record for seeding the learning view.
+fn seed(id: &str, suggestion: &str, outcome: Outcome) -> feedback::Record {
+    feedback::Record {
+        ts: feedback::now_ms(),
+        request_id: id.to_owned(),
+        lang: "python".to_owned(),
+        ext: Some("py".to_owned()),
+        prompt_hash: "0".repeat(16),
+        context_tail: format!("# ctx {id}"),
+        suggestion: suggestion.to_owned(),
+        lines: feedback::line_count(suggestion),
+        outcome,
+        accepted_text: None,
+        ttft_ms: None,
+        total_ms: 1,
+        model: None,
+        max_lines: Some(8),
+        num_predict: Some(32),
+    }
+}
+
+#[tokio::test]
+async fn learned_limits_reach_the_model_request() {
+    // The model streams a 6-line block; the learned cap is 4 lines.
+    let block: Vec<String> = (0..6).map(|i| format!("v{i} = {i}\n    ")).collect();
+    let mut chunks: Vec<Value> = block.iter().map(|l| generate_chunk(l)).collect();
+    chunks.push(generate_done());
+    let env = setup(Script {
+        generate: vec![chunks],
+        ..Script::default()
+    })
+    .await;
+    let log = Arc::new(FeedbackLog::for_workspace(&env.root));
+    env.engine.set_feedback_log(log.clone());
+    for i in 0..20 {
+        log.submit(seed(
+            &format!("long{i}"),
+            "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6",
+            Outcome::Rejected,
+        ));
+    }
+    for i in 0..10 {
+        log.submit(seed(
+            &format!("two{i}"),
+            &format!("ex{i} = 1\nex{i} += 1"),
+            Outcome::Accepted,
+        ));
+    }
+    log.flush().await;
+    env.engine.refresh_snippets(&env.uri).await;
+
+    let result = complete(&env, "r1", CURSOR).await;
+    let text = texts(&result)[0];
+    assert_eq!(text.lines().count(), 4, "{text:?}");
+    let body = &generate_bodies(&env.mock)[0];
+    assert_eq!(body["options"]["num_predict"], 16, "{body}");
+    let prompt = body["prompt"].as_str().unwrap();
+    assert!(
+        prompt.starts_with("# Example\n# ctx two9\nex9 = 1\nex9 += 1\n\n"),
+        "{prompt:?}"
+    );
+
+    env.engine.on_outcome("r1", Outcome::Accepted, None);
+    log.flush().await;
+    let record = log.records().pop().unwrap();
+    assert_eq!((record.max_lines, record.num_predict), (Some(4), Some(16)));
+}

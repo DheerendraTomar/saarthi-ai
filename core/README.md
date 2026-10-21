@@ -120,6 +120,48 @@ Additions beyond the spec:
   request path. The file is rotated past 10 000 lines, keeping the newest
   5 000. Resetting learning writes `completions.meta.json`
   (`{ "learningResetAt": ms }`); the log itself is never truncated.
+- **`completion/stats {}`** → `{ languages: { [lang]: { served, accepted,
+  partial, rejected, typedThrough, acceptRate, learnedMaxLines,
+  learnedNumPredict, examples } }, logPath, adaptive }`: outcome counts per
+  language since the last learning reset (written outcomes only; the call
+  waits for queued ones). `acceptRate` = `(accepted + partial) / served`.
+  `learnedMaxLines` / `learnedNumPredict` / `examples` (a count) are what
+  the policy yields now, i.e. what the next snippet refresh applies (the
+  configured `8` / `completionMaxTokens` / `0` with too few outcomes or when
+  `adaptive` is `false`). `logPath` is `null` before `initialize`.
+- **`completion/resetLearning {}`** → `{}`: forgets everything learned (counts,
+  learned limits, examples — at once, for every open file) and records the
+  reset in `completions.meta.json`; the log file keeps every record.
+- **Adaptive completions** (setting **`adaptiveCompletions`**, default `true`).
+  From the newest 50 logged outcomes of the file's language, the engine picks
+  the multi-line cap and `num_predict`:
+  - Records served with `maxLines` 1 (single-line mode, or while a learned
+    cap of 1 was in effect) are left out: they say nothing about multi-line
+    length. Fewer than 10 left → the configured values (cap 8,
+    `completionMaxTokens`). This also means a learned cap of 1 is revisited
+    once ~40 newer one-line records push the older ones out of the 50.
+  - Suggestions are bucketed by lines (1 / 2–4 / 5–8, longer → 5–8); each
+    bucket with ≥ 3 records is scored by accepted characters per served
+    suggestion (`accepted`: the suggestion, `partial`: `acceptedText`,
+    `rejected` / `typedThrough`: 0). The best bucket wins (ties → shorter);
+    if no bucket scores above 0 (mostly rejections), the 1-line bucket wins.
+  - Cap = the bucket's upper bound (1, 4 or 8), applied in multi-line mode
+    only (single-line mode always stops at the line end). `num_predict` =
+    1.5 × the longest accepted text of the bucket in tokens, bounded to
+    [16, 2 × `completionMaxTokens`] (16 when nothing was accepted; never 0).
+  - **Style examples:** up to 3 of the most recent `accepted` suggestions of
+    the same language with ≥ 2 lines, newest first, each as
+    `<comment> Example\n<contextTail>\n<suggestion>\n\n` (the language's
+    line comment), ≤ 300 tokens together. They lead the snippet block and
+    take their tokens out of the snippet budget (768 by default), so the
+    prompt stays within `completionContextTokens`.
+  - Learned limits and examples are computed only when a file's snippet block
+    is refreshed (open, save, watcher change, or 60 s old) and stored with it;
+    requests only read them, so the prompt stays byte-identical while typing
+    and Ollama's KV cache keeps working. `maxLines` / `numPredict` in each log
+    record are the values that were in effect.
+  - `adaptiveCompletions: false`: configured limits and no examples; outcomes
+    are still logged.
 - **One Ollama status shape everywhere: `{ ollama, detail }`**, with
   `ollama` one of `"ok" | "down" | "modelMissing"`. It is
   `InitializeResult.ollamaStatus`, the `ollama/status` result and the params

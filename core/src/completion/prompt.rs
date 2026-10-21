@@ -54,16 +54,20 @@ pub fn line_comment(lang: Lang) -> &'static str {
 }
 
 /// Builds the FIM prompt for a document in language `lang`. `prompt` is the
-/// snippet block — each snippet as `<comment> Path: <path>\n<text>\n\n`
-/// with `lang`'s line comment, in the given order, stopping before a snippet
-/// that would exceed [`snippet_budget`] — followed by the tail of `prefix`;
-/// `suffix` is `take_first(suffix, 512)`.
+/// stable block — `examples` (the adaptive policy's style examples, already
+/// rendered; `""` for none) and then each snippet as
+/// `<comment> Path: <path>\n<text>\n\n` with `lang`'s line comment, in the
+/// given order, stopping before a snippet that would push the block past
+/// [`snippet_budget`] — followed by the tail of `prefix`; `suffix` is
+/// `take_first(suffix, 512)`. Examples take their tokens out of the snippet
+/// budget, so the whole prompt stays within `completion_context_tokens`.
 ///
 /// A prefix within `PREFIX_TOKENS + PREFIX_SLACK_TOKENS` is kept whole (the
 /// engine passes the store's stable, line-aligned window); a longer one is
-/// cut back to `PREFIX_TOKENS` at a line boundary. The snippet block is a
-/// pure function of `snippets`, `lang` and `settings`.
+/// cut back to `PREFIX_TOKENS` at a line boundary. The stable block is a
+/// pure function of `examples`, `snippets`, `lang` and `settings`.
 pub fn build(
+    examples: &str,
     snippets: &[Snippet],
     prefix: &str,
     suffix: &str,
@@ -72,8 +76,10 @@ pub fn build(
 ) -> FimPrompt {
     let start = tokens::stable_tail_start(prefix, PREFIX_TOKENS, PREFIX_SLACK_TOKENS, Some(0));
     let prefix = &prefix[start..];
-    let block = snippet_block(snippets, lang, snippet_budget(settings));
-    let mut prompt = String::with_capacity(block.len() + prefix.len());
+    let budget = snippet_budget(settings).saturating_sub(tokens::estimate(examples));
+    let block = snippet_block(snippets, lang, budget);
+    let mut prompt = String::with_capacity(examples.len() + block.len() + prefix.len());
+    prompt.push_str(examples);
     prompt.push_str(&block);
     prompt.push_str(prefix);
     FimPrompt {
@@ -120,8 +126,8 @@ mod tests {
     #[test]
     fn prompt_prefix_is_byte_stable() {
         let settings = Settings::default();
-        let a = build(&sample(), "x = helper(", ")\n", Lang::Python, &settings);
-        let b = build(&sample(), "x = helper(", ")\n", Lang::Python, &settings);
+        let a = build("", &sample(), "x = helper(", ")\n", Lang::Python, &settings);
+        let b = build("", &sample(), "x = helper(", ")\n", Lang::Python, &settings);
         assert_eq!(a, b);
         let block = "# Path: lib/util.py\ndef helper():\n    return 1\n\n\
                      # Path: web/app.ts\nexport function run() {}\n\n";
@@ -129,13 +135,37 @@ mod tests {
         assert_eq!(a.suffix, ")\n");
 
         // Only the prefix tail changes when the user types.
-        let c = build(&sample(), "x = helper(a", ")\n", Lang::Python, &settings);
+        let c = build(
+            "",
+            &sample(),
+            "x = helper(a",
+            ")\n",
+            Lang::Python,
+            &settings,
+        );
         assert!(c.prompt.starts_with(&a.prompt));
     }
 
     #[test]
+    fn examples_lead_the_block_and_take_from_the_snippet_budget() {
+        let settings = Settings {
+            completion_context_tokens: PREFIX_TOKENS + PREFIX_SLACK_TOKENS + SUFFIX_TOKENS + 30,
+            ..Settings::default()
+        };
+        let examples = "# Example\ndef f():\n    return 1\n\n";
+        let p = build(examples, &sample(), "x = ", "", Lang::Python, &settings);
+        // 30 tokens: both snippets (~19) fit alone, not after the examples (~9).
+        let alone = build("", &sample(), "x = ", "", Lang::Python, &settings);
+        assert!(alone.prompt.contains("web/app.ts"));
+        assert_eq!(
+            p.prompt,
+            format!("{examples}# Path: lib/util.py\ndef helper():\n    return 1\n\nx = ")
+        );
+    }
+
+    #[test]
     fn header_comment_follows_the_current_document_language() {
-        let p = build(&sample(), "", "", Lang::Rust, &Settings::default());
+        let p = build("", &sample(), "", "", Lang::Rust, &Settings::default());
         assert!(p.prompt.starts_with("// Path: lib/util.py\n"));
         assert!(p.prompt.contains("// Path: web/app.ts\n"));
     }
@@ -146,7 +176,7 @@ mod tests {
         let line = format!("{}\n", "p".repeat(99));
         let prefix = line.repeat((PREFIX_TOKENS + PREFIX_SLACK_TOKENS) * 4 / 100 + 5);
         let suffix = "s".repeat(SUFFIX_TOKENS * 4 + 100);
-        let p = build(&[], &prefix, &suffix, Lang::Python, &settings);
+        let p = build("", &[], &prefix, &suffix, Lang::Python, &settings);
         assert!(p.prompt.len() <= PREFIX_TOKENS * 4);
         assert!(prefix.ends_with(&p.prompt));
         assert!(
@@ -157,7 +187,7 @@ mod tests {
         // A window within budget + slack is kept whole.
         let window = &prefix[prefix.len() - (PREFIX_TOKENS + 100) * 4..];
         assert_eq!(
-            build(&[], window, "", Lang::Python, &settings).prompt,
+            build("", &[], window, "", Lang::Python, &settings).prompt,
             window
         );
     }

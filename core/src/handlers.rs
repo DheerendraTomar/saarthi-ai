@@ -36,10 +36,10 @@ use crate::protocol::{
     Capabilities, ChatApproveParams, ChatDeleteSessionParams, ChatDone, ChatHistoryParams,
     ChatListSessionsResult, ChatNewSessionResult, ChatSendParams, ChatSendResult, ChatStopParams,
     CompletionAcceptedParams, CompletionCancelParams, CompletionOutcomeParams,
-    CompletionRejectedParams, CompletionRequestParams, DidChangeParams, DidCloseParams,
-    DidOpenParams, DidSaveParams, IndexReady, IndexStatus, InitializeParams, InitializeResult,
-    OllamaModelsResult, OllamaPullParams, OllamaPullProgress, OllamaPullResult, StopReason,
-    methods,
+    CompletionRejectedParams, CompletionRequestParams, CompletionResetLearningResult,
+    DidChangeParams, DidCloseParams, DidOpenParams, DidSaveParams, IndexReady, IndexStatus,
+    InitializeParams, InitializeResult, OllamaModelsResult, OllamaPullParams, OllamaPullProgress,
+    OllamaPullResult, StopReason, methods,
 };
 use crate::rpc::{Ctx, Handler, RpcError};
 use crate::settings::Settings;
@@ -379,6 +379,15 @@ impl AppHandler {
                 pull(&state, params.model, &ctx).await?;
                 state.refresh_status(&ctx).await;
                 Ok(to_json(OllamaPullResult {}))
+            }
+            methods::COMPLETION_STATS => {
+                parse::<Value>(params)?;
+                Ok(to_json(state.completion.stats().await))
+            }
+            methods::COMPLETION_RESET_LEARNING => {
+                parse::<Value>(params)?;
+                state.completion.reset_learning();
+                Ok(to_json(CompletionResetLearningResult {}))
             }
             methods::BENCH_RUN => Err(RpcError::method_not_found(
                 "bench/run (not available in this build)",

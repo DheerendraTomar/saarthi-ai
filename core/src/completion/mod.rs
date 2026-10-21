@@ -1,6 +1,7 @@
 //! Inline (ghost-text) completions: prompt assembly, caching, stop rules and
 //! the engine that drives the fill-in-the-middle model through Ollama.
 
+pub mod adaptive;
 pub mod cache;
 pub mod engine;
 pub mod feedback;

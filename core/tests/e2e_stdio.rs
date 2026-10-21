@@ -812,3 +812,65 @@ async fn shutdown_logs_unanswered_suggestions_as_rejected() {
     assert_eq!(records[0]["requestId"], "r1");
     assert_eq!(records[0]["outcome"], "rejected");
 }
+
+#[tokio::test]
+async fn completion_stats_over_stdio() {
+    let mock = MockOllama::start(Script {
+        models: vec!["coder".to_owned(), "chat".to_owned()],
+        generate: vec![vec![
+            generate_chunk("a"),
+            generate_chunk(" + b"),
+            generate_done(),
+        ]],
+        ..Script::default()
+    })
+    .await;
+    let ws = Workspace::new();
+    let mut core = Core::spawn(&ws.root);
+    initialize(&mut core, &ws, &mock).await;
+    open_main(&mut core, &ws).await;
+    for id in ["r1", "r2", "r3"] {
+        core.call("completion/request", complete_params(&ws, id))
+            .await;
+    }
+    core.notify("completion/accepted", json!({"requestId": "r1"}))
+        .await;
+    core.notify(
+        "completion/outcome",
+        json!({"requestId": "r2", "outcome": "partial", "acceptedText": "a"}),
+    )
+    .await;
+    core.notify("completion/rejected", json!({"requestId": "r3"}))
+        .await;
+
+    // Sent right after the notifications: stats still sees all three.
+    let stats = core.call("completion/stats", json!({})).await;
+    assert_eq!(stats["adaptive"], true, "{stats}");
+    let log = stats["logPath"].as_str().unwrap();
+    assert!(
+        log.ends_with(".localpilot/completions.jsonl"),
+        "logPath {log}"
+    );
+    let py = &stats["languages"]["python"];
+    assert_eq!(py["served"], 3, "{stats}");
+    assert_eq!(py["accepted"], 1);
+    assert_eq!(py["partial"], 1);
+    assert_eq!(py["rejected"], 1);
+    assert_eq!(py["typedThrough"], 0);
+    assert!((py["acceptRate"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-9);
+    // Fewer than 10 outcomes: the configured limits; one-line: no examples.
+    assert_eq!(py["learnedMaxLines"], 8);
+    assert_eq!(py["learnedNumPredict"], 32);
+    assert_eq!(py["examples"], 0);
+
+    let reset = core.call("completion/resetLearning", json!({})).await;
+    assert_eq!(reset, json!({}));
+    let stats = core.call("completion/stats", json!({})).await;
+    assert_eq!(stats["languages"], json!({}), "{stats}");
+    // The log itself is kept.
+    let raw = std::fs::read_to_string(ws.root.join(".localpilot/completions.jsonl")).unwrap();
+    assert_eq!(raw.lines().count(), 3);
+    assert!(ws.root.join(".localpilot/completions.meta.json").exists());
+
+    core.shutdown().await;
+}

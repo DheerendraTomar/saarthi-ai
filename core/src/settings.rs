@@ -38,6 +38,10 @@ pub struct Settings {
     pub chat_context_tokens: usize,
     /// `keep_alive` sent with every Ollama request so models stay resident.
     pub keep_alive: String,
+    /// Learn suggestion length and style examples from the outcome log.
+    /// Off: the configured limits are used and no examples are added, but
+    /// outcomes are still logged.
+    pub adaptive_completions: bool,
 }
 
 impl Default for Settings {
@@ -55,6 +59,7 @@ impl Default for Settings {
             completion_context_tokens: 3584,
             chat_context_tokens: 24000,
             keep_alive: "30m".to_string(),
+            adaptive_completions: true,
         }
     }
 }
@@ -78,6 +83,7 @@ mod tests {
         assert_eq!(s.completion_context_tokens, 3584);
         assert_eq!(s.chat_context_tokens, 24000);
         assert_eq!(s.keep_alive, "30m");
+        assert!(s.adaptive_completions);
         assert_eq!(s, Settings::default());
     }
 
@@ -85,7 +91,8 @@ mod tests {
     fn settings_accept_camel_case() {
         let s: Settings = serde_json::from_str(
             r#"{"ollamaUrl":"http://x:1","chatThinking":"on","completionDebounceMs":50,
-                "allowedCommandsAlways":["cargo test"],"coreBinaryPath":"/bin/x"}"#,
+                "allowedCommandsAlways":["cargo test"],"coreBinaryPath":"/bin/x",
+                "adaptiveCompletions":false}"#,
         )
         .unwrap();
         assert_eq!(s.ollama_url, "http://x:1");
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(s.completion_debounce_ms, 50);
         assert_eq!(s.allowed_commands_always, vec!["cargo test".to_string()]);
         assert_eq!(s.core_binary_path.as_deref(), Some("/bin/x"));
+        assert!(!s.adaptive_completions);
         // Unspecified fields keep their defaults.
         assert_eq!(s.chat_model, "qwen3.8:27b-mlx");
 
@@ -101,5 +109,6 @@ mod tests {
         assert_eq!(v["chatThinking"], "on");
         assert_eq!(v["completionContextTokens"], 3584);
         assert_eq!(v["keepAlive"], "30m");
+        assert_eq!(v["adaptiveCompletions"], false);
     }
 }

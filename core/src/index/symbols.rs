@@ -66,6 +66,22 @@ impl Lang {
             Lang::Other => "other",
         }
     }
+
+    /// Inverse of [`as_str`](Self::as_str); unknown names are `Other`.
+    pub fn from_name(name: &str) -> Lang {
+        [
+            Lang::Python,
+            Lang::JavaScript,
+            Lang::TypeScript,
+            Lang::Rust,
+            Lang::Go,
+            Lang::Java,
+            Lang::Kotlin,
+        ]
+        .into_iter()
+        .find(|l| l.as_str() == name)
+        .unwrap_or(Lang::Other)
+    }
 }
 
 /// Common keywords across the supported languages; never reported as
