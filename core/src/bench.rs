@@ -47,6 +47,8 @@ pub struct BenchArgs {
     pub n: usize,
     /// Completion model; the settings default if `None`.
     pub model: Option<String>,
+    /// Completion max tokens; the settings default if `None`.
+    pub max_tokens: Option<u32>,
     pub json: bool,
     pub mode: Mode,
 }
@@ -116,6 +118,7 @@ pub struct BenchReport {
     pub file: String,
     pub file_lines: usize,
     pub model: String,
+    pub max_tokens: u32,
     pub ollama_url: String,
     pub mode: Mode,
     pub plan: String,
@@ -205,10 +208,7 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
             .ok_or_else(|| format!("{} has no non-blank line to type", args.file))?,
     };
 
-    let mut settings = Settings::default();
-    if let Some(model) = &args.model {
-        settings.completion_model = model.clone();
-    }
+    let settings = bench_settings(&args);
 
     let started = Instant::now();
     let index = WorkspaceIndex::build(&root);
@@ -326,6 +326,7 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
         file: args.file,
         file_lines,
         model: settings.completion_model,
+        max_tokens: settings.completion_max_tokens,
         ollama_url: settings.ollama_url,
         mode: args.mode,
         plan: plan.description,
@@ -344,6 +345,19 @@ pub async fn run(args: BenchArgs) -> Result<BenchReport, String> {
         samples,
         checks,
     })
+}
+
+/// The settings the bench runs with: the defaults, with `--model` and
+/// `--max-tokens` applied.
+pub fn bench_settings(args: &BenchArgs) -> Settings {
+    let mut settings = Settings::default();
+    if let Some(model) = &args.model {
+        settings.completion_model = model.clone();
+    }
+    if let Some(max_tokens) = args.max_tokens {
+        settings.completion_max_tokens = max_tokens;
+    }
+    settings
 }
 
 /// One timed completion; `true` if the suggestion was empty.
@@ -525,7 +539,10 @@ pub fn render(r: &BenchReport) -> String {
     out += "LocalPilot core bench\n";
     out += &format!("  workspace     {}\n", r.workspace);
     out += &format!("  file          {} ({} lines)\n", r.file, r.file_lines);
-    out += &format!("  model         {} @ {}\n", r.model, r.ollama_url);
+    out += &format!(
+        "  model         {} @ {} (max tokens {})\n",
+        r.model, r.ollama_url, r.max_tokens
+    );
     out += &format!(
         "  mode          {} ({})\n",
         match r.mode {
@@ -715,6 +732,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bench_settings_apply_model_and_max_tokens_overrides() {
+        let mut args = BenchArgs {
+            workspace: PathBuf::from("."),
+            file: "f.rs".to_owned(),
+            n: 1,
+            model: None,
+            max_tokens: None,
+            json: false,
+            mode: Mode::Typing,
+        };
+        let defaults = Settings::default();
+        let s = bench_settings(&args);
+        assert_eq!(s.completion_model, defaults.completion_model);
+        assert_eq!(s.completion_max_tokens, defaults.completion_max_tokens);
+
+        args.model = Some("m".to_owned());
+        args.max_tokens = Some(16);
+        let s = bench_settings(&args);
+        assert_eq!(s.completion_model, "m");
+        assert_eq!(s.completion_max_tokens, 16);
+    }
+
     #[tokio::test]
     async fn rejects_absolute_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -723,6 +763,7 @@ mod tests {
             file: "/etc/hosts".to_owned(),
             n: 1,
             model: None,
+            max_tokens: None,
             json: false,
             mode: Mode::Spread,
         })

@@ -48,6 +48,9 @@ enum Command {
         /// Completion model (default: the settings default).
         #[arg(long)]
         model: Option<String>,
+        /// Completion max tokens (`num_predict`; default: the settings default).
+        #[arg(long)]
+        max_tokens: Option<u32>,
         /// Print the report as one JSON object.
         #[arg(long)]
         json: bool,
@@ -70,6 +73,7 @@ fn main() -> ExitCode {
             file,
             n,
             model,
+            max_tokens,
             json,
             mode,
         } => bench::main(BenchArgs {
@@ -77,6 +81,7 @@ fn main() -> ExitCode {
             file,
             n,
             model,
+            max_tokens,
             json,
             mode,
         }),
