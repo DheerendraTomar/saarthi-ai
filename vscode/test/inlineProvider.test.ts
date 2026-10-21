@@ -206,8 +206,9 @@ describe("InlineProvider", () => {
     // Two partial accepts then 2 s of quiet: partial with both chunks, reported by the timer.
     fdoc.text = "y = \nnext";
     suggestion = "total(a, b)";
-    await ask(0, 4); // supersedes #2 (untouched → rejected)
-    expect(client.of("completion/rejected")).toEqual([{ requestId: "2" }]);
+    await ask(0, 4);
+    // #2 was the rest of #1 (a typed-prefix hit): settled with #1's run, never reported on its own.
+    expect(client.of("completion/rejected")).toEqual([]);
     change("y = total\nnext", range(0, 4, 0, 4), "total");
     change("y = total(a,\nnext", range(0, 9, 0, 9), "(a,");
     await vi.advanceTimersByTimeAsync(1999);
@@ -231,7 +232,7 @@ describe("InlineProvider", () => {
     await ask(0, 4);
     change("w = ()\nnext", range(0, 4, 0, 4), "()");
     change("w = ()\nnextQ", range(1, 4, 1, 4), "Q");
-    expect(client.of("completion/rejected")).toEqual([{ requestId: "2" }, { requestId: "5" }]);
+    expect(client.of("completion/rejected")).toEqual([{ requestId: "5" }]);
     expect(client.of("completion/outcome")).toHaveLength(2);
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -319,6 +320,76 @@ describe("InlineProvider", () => {
     h.edit(14, " b)");
     await vi.advanceTimersByTimeAsync(2000);
     expect(h.outcomes()).toEqual([{ requestId: id, outcome: "accepted", acceptedText: "compute(a, b)" }]);
+    expect(h.rejected()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("typed_prefix_hit_hands_off_the_watch_without_reporting", async () => {
+    // The core serves the rest of the suggestion (a typed-prefix hit) after each key.
+    const full = "compute(a)";
+    const h = harness("x = ", (c) => full.slice(c - 4));
+    const id = await h.ask(4);
+    h.edit(4, "c");
+    const hit = await h.ask(5);
+    expect(hit).not.toBe(id);
+    expect(h.outcomes()).toEqual([]);
+    expect(h.rejected()).toEqual([]);
+    // Tab on the hit's ghost text: accepted once, for the whole run (its original id); nothing else later.
+    h.edit(5, "ompute(a)");
+    h.provider.reportAccepted(hit);
+    h.provider.reportAccepted(id);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(h.client.of("completion/accepted")).toEqual([{ requestId: id }]);
+    expect(h.outcomes()).toEqual([]);
+    expect(h.rejected()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    // accept-next-word into the hit's ghost text, then quiet: one partial with everything taken in the run.
+    const g = harness("y = ", (c) => full.slice(c - 4));
+    const gid = await g.ask(4);
+    g.edit(4, "c");
+    await g.ask(5);
+    g.edit(5, "ompute");
+    await g.ask(11);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(g.outcomes()).toEqual([{ requestId: gid, outcome: "partial", acceptedText: "compute" }]);
+    expect(g.rejected()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("backspace_after_typed_prefix_hit_does_not_report_rejected_early", async () => {
+    const full = "value + 1";
+    const h = harness("x = ", (c) => full.slice(c - 4));
+    const id = await h.ask(4);
+    h.edit(4, "v");
+    await h.ask(5);
+    h.edit(5, "a");
+    await h.ask(6);
+    h.edit(5, "", 1); // backspace: the latest hit no longer fits, the run still does
+    expect(h.rejected()).toEqual([]);
+    expect(h.outcomes()).toEqual([]);
+    const hit = await h.ask(5);
+    expect(h.rejected()).toEqual([]);
+    // Then the user takes the rest with Tab.
+    h.edit(5, "alue + 1");
+    h.provider.reportAccepted(hit);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(h.client.of("completion/accepted")).toEqual([{ requestId: id }]);
+    expect(h.rejected()).toEqual([]);
+    expect(h.outcomes()).toEqual([]);
+  });
+
+  it("long_type_through_reports_once", async () => {
+    // Far more typed-prefix hits than the tracker's limit of 8.
+    const full = "computeTotal(alpha, beta)";
+    const h = harness("x = ", (c) => full.slice(c - 4));
+    const id = await h.ask(4);
+    for (const [i, ch] of [...full].entries()) {
+      h.edit(4 + i, ch);
+      await h.ask(5 + i);
+    }
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.outcomes()).toEqual([{ requestId: id, outcome: "typedThrough" }]);
     expect(h.rejected()).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
   });

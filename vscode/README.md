@@ -17,8 +17,8 @@ Requires Rust (stable), Node 20+ and npm; the bundled core is built for this mac
 
 ```sh
 npm ci                                   # once, from the repo root
-bash scripts/package-vscode.sh           # → dist/localpilot-0.2.1.vsix
-code --install-extension dist/localpilot-0.2.1.vsix --force
+bash scripts/package-vscode.sh           # → dist/localpilot-0.2.2.vsix
+code --install-extension dist/localpilot-0.2.2.vsix --force
 code --list-extensions | grep localpilot # → localpilot.localpilot
 ```
 
@@ -103,7 +103,9 @@ per-language bookkeeping in the core:
   - **rejected** — it was dismissed, you typed something else, or you typed only
     part of it by hand.
   A suggestion that is partly taken is reported once nothing more of it arrives
-  for 2 s.
+  for 2 s. Typing into a suggestion is one run however often the rest is shown
+  again after a key: VS Code reports the run once, under the first suggestion's
+  request id, with everything taken since it was shown.
 - **Known biases** of these heuristics (VS Code tells extensions nothing about
   partial accepts, so LocalPilot infers them from edits):
   - any single edit that inserts ≥ 2 characters (with a letter or digit) matching the ghost text counts as

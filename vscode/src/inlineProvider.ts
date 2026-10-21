@@ -64,12 +64,15 @@ export class Debouncer {
 
 /** How long a partly taken suggestion may sit without progress before its outcome is reported. */
 export const OUTCOME_IDLE_MS = 2000;
-/** At most this many shown suggestions are watched at once (the oldest is reported first). */
+/** At most this many typing runs are watched at once (the oldest is reported first). */
 const MAX_TRACKED = 8;
 
 /** A shown suggestion, watched through document changes until its outcome is known. */
 interface Tracked {
+  /** The run's original request id: its outcome is reported under it. */
   requestId: string;
+  /** Typed-prefix hits handed off to this watch (they continue the same suggestion). */
+  hits: string[];
   uri: string;
   /** Document text before / after the item's range when it was shown. */
   before: string;
@@ -135,12 +138,22 @@ function matchedPrefix(middle: string, suggestion: string): string | undefined {
  * - part of it with a chunk → `completion/outcome partial` with `acceptedText`;
  * - otherwise (untouched, or only typed by hand) → `completion/rejected`.
  * The core serves one item per request; the first item is the one watched.
+ *
+ * A typing run is watched once: when a newly served suggestion is the rest of
+ * a watched one the user has typed into (the core's typed-prefix cache hit,
+ * whose request id the core aliases to the original suggestion), the watch
+ * is handed off unreported — the new id joins the original's watch, which
+ * keeps the original's surroundings, text and chunk state and reports the
+ * whole run once under the original id (so `acceptedText` is everything
+ * taken since the original was shown).
  */
 export class InlineProvider implements vscode.InlineCompletionItemProvider {
   private readonly debouncer: Debouncer;
   private seq = 0;
   private inflight?: { requestId: string; cancel: () => void };
   private readonly tracked = new Map<string, Tracked>();
+  /** Typed-prefix hit id → the original request id of the run it continues. */
+  private readonly runOf = new Map<string, string>();
   /** Request ids whose outcome was sent (so a late accept command is not reported twice). */
   private readonly reported = new Set<string>();
 
@@ -213,7 +226,8 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
   }
 
   /** Called through `ACCEPT_COMMAND` when the user accepts an item. */
-  reportAccepted(requestId: string): void {
+  reportAccepted(id: string): void {
+    const requestId = this.runOf.get(id) ?? id;
     const t = this.tracked.get(requestId);
     if (t) this.untrack(t);
     if (!this.markReported(requestId)) return;
@@ -229,9 +243,7 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
     for (const t of [...this.tracked.values()]) {
       if (t.uri !== uri) continue;
       text ??= e.document.getText();
-      const fits = text.length >= t.before.length + t.after.length && text.startsWith(t.before) && text.endsWith(t.after);
-      const middle = fits ? text.slice(t.before.length, text.length - t.after.length) : undefined;
-      const prefix = middle === undefined ? undefined : matchedPrefix(middle, t.suggestion);
+      const prefix = this.matched(t, text);
       if (prefix === undefined) {
         this.finish(t);
         continue;
@@ -246,6 +258,7 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
   dispose(): void {
     for (const t of this.tracked.values()) clearTimeout(t.timer);
     this.tracked.clear();
+    this.runOf.clear();
   }
 
   private track(document: vscode.TextDocument, requestId: string, item: { text: string; range: WireRange }): void {
@@ -253,12 +266,27 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
     const text = document.getText();
     const start = offsetAt(text, item.range.start.line, item.range.start.character);
     const end = Math.max(start, offsetAt(text, item.range.end.line, item.range.end.character));
+    const before = text.slice(0, start);
+    const uri = document.uri.toString();
+    for (const t of this.tracked.values()) {
+      if (t.uri !== uri) continue;
+      const prefix = this.matched(t, text);
+      // The rest of a suggestion the user typed into: hand the watch off, report nothing.
+      if (prefix !== undefined && prefix.length > t.baseline && t.before + prefix === before && t.suggestion === prefix + item.text) {
+        t.hits.push(requestId);
+        this.runOf.set(requestId, t.requestId);
+        t.gained = prefix;
+        this.armTimer(t);
+        return;
+      }
+    }
     const existing = text.slice(start, end);
     const gained = item.text.startsWith(existing) ? existing : "";
     this.tracked.set(requestId, {
       requestId,
-      uri: document.uri.toString(),
-      before: text.slice(0, start),
+      hits: [],
+      uri,
+      before,
       after: text.slice(end),
       suggestion: item.text,
       gained,
@@ -271,6 +299,12 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
     }
   }
 
+  /** The part of `t`'s suggestion now between its surroundings in `text`; undefined once it diverged. */
+  private matched(t: Tracked, text: string): string | undefined {
+    const fits = text.length >= t.before.length + t.after.length && text.startsWith(t.before) && text.endsWith(t.after);
+    return fits ? matchedPrefix(text.slice(t.before.length, text.length - t.after.length), t.suggestion) : undefined;
+  }
+
   private armTimer(t: Tracked): void {
     clearTimeout(t.timer);
     t.timer = setTimeout(() => this.finish(t), OUTCOME_IDLE_MS);
@@ -279,6 +313,10 @@ export class InlineProvider implements vscode.InlineCompletionItemProvider {
   private untrack(t: Tracked): void {
     clearTimeout(t.timer);
     this.tracked.delete(t.requestId);
+    for (const hit of t.hits) {
+      this.runOf.delete(hit);
+      this.markReported(hit);
+    }
   }
 
   /** Stops watching `t` and reports what was taken from it. */

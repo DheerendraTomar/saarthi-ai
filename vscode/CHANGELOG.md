@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 — 2026-10-21
+
+- Typing through a suggestion is reported once for the whole run: when the rest of a suggestion you are typing into is shown again, its watch is handed over without a report, so a backspace no longer logs the run as rejected before you accept it, and long type-throughs are no longer cut off (and logged rejected) after 8 keys.
+
 ## 0.2.1 — 2026-10-21
 
 - Adaptive completions never generate more tokens than `localpilot.completionMaxTokens`: learning only shortens suggestions (it could previously go up to twice the setting, above the latency target).
