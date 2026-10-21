@@ -1,0 +1,12 @@
+<idea-plugin>
+    <id>dev.localpilot</id>
+    <name>LocalPilot</name>
+    <vendor>LocalPilot</vendor>
+    <description><![CDATA[
+    Copilot-style assistant backed by a local model served by Ollama: ghost-text inline
+    completions (including notebook cells) and an agentic chat with approval-gated edits
+    and commands. Everything runs on your machine through the bundled LocalPilot core.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+</idea-plugin>

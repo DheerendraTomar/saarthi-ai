@@ -16,3 +16,7 @@ jupyterlab/tsconfig.tsbuildinfo
 jupyterlab/coverage/
 __pycache__/
 .pytest_cache/
+jetbrains/.gradle/
+jetbrains/build/
+jetbrains/.intellijPlatform/
+jetbrains/.kotlin/
