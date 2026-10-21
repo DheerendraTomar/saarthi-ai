@@ -83,6 +83,7 @@ export const events = {
   openNotebook: new EventEmitter<unknown>(),
   changeNotebook: new EventEmitter<unknown>(),
   closeNotebook: new EventEmitter<unknown>(),
+  saveNotebook: new EventEmitter<unknown>(),
 };
 
 export const workspace = {
@@ -96,6 +97,7 @@ export const workspace = {
   onDidOpenNotebookDocument: events.openNotebook.event,
   onDidChangeNotebookDocument: events.changeNotebook.event,
   onDidCloseNotebookDocument: events.closeNotebook.event,
+  onDidSaveNotebookDocument: events.saveNotebook.event,
   getConfiguration(section?: string) {
     const prefix = section ? `${section}.` : "";
     return {

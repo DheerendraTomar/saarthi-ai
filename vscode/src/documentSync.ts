@@ -90,6 +90,7 @@ export class DocumentSync implements vscode.Disposable {
         if (e.contentChanges.length > 0) this.reconcile(e.notebook);
       }),
       ws.onDidCloseNotebookDocument((nb) => this.closeNotebook(nb)),
+      ws.onDidSaveNotebookDocument((nb) => this.onSaveNotebook(nb)),
       // The queue of a starting core is cleared before this fires, so these
       // didOpens precede any later didChange.
       client.onDidChangeState((state) => {
@@ -105,6 +106,33 @@ export class DocumentSync implements vscode.Disposable {
     this.notebooks.clear();
     this.cellOwner.clear();
     this.files.clear();
+  }
+
+  /**
+   * The open code cell the core knows as `virtualUri` (`file://<nb>.ipynb.cell<i>.<ext>`),
+   * with its notebook; undefined for anything else, including the `.cells.<ext>` concat doc.
+   */
+  cellForUri(virtualUri: string): { document: vscode.TextDocument; notebook: vscode.NotebookDocument } | undefined {
+    let fsPath: string;
+    try {
+      fsPath = vscode.Uri.parse(virtualUri, true).fsPath;
+    } catch {
+      return undefined;
+    }
+    for (const st of this.notebooks.values()) {
+      for (const [cellKey, virtual] of st.cells) {
+        // Compare paths, not strings: the core may encode the URI differently.
+        if (virtual !== virtualUri && vscode.Uri.parse(virtual).fsPath !== fsPath) continue;
+        const cell = st.nb.getCells().find((c) => c.document.uri.toString() === cellKey);
+        if (cell) return { document: cell.document, notebook: st.nb };
+      }
+    }
+    return undefined;
+  }
+
+  /** The cell document behind a virtual cell URI (see `cellForUri`). */
+  cellDocumentForUri(virtualUri: string): vscode.TextDocument | undefined {
+    return this.cellForUri(virtualUri)?.document;
   }
 
   /** Sends didOpen for everything currently open (a fresh core has an empty overlay). */
@@ -161,6 +189,14 @@ export class DocumentSync implements vscode.Disposable {
   private onSave(doc: vscode.TextDocument): void {
     const uri = doc.uri.toString();
     if (this.files.has(uri)) this.client.notify("textDocument/didSave", { uri });
+  }
+
+  /** A saved notebook saved its cells: tell the core about every virtual document of it. */
+  private onSaveNotebook(nb: vscode.NotebookDocument): void {
+    const st = this.notebooks.get(nb.uri.toString());
+    if (!st) return;
+    for (const virtual of st.cells.values()) this.client.notify("textDocument/didSave", { uri: virtual });
+    if (st.concat) this.client.notify("textDocument/didSave", { uri: st.concat.uri });
   }
 
   private onClose(doc: vscode.TextDocument): void {

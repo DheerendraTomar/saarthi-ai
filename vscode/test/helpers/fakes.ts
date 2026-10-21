@@ -81,6 +81,10 @@ export interface FakeNotebook {
   notebookType: string;
   cells: Array<{ index: number; kind: NotebookCellKind; document: FakeDoc }>;
   getCells(): FakeNotebook["cells"];
+  isDirty: boolean;
+  /** How many times `save()` ran. */
+  saves: number;
+  save(): Promise<boolean>;
 }
 
 export function fakeNotebook(path: string, specs: FakeCellSpec[]): FakeNotebook {
@@ -97,6 +101,13 @@ export function fakeNotebook(path: string, specs: FakeCellSpec[]): FakeNotebook 
       ),
     })),
     getCells: () => nb.cells,
+    isDirty: false,
+    saves: 0,
+    async save() {
+      nb.saves += 1;
+      nb.isDirty = false;
+      return true;
+    },
   };
   return nb;
 }

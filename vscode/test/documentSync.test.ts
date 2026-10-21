@@ -189,4 +189,38 @@ describe("DocumentSync", () => {
     });
     expect(client.of("textDocument/didClose")).toEqual([]);
   });
+
+  it("cells_resolve_from_their_virtual_uri_and_notebook_save_sends_didSave", () => {
+    const nbPath = `${ROOT}/nb.ipynb`;
+    const nb = fakeNotebook(nbPath, [
+      { kind: "code", text: "a = 1" },
+      { kind: "markdown", text: "# m" },
+      { kind: "code", text: "b = 2" },
+    ]);
+    for (const c of nb.cells) workspace.textDocuments.push(c.document);
+    workspace.notebookDocuments.push(nb);
+    const client = new FakeClient();
+    const sync = makeSync(client);
+
+    // The inverse of the virtual URI mapping: the core's URI → the cell document (and its notebook).
+    expect(sync.cellDocumentForUri(`file://${nbPath}.cell0.py`)).toBe(nb.cells[0].document);
+    expect(sync.cellDocumentForUri(`file://${nbPath}.cell2.py`)).toBe(nb.cells[2].document);
+    expect(sync.cellForUri(`file://${nbPath}.cell2.py`)?.notebook).toBe(nb);
+    expect(sync.cellDocumentForUri(`file://${nbPath}.cell1.py`)).toBeUndefined(); // markdown: not synced
+    expect(sync.cellDocumentForUri(`file://${nbPath}.cells.py`)).toBeUndefined(); // concat doc
+    expect(sync.cellDocumentForUri(`file://${ROOT}/a.py`)).toBeUndefined();
+    expect(sync.cellDocumentForUri("::bad")).toBeUndefined();
+
+    // Saving the notebook saves its cell documents and the concat doc in the core's eyes.
+    events.saveNotebook.fire(nb);
+    expect(client.of("textDocument/didSave")).toEqual([
+      { uri: `file://${nbPath}.cell0.py` },
+      { uri: `file://${nbPath}.cell2.py` },
+      { uri: `file://${nbPath}.cells.py` },
+    ]);
+    // A notebook that is not synced (outside the root) sends nothing.
+    client.calls.length = 0;
+    events.saveNotebook.fire(fakeNotebook("/elsewhere/x.ipynb", [{ kind: "code", text: "" }]));
+    expect(client.calls).toEqual([]);
+  });
 });

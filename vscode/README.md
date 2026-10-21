@@ -87,6 +87,10 @@ Walk this after installing a new build (folder open, Ollama models pulled):
    is applied and the file is saved (no dirty dot on its tab).
 7. **Run command, denied** — ask the chat to run `ls` (or the tests): a command
    card appears; click **Deny**: nothing runs, and the agent says it was denied.
+8. **Chat edit in a notebook** — open an `.ipynb`, put the cursor in a code cell,
+   attach it in the chat and ask for a change to that cell: the diff card shows the
+   cell (`….ipynb.cell<N>.py`); click **Approve**: the cell changes in place and the
+   notebook is saved (no dirty dot).
 
 ## Troubleshooting
 

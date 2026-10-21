@@ -163,4 +163,99 @@ describe("applyEdit", () => {
     expect(bad.applied).toBe(false);
     expect(typeof bad.error).toBe("string");
   });
+
+  describe("notebook cells", () => {
+    const NB = "/work/proj/nb.ipynb";
+    const CELL0 = `file://${NB}.cell0.py`;
+    const CELL2 = `file://${NB}.cell2.py`;
+
+    function notebook() {
+      const nb = {
+        uri: Uri.file(NB),
+        isDirty: false,
+        saves: 0,
+        async save() {
+          nb.saves += 1;
+          nb.isDirty = false;
+          return true;
+        },
+      };
+      const cell = (i: number) => ({ uri: Uri.from({ scheme: "vscode-notebook-cell", path: NB, fragment: `W${i}` }) });
+      const cells = new Map([
+        [CELL0, cell(0)],
+        [CELL2, cell(2)],
+      ]);
+      const resolveCell = (uri: string) => {
+        const document = cells.get(uri);
+        return document ? { document: document as never, notebook: nb as never } : undefined;
+      };
+      workspaceFns.applyEdit = async (edit: WorkspaceEdit) => {
+        applied.push(edit);
+        nb.isDirty = true; // editing a cell dirties its notebook
+        return true;
+      };
+      return { nb, cells, resolveCell };
+    }
+
+    it("applyEdit_edits_a_cell_through_its_virtual_uri_and_saves_the_notebook", async () => {
+      const { nb, cells, resolveCell } = notebook();
+      const result = await applyEdit(
+        {
+          ops: [
+            { kind: "edit", uri: CELL0, range: range(0, 0, 0, 0), newText: "import os\n" },
+            { kind: "edit", uri: CELL2, range: range(1, 2, 1, 4), newText: "y" },
+          ],
+          save: true,
+        },
+        { resolveCell },
+      );
+      expect(result).toEqual({ applied: true });
+      // The edits target the cell documents, never the (non-existent) virtual files.
+      expect(applied).toHaveLength(1);
+      expect(applied[0].ops.map((op) => (op.kind === "replace" ? [op.uri, op.newText] : op.kind))).toEqual([
+        [cells.get(CELL0)!.uri, "import os\n"],
+        [cells.get(CELL2)!.uri, "y"],
+      ]);
+      expect(opened).toEqual([]);
+      // Saved through the notebook, once for both cells.
+      expect(nb.saves).toBe(1);
+      expect(nb.isDirty).toBe(false);
+    });
+
+    it("applyEdit_reports_an_unsaved_notebook_and_skips_save_when_not_asked", async () => {
+      const { nb, resolveCell } = notebook();
+      const noSave = await applyEdit({ ops: [{ kind: "edit", uri: CELL0, range: range(0, 0, 0, 0), newText: "x" }], save: false }, { resolveCell });
+      expect(noSave).toEqual({ applied: true });
+      expect(nb.saves).toBe(0);
+
+      nb.save = async () => false; // stays dirty
+      const failed = await applyEdit({ ops: [{ kind: "edit", uri: CELL0, range: range(0, 0, 0, 0), newText: "x" }], save: true }, { resolveCell });
+      expect(failed.applied).toBe(true);
+      expect(failed.error).toMatch(/could not save .*nb\.ipynb/);
+    });
+
+    it("applyEdit_rejects_concat_uri_create_on_cell_and_closed_cells", async () => {
+      const { resolveCell } = notebook();
+      const concat = await applyEdit(
+        { ops: [{ kind: "edit", uri: `file://${NB}.cells.py`, range: range(0, 0, 0, 0), newText: "x" }], save: true },
+        { resolveCell },
+      );
+      expect(concat.applied).toBe(false);
+      expect(concat.error).toMatch(/cells\.py/);
+      expect(concat.error).toMatch(/notebook/i);
+
+      const create = await applyEdit({ ops: [{ kind: "create", uri: `file://${NB}.cell5.py`, content: "x" }], save: true }, { resolveCell });
+      expect(create).toEqual({ applied: false, error: expect.stringContaining("LocalPilot can't create notebook cells") });
+
+      // A cell URI that no open notebook has (closed meanwhile, or no resolver at all).
+      const closed = await applyEdit({ ops: [{ kind: "edit", uri: `file://${NB}.cell7.py`, range: range(0, 0, 0, 0), newText: "x" }], save: true }, { resolveCell });
+      expect(closed.applied).toBe(false);
+      expect(closed.error).toMatch(/cell7\.py/);
+      const noResolver = await applyEdit({ ops: [{ kind: "edit", uri: CELL0, range: range(0, 0, 0, 0), newText: "x" }], save: true });
+      expect(noResolver.applied).toBe(false);
+
+      expect(applied).toHaveLength(0);
+      expect(opened).toEqual([]);
+    });
+  });
 });

@@ -144,7 +144,7 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
   });
 
   // Core → client requests (the core sends them only after the user approved in the chat).
-  client.onRequest("workspace/applyEdit", (params) => applyEdit(params as ApplyEditParams));
+  client.onRequest("workspace/applyEdit", (params) => applyEdit(params as ApplyEditParams, { resolveCell: (uri) => sync.cellForUri(uri) }));
   client.onRequest("workspace/runCommand", (params) => runCommand(params as RunCommandParams, output, { defaultCwd: root }));
   // The chat view relays `status` to the webview itself; the status bar listens here.
   client.onNotification("status", (params) => statusBar.setStatus(params as StatusNotification));
