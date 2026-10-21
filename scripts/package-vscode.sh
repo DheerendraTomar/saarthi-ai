@@ -31,7 +31,7 @@ rm -f vscode/out/*.map
 version="$(node -p 'require("./vscode/package.json").version')"
 vsix="$repo/dist/localpilot-$version.vsix"
 mkdir -p dist
-(cd vscode && npx --no-install vsce package --no-dependencies --allow-missing-repository --skip-license -o "$vsix")
+(cd vscode && npx --no-install vsce package --no-dependencies --allow-missing-repository -o "$vsix")
 
 # 5. The package must contain the core and the chat page.
 listing="$(unzip -l "$vsix")"
