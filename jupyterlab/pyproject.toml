@@ -25,9 +25,11 @@ test = ["pytest>=7", "pytest-jupyter[server]>=0.6", "pytest-asyncio>=0.21"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["localpilot_jupyter"]
-# The bundled core (localpilot_jupyter/bin/<triple>/localpilot-core) and the built
-# labextension are git-ignored but must ship in the wheel.
-artifacts = ["localpilot_jupyter/bin", "localpilot_jupyter/labextension"]
+# The bundled core (localpilot_jupyter/bin/<triple>/localpilot-core) is git-ignored
+# but must ship in the wheel. The built labextension ships only as shared-data
+# (share/jupyter/labextensions/...), not a second time inside the package.
+artifacts = ["localpilot_jupyter/bin"]
+exclude = ["localpilot_jupyter/labextension"]
 
 [tool.hatch.build.targets.wheel.shared-data]
 "jupyter-config/jupyter_server_config.d" = "etc/jupyter/jupyter_server_config.d"

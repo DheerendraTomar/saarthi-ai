@@ -1,0 +1,54 @@
+name: jupyterlab
+
+on:
+  push:
+    paths:
+      - "jupyterlab/**"
+      - "chat-ui/**"
+      - "rpc-client/**"
+      - "vscode/test/fakeCore.mjs"
+      - "scripts/package-jupyterlab.sh"
+      - ".github/workflows/jupyterlab.yml"
+  pull_request:
+    paths:
+      - "jupyterlab/**"
+      - "chat-ui/**"
+      - "rpc-client/**"
+      - "vscode/test/fakeCore.mjs"
+      - "scripts/package-jupyterlab.sh"
+      - ".github/workflows/jupyterlab.yml"
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: lint, jest, pytest (macOS arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: npm ci (repo root)
+        run: npm ci
+      - name: build chat-ui (embedded into the labextension)
+        run: npm run build -w chat-ui
+      - name: install JupyterLab and the extension (editable, with test extras)
+        working-directory: jupyterlab
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "jupyterlab>=4.5,<5"
+          jlpm install --immutable
+          python -m pip install -e ".[test]"
+      - name: lint (tsc + eslint)
+        working-directory: jupyterlab
+        run: jlpm lint
+      - name: jest
+        working-directory: jupyterlab
+        run: jlpm test
+      - name: pytest (server extension + bridge, against vscode/test/fakeCore.mjs)
+        working-directory: jupyterlab
+        run: python -m pytest -q
