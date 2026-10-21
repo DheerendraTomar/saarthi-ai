@@ -174,4 +174,103 @@ describe("InlineProvider", () => {
     expect(client.of("completion/rejected")).toEqual([{ requestId: "2" }, { requestId: "3" }]);
     expect(client.of("completion/cancel")).toEqual([]);
   });
+
+  it("partial_accept_reports_partial", async () => {
+    const client = new FakeClient();
+    let suggestion = "compute(value) + 1";
+    client.respond = async (_m, params) => {
+      const { position } = params as { position: { line: number; character: number } };
+      return { items: [{ text: suggestion, range: { start: position, end: position } }] };
+    };
+    const provider = new InlineProvider(client, settings());
+    const fdoc = fakeDoc(`${ROOT}/a.ts`, "x = \nnext");
+    const ask = async (line: number, character: number) => {
+      const p = provider.provideInlineCompletionItems(asDoc(fdoc), pos(line, character), ctx, tokenSource().token);
+      await vi.advanceTimersByTimeAsync(120);
+      return p;
+    };
+    const change = (newText: string, r: ReturnType<typeof range>, text: string) =>
+      provider.onDidChangeTextDocument(changeEvent(fdoc, newText, r, text) as never);
+
+    // Shown at (0,4); VS Code's "accept next word" inserts "compute" in one edit, then asks again.
+    await ask(0, 4);
+    change("x = compute\nnext", range(0, 4, 0, 4), "compute");
+    suggestion = "(value) + 1";
+    await ask(0, 11);
+    expect(client.of("completion/rejected")).toEqual([]); // the partly accepted one is not rejected
+    expect(client.of("completion/outcome")).toEqual([]);
+    // The user stops there and types something else: reported as partial with what was taken.
+    change("x = computeZ\nnext", range(0, 11, 0, 11), "Z");
+    expect(client.of("completion/outcome")).toEqual([{ requestId: "1", outcome: "partial", acceptedText: "compute" }]);
+
+    // Two partial accepts then 2 s of quiet: partial with both chunks, reported by the timer.
+    fdoc.text = "y = \nnext";
+    suggestion = "total(a, b)";
+    await ask(0, 4); // supersedes #2 (untouched → rejected)
+    expect(client.of("completion/rejected")).toEqual([{ requestId: "2" }]);
+    change("y = total\nnext", range(0, 4, 0, 4), "total");
+    change("y = total(a,\nnext", range(0, 9, 0, 9), "(a,");
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(client.of("completion/outcome")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.of("completion/outcome")[1]).toEqual({ requestId: "3", outcome: "partial", acceptedText: "total(a," });
+
+    // A full accept (Tab) inserts everything in one edit and runs the command: accepted only, once.
+    fdoc.text = "z = \nnext";
+    suggestion = "go()";
+    await ask(0, 4);
+    change("z = go()\nnext", range(0, 4, 0, 4), "go()");
+    provider.reportAccepted("4");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(client.of("completion/accepted")).toEqual([{ requestId: "4" }]);
+    expect(client.of("completion/outcome")).toHaveLength(2);
+
+    // Only punctuation gained (an auto-closed bracket), then something else: rejected.
+    fdoc.text = "w = \nnext";
+    suggestion = "(), 1";
+    await ask(0, 4);
+    change("w = ()\nnext", range(0, 4, 0, 4), "()");
+    change("w = ()\nnextQ", range(1, 4, 1, 4), "Q");
+    expect(client.of("completion/rejected")).toEqual([{ requestId: "2" }, { requestId: "5" }]);
+    expect(client.of("completion/outcome")).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("typed_through_reports_typedThrough", async () => {
+    const client = new FakeClient();
+    const full = "foo(1)";
+    client.respond = async (_m, params) => {
+      const { position } = params as { position: { line: number; character: number } };
+      return { items: [{ text: full.slice(position.character - 4), range: { start: position, end: position } }] };
+    };
+    const provider = new InlineProvider(client, settings());
+    const fdoc = fakeDoc(`${ROOT}/a.ts`, "x = ");
+    const ask = async (character: number) => {
+      const p = provider.provideInlineCompletionItems(asDoc(fdoc), pos(0, character), ctx, tokenSource().token);
+      await vi.advanceTimersByTimeAsync(120);
+      return p;
+    };
+
+    // The user types the suggestion one key at a time; VS Code asks again after each key.
+    await ask(4);
+    let text = "x = ";
+    for (const ch of full) {
+      provider.onDidChangeTextDocument(changeEvent(fdoc, (text += ch), range(0, text.length - 1, 0, text.length - 1), ch) as never);
+      await ask(text.length);
+    }
+    await vi.advanceTimersByTimeAsync(2000);
+    const outcomes = client.of("completion/outcome") as Array<{ requestId: string; outcome: string }>;
+    expect(outcomes.find((o) => o.requestId === "1")).toEqual({ requestId: "1", outcome: "typedThrough" });
+    expect(client.of("completion/rejected")).not.toContainEqual({ requestId: "1" });
+    expect(client.of("completion/accepted")).toEqual([]);
+
+    // Typing only part of a word, then something else: rejected (no word was gained).
+    const before = (client.of("completion/rejected") as unknown[]).length;
+    fdoc.text = "y = ";
+    await ask(4); // #8 shown: "foo(1)"
+    provider.onDidChangeTextDocument(changeEvent(fdoc, "y = f", range(0, 4, 0, 4), "f") as never);
+    provider.onDidChangeTextDocument(changeEvent(fdoc, "y = fx", range(0, 5, 0, 5), "x") as never);
+    expect((client.of("completion/rejected") as unknown[]).slice(before)).toContainEqual({ requestId: "8" });
+    expect((client.of("completion/outcome") as Array<{ requestId: string }>).filter((o) => o.requestId === "8")).toEqual([]);
+  });
 });

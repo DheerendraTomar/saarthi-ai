@@ -168,6 +168,9 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
     sync,
     chatView,
     vscode.languages.registerInlineCompletionItemProvider({ pattern: "**" }, inline),
+    inline,
+    // Partial accepts and typed-through suggestions are only visible as document changes.
+    vscode.workspace.onDidChangeTextDocument((e) => inline.onDidChangeTextDocument(e)),
     vscode.window.registerWebviewViewProvider(CHAT_VIEW_TYPE, chatView, { webviewOptions: { retainContextWhenHidden: true } }),
     ...registerCommands(deps),
     vscode.workspace.onDidChangeConfiguration((e) => {
