@@ -121,6 +121,8 @@ class ChatBridge(
     private var lastKnownModels: JsonArray? = null
     /** While `ui/ready` fetches the session list, relayed core events wait here (the list must come first). */
     private var heldEvents: MutableList<JsonObject>? = null
+    /** Counts `ui/ready`s; only the latest releases [heldEvents] (an earlier one's list may precede the page's last). */
+    private var readyGeneration = 0
     private var lastState: CoreState? = null
     private val chains = mapOf("settings" to Mutex(), "sessions" to Mutex(), "completion" to Mutex())
     private val subscriptions = mutableListOf<Disposable>()
@@ -248,11 +250,13 @@ class ChatBridge(
     }
 
     private suspend fun onReady() {
-        // Order matters: the UI keys tool cards by session, so the list goes before any turn event.
-        heldEvents = mutableListOf()
+        // Order matters: the UI keys tool cards by session, so the list goes before any turn event. A ready that
+        // arrives while an earlier one is still fetching keeps the events held so far and takes over releasing them.
+        val generation = ++readyGeneration
+        if (heldEvents == null) heldEvents = mutableListOf()
         try {
             postSessionList()
-            releaseHeldEvents()
+            if (generation == readyGeneration) releaseHeldEvents()
             current?.let { postHistory(it) }
             // Turns running in other sessions too, so the UI keeps their delete buttons disabled.
             for (sessionId in activeTurns.toList()) {
@@ -262,7 +266,7 @@ class ChatBridge(
             throw e
         } catch (e: Exception) {
             post(sessionListMessage(emptyList(), current))
-            releaseHeldEvents()
+            if (generation == readyGeneration) releaseHeldEvents()
             if (e !is CoreCrashed) postError("LocalPilot core is not available: ${errorMessage(e)}")
         }
         val known = status ?: try {

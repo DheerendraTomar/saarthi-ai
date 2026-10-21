@@ -1,11 +1,14 @@
 package dev.localpilot.chat
 
+import com.intellij.ide.BrowserUtil
 import com.intellij.ide.ui.LafManagerListener
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.EDT
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.asContextElement
 import com.intellij.openapi.util.Computable
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.components.Service
@@ -25,6 +28,7 @@ import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.vfs.ReadonlyStatusHandler
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
@@ -50,6 +54,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import org.cef.browser.CefBrowser
+import org.cef.browser.CefFrame
+import org.cef.handler.CefLifeSpanHandlerAdapter
+import org.cef.handler.CefRequestHandlerAdapter
+import org.cef.network.CefRequest
 import java.awt.BorderLayout
 import java.awt.datatransfer.StringSelection
 import java.net.URI
@@ -94,6 +103,7 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         val sink = UiSink { msg -> browser.cefBrowser.executeJavaScript(ChatHtml.postScript(msg), browser.cefBrowser.url, 0) }
         bridge.ui = sink
         Disposer.register(disposable) { if (bridge.ui === sink) bridge.ui = null }
+        installNavigationGuard(browser)
         panel.add(browser.component, BorderLayout.CENTER)
 
         installListeners(project, bridge, disposable)
@@ -104,9 +114,46 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
         service.scope.launch(Dispatchers.IO) {
             val html = ChatHtml.render(ChatHtml.loadTemplate(), shim, themeCss)
             withContext(Dispatchers.EDT) {
-                if (!browser.isDisposed) browser.loadHTML(html)
+                if (!browser.isDisposed) browser.loadHTML(html, ChatHtml.PAGE_URL)
             }
         }
+    }
+
+    /**
+     * Keeps the browser on the chat page: chat-ui renders http(s)/mailto links as real anchors, and following one would
+     * replace the page (and give the remote page the bridge). Those navigations and every popup are cancelled; web and
+     * mail links open in the system browser / mail client instead.
+     */
+    private fun installNavigationGuard(browser: JBCefBrowser) {
+        fun openExternally(url: String?) {
+            if (url != null && ChatHtml.opensExternally(url)) BrowserUtil.browse(url)
+        }
+        browser.jbCefClient.addRequestHandler(object : CefRequestHandlerAdapter() {
+            override fun onBeforeBrowse(
+                cefBrowser: CefBrowser?,
+                frame: CefFrame?,
+                request: CefRequest?,
+                userGesture: Boolean,
+                isRedirect: Boolean,
+            ): Boolean {
+                val url = request?.url ?: return true
+                if (ChatHtml.isAllowedNavigation(url, ChatHtml.PAGE_URL)) return false
+                openExternally(url)
+                return true
+            }
+
+            // Ctrl/middle-click ("open in a new tab"): never inside the chat browser.
+            override fun onOpenURLFromTab(cefBrowser: CefBrowser?, frame: CefFrame?, targetUrl: String?, userGesture: Boolean): Boolean {
+                openExternally(targetUrl)
+                return true
+            }
+        }, browser.cefBrowser)
+        browser.jbCefClient.addLifeSpanHandler(object : CefLifeSpanHandlerAdapter() {
+            override fun onBeforePopup(cefBrowser: CefBrowser?, frame: CefFrame?, targetUrl: String?, targetFrameName: String?): Boolean {
+                openExternally(targetUrl)
+                return true
+            }
+        }, browser.cefBrowser)
     }
 
     private fun installListeners(project: Project, bridge: ChatBridge, disposable: Disposable) {
@@ -139,7 +186,35 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 object ChatHtml {
     const val RESOURCE = "/chat/index.html"
 
+    /**
+     * The URL the page is loaded under (`loadHTML(html, PAGE_URL)`; JCEF serves the HTML from memory for it). Fixed, so
+     * the navigation guard can recognise it: `loadHTML(html)` alone would pick a random `file:///jbcefbrowser/` URL.
+     */
+    const val PAGE_URL = "file:///jbcefbrowser/localpilot-chat.html"
+
+    private val EXTERNAL_SCHEMES = setOf("http", "https", "mailto")
+
+    /**
+     * Whether the chat browser may navigate to [url]: only its own page [ownUrl] (an in-page `#fragment` included) and
+     * `about:blank`. Anything else would take the browser off the chat (losing its state) and hand the bridge — every
+     * host → UI message and the `cefQuery` function — to that page; the guard cancels it.
+     */
+    fun isAllowedNavigation(url: String, ownUrl: String): Boolean =
+        url == "about:blank" || url == ownUrl || url.startsWith("$ownUrl#")
+
+    /** Whether a link the guard cancelled is opened in the system browser / mail client instead (http(s), mailto). */
+    fun opensExternally(url: String): Boolean {
+        val scheme = try {
+            URI(url).scheme
+        } catch (_: Exception) {
+            null
+        } ?: return false
+        return scheme.lowercase() in EXTERNAL_SCHEMES
+    }
+
     /** No network, inline scripts/styles only (the bundle is a single file), images from data: URIs. */
+    private const val CHARSET = "<meta charset=\"utf-8\">"
+
     const val CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:"
 
     private val JSON = Json
@@ -159,23 +234,31 @@ object ChatHtml {
     """.trimIndent()
 
     /**
-     * Inserts the CSP `<meta>`, the [shim] script and the theme `<style>` right after `<head>` (so `window.cefQuery`
-     * exists before the bundle's module script runs); [template] null → [MISSING_PAGE].
+     * Inserts the CSP `<meta>`, the [shim] script and the theme `<style>` right after the bundle's `<meta charset>`
+     * (or, without one, after `<head>` behind a `<meta charset="utf-8">` of our own), so the charset stays within the
+     * browser's 1024-byte prescan and `window.cefQuery` exists before the bundle's module script runs;
+     * [template] null → [MISSING_PAGE].
      */
     fun render(template: String?, shim: String, themeCss: String): String {
         val page = template ?: MISSING_PAGE
         val inject = "\n<meta http-equiv=\"Content-Security-Policy\" content=\"$CSP\">\n<script>$shim</script>\n$themeCss\n"
         val head = Regex("<head(\\s[^>]*)?>", RegexOption.IGNORE_CASE).find(page)
         if (head != null) {
+            val charset = Regex("<meta\\s+charset\\s*=[^>]*>", RegexOption.IGNORE_CASE).find(page, head.range.last + 1)
+            val headEnd = page.indexOf("</head", head.range.last + 1, ignoreCase = true)
+            if (charset != null && (headEnd < 0 || charset.range.first < headEnd)) {
+                val at = charset.range.last + 1
+                return page.substring(0, at) + inject + page.substring(at)
+            }
             val at = head.range.last + 1
-            return page.substring(0, at) + inject + page.substring(at)
+            return page.substring(0, at) + CHARSET + inject + page.substring(at)
         }
         val html = Regex("<html(\\s[^>]*)?>", RegexOption.IGNORE_CASE).find(page)
         if (html != null) {
             val at = html.range.last + 1
-            return page.substring(0, at) + "<head>$inject</head>" + page.substring(at)
+            return page.substring(0, at) + "<head>$CHARSET$inject</head>" + page.substring(at)
         }
-        return "<head>$inject</head>$page"
+        return "<head>$CHARSET$inject</head>$page"
     }
 
     /**
@@ -286,17 +369,24 @@ internal class IdeChatEditorHost(
     }
 
     override suspend fun insertAtCursor(text: String) {
-        withContext(Dispatchers.EDT) { insertNow(text) }
+        // Non-modal: never inserts into an editor behind a dialog that opened meanwhile.
+        withContext(Dispatchers.EDT + ModalityState.nonModal().asContextElement()) { insertNow(text) }
     }
 
-    /** [insertAtCursor] on the EDT; false when there is no writable editor (the user is told). */
+    /**
+     * [insertAtCursor] on the EDT; false when there is no writable editor (the user is told). A read-only file is first
+     * offered to be made writable (VCS checkout / clearing the read-only flag), as for any IDE edit.
+     */
     fun insertNow(text: String): Boolean {
         if (project.isDisposed) return false
         val editor = FileEditorManager.getInstance(project).selectedTextEditor
+        val file = editor?.let { FileDocumentManager.getInstance().getFile(it.document) }
+        if (editor != null && file != null && ReadonlyStatusHandler.getInstance(project).ensureFilesWritable(listOf(file)).hasReadonlyFiles()) {
+            notifyNoEditor("${file.name} is read-only; the code was not inserted.")
+            return false
+        }
         if (editor == null || !editor.document.isWritable) {
-            NotificationGroupManager.getInstance().getNotificationGroup(LocalPilotCore.NOTIFICATION_GROUP)
-                .createNotification("LocalPilot", "Open an editor to insert the code into.", NotificationType.WARNING)
-                .notify(project)
+            notifyNoEditor("Open an editor to insert the code into.")
             return false
         }
         WriteCommandAction.runWriteCommandAction(project, "Insert from LocalPilot Chat", null, {
@@ -308,6 +398,12 @@ internal class IdeChatEditorHost(
             }
         })
         return true
+    }
+
+    private fun notifyNoEditor(message: String) {
+        NotificationGroupManager.getInstance().getNotificationGroup(LocalPilotCore.NOTIFICATION_GROUP)
+            .createNotification("LocalPilot", message, NotificationType.WARNING)
+            .notify(project)
     }
 
     override fun copy(text: String) {

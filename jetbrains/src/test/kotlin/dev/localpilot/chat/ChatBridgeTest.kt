@@ -392,6 +392,67 @@ class ChatBridgeTest {
         assertEquals("file:///p/a.py", h.posted[6].str("uri"))
     }
 
+    @Test
+    fun double_ready_keeps_all_held_events_in_order() = bridgeTest { h ->
+        h.core.sessions = mutableListOf("s1")
+        // Each ui/ready's chat/listSessions waits on its own gate, so the first can finish while the second still waits.
+        val gates = listOf(CompletableDeferred<Unit>(), CompletableDeferred<Unit>())
+        var calls = 0
+        val list = h.core.responders.getValue("chat/listSessions")
+        h.core.responders["chat/listSessions"] = { p ->
+            gates.getOrNull(calls++)?.await()
+            list(p)
+        }
+        fun token(text: String) = h.core.emit("chat/token", buildJsonObject {
+            put("sessionId", "s1")
+            put("text", text)
+        })
+        launch { h.ui("""{"type":"ui/ready"}""") }
+        settle()
+        token("a")
+        settle()
+        launch { h.ui("""{"type":"ui/ready"}""") }
+        settle()
+        token("b")
+        settle()
+        assertTrue("nothing before a session list: ${h.types()}", h.posted.isEmpty())
+
+        // The first ready finishes while the second is still fetching: no token may pass the second's list.
+        gates[0].complete(Unit)
+        settle()
+        assertTrue("no token before the second list: ${h.types()}", h.ofType("chat/token").isEmpty())
+        gates[1].complete(Unit)
+        settle()
+        assertEquals(listOf("a", "b"), h.ofType("chat/token").map { it.str("text") })
+        val lastList = h.types().lastIndexOf("session/list")
+        val firstToken = h.types().indexOf("chat/token")
+        assertTrue("tokens after every session/list: ${h.types()}", firstToken > lastList)
+        assertEquals(2, h.ofType("session/list").size)
+
+        // Afterwards events flow straight through again.
+        h.posted.clear()
+        token("c")
+        settle()
+        assertEquals(listOf("chat/token"), h.types())
+    }
+
+    @Test
+    fun delete_running_session_posts_stopped_done() = bridgeTest { h ->
+        h.core.sessions = mutableListOf("s1", "s2")
+        h.ui("""{"type":"ui/ready"}""")
+        h.ui("""{"type":"chat/send","message":"hi","attachments":[]}""") // the bridge thinks s1's turn runs
+        h.core.responders["chat/deleteSession"] = { p ->
+            h.core.sessions.remove(p.jsonObject.str("sessionId"))
+            JsonObject(emptyMap())
+        }
+        h.posted.clear()
+        h.ui("""{"type":"session/delete","sessionId":"s1"}""")
+        assertEquals(listOf("chat/done", "session/deleted", "session/list"), h.types())
+        assertEquals("s1", h.posted[0].str("sessionId"))
+        assertEquals("stopped", h.posted[0].str("stopReason"))
+        assertEquals(listOf(true, false), h.activeChanges)
+    }
+
     // ------------------------------------------------------------ more bridge behaviour
 
     @Test
@@ -604,15 +665,63 @@ class ChatBridgeTest {
     }
 
     @Test
+    fun navigation_allows_only_own_page_and_opens_links_externally() {
+        val own = ChatHtml.PAGE_URL
+        assertTrue(ChatHtml.isAllowedNavigation(own, own))
+        assertTrue("in-page anchor", ChatHtml.isAllowedNavigation("$own#top", own))
+        assertTrue(ChatHtml.isAllowedNavigation("about:blank", own))
+        for (url in listOf(
+            "https://example.com/",
+            "http://localhost:11434/api/tags",
+            "mailto:a@b.c",
+            "file:///etc/passwd",
+            "file:///jbcefbrowser/other.html",
+            "$own.evil",
+            "${own}x",
+            "javascript:alert(1)",
+            "data:text/html,<script>x</script>",
+            "about:blankx",
+            "",
+        )) {
+            assertFalse(url, ChatHtml.isAllowedNavigation(url, own))
+        }
+        assertTrue(ChatHtml.opensExternally("https://example.com/a?b#c"))
+        assertTrue(ChatHtml.opensExternally("HTTP://example.com"))
+        assertTrue(ChatHtml.opensExternally("mailto:a@b.c"))
+        assertFalse(ChatHtml.opensExternally("file:///etc/passwd"))
+        assertFalse(ChatHtml.opensExternally("javascript:alert(1)"))
+        assertFalse(ChatHtml.opensExternally("not a url"))
+    }
+
+    @Test
+    fun html_keeps_charset_first_in_head() {
+        val bigTheme = ChatTheme.rootStyle(mapOf("--vscode-font-family" to "\"" + "x".repeat(3000) + "\""))
+        val template = """<!doctype html><html lang="en"><head><meta charset="UTF-8"><title>t</title><script type="module">boot()</script></head><body></body></html>"""
+        val html = ChatHtml.render(template, "shim()", bigTheme)
+        val charset = html.indexOf("<meta charset=\"UTF-8\">")
+        assertTrue(charset in 0 until 1024)
+        assertTrue(charset < html.indexOf("Content-Security-Policy"))
+        assertTrue(html.indexOf("shim()") < html.indexOf("type=\"module\""))
+        assertEquals(1, Regex("<meta charset", RegexOption.IGNORE_CASE).findAll(html).count())
+
+        // No charset in the bundle: one is put first.
+        val bare = ChatHtml.render("""<html><head><script type="module">boot()</script></head></html>""", "shim()", bigTheme)
+        assertTrue(bare.startsWith("""<html><head><meta charset="utf-8">"""))
+        assertTrue(bare.indexOf("shim()") < bare.indexOf("type=\"module\""))
+    }
+
+    @Test
     fun post_script_escapes_the_message_as_a_js_string() {
         val msg = buildJsonObject {
             put("type", "chat/token")
-            put("text", "a'b\"c</script> \n")
+            put("text", "a'b\"c</script>\u2028\u2029\n")
         }
         val js = ChatHtml.postScript(msg)
         assertTrue(js.startsWith("window.postMessage(JSON.parse(\""))
         assertFalse(js.contains("</script>"))
-        assertFalse(js.contains(" "))
+        assertFalse(js.contains("\u2028"))
+        assertFalse(js.contains("\u2029"))
+        assertTrue(js.contains("\\u2028"))
         assertFalse(js.contains("\n"))
         // The literal decodes back to the message's JSON.
         val literal = js.removePrefix("window.postMessage(JSON.parse(").removeSuffix("), '*');")
@@ -688,7 +797,8 @@ class ChatEditorHostTest : com.intellij.testFramework.fixtures.BasePlatformTestC
     fun test_attachable_only_inside_the_project() {
         val host = IdeChatEditorHost(project) { true }
         val root = dev.localpilot.rpc.LocalPilotCore.getInstance(project).workspace
-        if (root != null) assertTrue(host.isAttachable(root.resolve("pkg/a.py").toUri().toString()))
+        assertNotNull("the test project has a workspace root", root)
+        assertTrue(host.isAttachable(root!!.resolve("pkg/a.py").toUri().toString()))
         assertFalse(host.isAttachable("file:///definitely/not/in/project/a.py"))
         assertFalse(host.isAttachable("https://example.com/a.py"))
         assertFalse(host.isAttachable("not a uri"))
