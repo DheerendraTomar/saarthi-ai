@@ -22,7 +22,9 @@ export interface InitializeResult {
  * - `ready`: `initialize` answered; requests and notifications flow;
  * - `reconnecting`: the socket closed; waiting for the backoff timer or a new socket;
  * - `crashed`: the server refused `initialize` (its core is crashed or cannot
- *   start); no retries until `reconnect()` (after `POST /localpilot/restart`);
+ *   start); `initialize` is re-sent on the open socket with the usual backoff
+ *   (any tab, or the server owner, may restart the core), and `reconnect()`
+ *   retries at once (after this tab's `POST /localpilot/restart`);
  * - `disposed`.
  */
 export type ConnectionState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'crashed' | 'disposed';
@@ -117,7 +119,7 @@ function abortError(): Error {
   return err;
 }
 
-const OPEN_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnecting'];
+const RETRY_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnecting', 'crashed'];
 
 /**
  * JSON-RPC to the LocalPilot core through the Jupyter server's
@@ -135,7 +137,8 @@ const OPEN_STATES: ReadonlyArray<ConnectionState> = ['connecting', 'reconnecting
  * DocumentSync (Task 3) replays `didOpen` for all its documents there.
  *
  * - `request()` waits while (re)connecting (honouring its `AbortSignal`) and
- *   rejects at once when `crashed` or disposed.
+ *   rejects at once when `crashed` (with the server's `RpcError`; check
+ *   `state` to tell "core down" from other errors) or disposed.
  * - `notify()` before the first `ready` is queued and flushed right after
  *   `initialize`; while reconnecting it is dropped (`onReconnect` replays state).
  */
@@ -286,7 +289,11 @@ export class WsCoreClient implements IDisposable {
     return this.statusListeners.add(listener);
   }
 
-  /** The socket closed after it had opened (e.g. 1012 mid chat turn): end running turns with this error. */
+  /**
+   * The socket closed after it had opened (e.g. 1012 mid chat turn): end
+   * running turns with this error. Also fires from `dispose()` and
+   * `reconnect()` on a ready client; check `isDisposed` before showing it.
+   */
   onDisconnect(listener: (error: CoreDisconnected) => void): IDisposable {
     return this.disconnectListeners.add(listener);
   }
@@ -360,13 +367,17 @@ export class WsCoreClient implements IDisposable {
       (err: unknown) => {
         // A close rejects initialize too; handleClose has dealt with that.
         if (this.ws !== ws || this._state === 'disposed' || err instanceof CoreDisconnected) return;
-        // The server refused (its core is crashed or cannot start): retrying cannot help.
+        // The server refused: its core is crashed or cannot start. Somebody may
+        // restart it (another tab, a settings change, the server owner), and the
+        // server closes no socket then, so keep asking on this one.
+        const first = this._state !== 'crashed';
         this._lastError = err instanceof Error ? err : new Error(String(err));
-        this.log(`initialize refused: ${this._lastError.message}`);
+        if (first) this.log(`initialize refused: ${this._lastError.message}`);
         const waiting = this.ready;
         this.ready = deferred();
         this.setState('crashed');
         waiting.reject(this._lastError);
+        this.scheduleReconnect();
       }
     );
   }
@@ -409,7 +420,11 @@ export class WsCoreClient implements IDisposable {
     this.attempt++;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      if (OPEN_STATES.includes(this._state)) this.connect();
+      if (this._state === 'crashed' && this.ws && this.opened) {
+        this.initialize(this.ws);
+      } else if (RETRY_STATES.includes(this._state)) {
+        this.connect();
+      }
     }, delay);
   }
 

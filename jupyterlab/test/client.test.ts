@@ -227,34 +227,56 @@ describe('WsCoreClient', () => {
     expect(disconnects).toHaveLength(2);
   });
 
-  it('stops retrying when the server refuses initialize, until reconnect()', async () => {
+  it('keeps retrying initialize while the server refuses it, and reconnect() retries at once', async () => {
     client = makeClient();
+    client.notify('textDocument/didOpen', { textDocument: { uri: 'file:///a.py' } });
     client.start();
     const ws = MockWebSocket.last;
     ws.open();
     await flush();
-    const init = ws.messages()[0];
-    ws.receive({
-      jsonrpc: '2.0',
-      id: init.id,
-      error: { code: -32603, message: 'LocalPilot core crashed; POST /localpilot/restart to retry' }
-    });
+    const refuse = () => {
+      const init = [...ws.messages()].reverse().find((m) => m.method === 'initialize');
+      ws.receive({
+        jsonrpc: '2.0',
+        id: init?.id,
+        error: { code: -32603, message: 'LocalPilot core crashed; POST /localpilot/restart to start it again' }
+      });
+    };
+    const initCount = () => ws.messages().filter((m) => m.method === 'initialize').length;
+    refuse();
     await flush();
     expect(client.state).toBe('crashed');
     expect(client.lastError?.message).toContain('POST /localpilot/restart');
-    expect(logs.join('\n')).toContain('initialize refused');
     await expect(client.request('chat/listSessions', {})).rejects.toThrow('POST /localpilot/restart');
 
-    await jest.advanceTimersByTimeAsync(60_000);
+    // Another tab (or the server owner) may restart the core: re-ask on the same
+    // socket with the usual backoff, without opening new sockets.
+    await jest.advanceTimersByTimeAsync(499);
+    expect(initCount()).toBe(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(initCount()).toBe(2);
+    refuse();
+    await flush();
+    expect(client.state).toBe('crashed');
+    expect(logs.filter((l) => l.includes('initialize refused'))).toHaveLength(1);
+    await jest.advanceTimersByTimeAsync(999);
+    expect(initCount()).toBe(2);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(initCount()).toBe(3);
+    ws.respond('initialize', INIT_RESULT);
+    await flush();
+    expect(client.state).toBe('ready');
+    expect(client.lastError).toBeUndefined();
     expect(MockWebSocket.instances).toHaveLength(1);
+    // The didOpen queued before the first ready went out once ready.
+    expect(ws.messages().map((m) => m.method)).toEqual(['initialize', 'initialize', 'initialize', 'textDocument/didOpen']);
 
-    // After POST /localpilot/restart the plugin calls reconnect(): a fresh socket at once.
+    // reconnect() (after this tab's POST /localpilot/restart): a fresh socket at once.
     client.reconnect();
     expect(ws.closedWith?.code).toBe(1000);
     expect(MockWebSocket.instances).toHaveLength(2);
     await connect();
     expect(client.state).toBe('ready');
-    expect(client.lastError).toBeUndefined();
   });
 
   it('dispose closes the socket, rejects pending requests and never reconnects', async () => {
