@@ -366,6 +366,52 @@ left to a later version.)
 - Talks to the host through a tiny `postMessage` shim with two
   implementations (VS Code `acquireVsCodeApi`, JCEF `window.cefQuery`).
 
+### 8.4 JupyterLab (`jupyterlab/`) — added 2026-10-21
+
+Owner requirement: completions (and chat) must work in JupyterLab and notebooks.
+Order of delivery: VS Code → JupyterLab → JetBrains. JetBrains must also
+complete inside `.ipynb` cells in PyCharm's notebook editor.
+
+- Target: JupyterLab ≥ 4.1 (owner runs 4.5.5, jupyter_server 2.17, Python 3.11
+  via pyenv). Shipped as one pip package `localpilot-jupyter` containing (a) a
+  prebuilt labextension and (b) a `jupyter_server` extension.
+- A browser cannot spawn the sidecar, so the **server extension owns the core
+  process**: one `localpilot-core serve --workspace <server root_dir>` per
+  Jupyter server, started lazily on first client connection, restarted on
+  crash (same ≤ 3/min policy as VS Code), stopped on server shutdown. It
+  exposes `GET /localpilot/status` and a WebSocket `/localpilot/rpc` that
+  bridges JSON-RPC lines 1:1 (text frames). Several browser tabs share one core;
+  each tab is a client, and the server multiplexes: `completion/*` and `chat/*`
+  requests are forwarded with per-tab id namespaces; core→client requests
+  (`workspace/applyEdit`) go to the tab that sent the originating `chat/send`;
+  `workspace/runCommand` is **answered by the server extension itself**
+  (subprocess in `root_dir`, same capture/timeout rules as §8.1) because the
+  browser cannot run commands. Binary location: bundled in the wheel under
+  `localpilot_jupyter/bin/<triple>/`, overridable by `LOCALPILOT_CORE_BINARY`
+  or the server config `LocalPilot.core_binary`.
+- Document sync mirrors the VS Code notebook scheme (plan 2026-10-21-vscode
+  Task 5): each code cell is a virtual file `<notebook path>.cell<i>.<ext>`,
+  plus one `<notebook path>.cells.<ext>` concatenation document; plain text
+  editors (`.py` files) sync as themselves. Notebook save → `didSave`.
+- Inline completions via `IInlineCompletionProvider` (`@jupyterlab/completer`):
+  JupyterLab's inline completer already debounces and shows ghost text; the
+  provider maps `fetch(request, context)` to `completion/request` for the cell's
+  virtual URI, honours the abort signal with `completion/cancel`, and reports
+  accepted/rejected. Multi-line completions are returned as one item.
+- Chat: a sidebar widget hosting the shared `chat-ui` bundle in an `iframe`
+  (`srcdoc`), using a third `HostBridge` implementation (parent-window
+  `postMessage`). Edits from the agent target either a cell (virtual URI →
+  cell model via the notebook's `sharedModel`) or a file (document manager
+  model), then save. "Start Ollama" opens a JupyterLab terminal and types
+  `ollama serve`; "Pull model" uses the core's `ollama/pull`.
+- Settings via JupyterLab's settings registry (same keys as §4.4), forwarded
+  at `initialize`; a change restarts the core (server endpoint
+  `POST /localpilot/restart`).
+- Non-goals: JupyterHub multi-user hardening, remote kernels on another host
+  (the core runs where the Jupyter server runs; completions still work, the
+  workspace is the server's filesystem), Notebook 7 classic UI beyond what the
+  shared lab extension already provides.
+
 ## 9. Testing and verification
 
 - Rust: unit tests for prompt assembly (byte-stable prefixes), cache, edit
