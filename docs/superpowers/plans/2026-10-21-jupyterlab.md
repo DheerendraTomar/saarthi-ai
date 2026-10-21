@@ -21,6 +21,8 @@
 - Settings keys = §4.4 names, via the settings registry; change → `POST /localpilot/restart`.
 - Binary bundled in the wheel at `localpilot_jupyter/bin/<triple>/localpilot-core` (v1: `aarch64-apple-darwin`); overridable by `LOCALPILOT_CORE_BINARY` env or `c.LocalPilot.core_binary`.
 - No telemetry; no network from the browser except the Jupyter server's own origin (CSP/XSRF respected).
+- Host contract with `chat-ui` (learned from the VS Code final review): send core notifications to the UI flattened as `{ type: <method>, ...params }`; on `ui/ready` send `session/list` **before** any turn event, then `session/history`, then `status`; pass `chat/approve.editedArgs` through whole; keep the full `chat/toolCall` params of calls still awaiting a decision per session and re-post them after `session/history`; send `chat/turnState { sessionId, running }` so the UI shows Stop; Stop targets the session whose turn is running; always send `completionsEnabled: true` to the core and gate completions client-side.
+- `@localpilot/rpc-client` ships TypeScript source (`main: ./src/index.ts`): the labextension build must transpile it (include it in the TS project or bundle via the builder's webpack config).
 - `pytest` and `jlpm test` green, `jlpm lint` clean before each commit; conventional commit messages; **no Co-Authored-By or other trailers**.
 
 ## Review Focus

@@ -22,6 +22,7 @@
 - `run_command`: `GeneralCommandLine` with the project base dir (or `cwd` param, confined to the project), output captured (16 KB tails) and echoed to a "LocalPilot" console/tool window tab, 10-minute timeout.
 - JCEF: `window.cefQuery` must exist before the bundle's module script runs (inject a `<script>` defining it from `JBCefJSQuery.inject(...)` at the top of the HTML; see VS Code Task 1 review note); host→UI via `browser.cefBrowser.executeJavaScript("window.postMessage(<json>, '*')")`; no external network from the page.
 - Keymap: `Cmd+Shift+L` / `Ctrl+Shift+L` opens the chat tool window.
+- Host contract with `chat-ui` (learned from the VS Code final review): send core notifications to the UI flattened as `{ type: <method>, ...params }`; on `ui/ready` send `session/list` **before** any turn event, then `session/history`, then `status`; pass `chat/approve.editedArgs` through whole; keep the full `chat/toolCall` params of calls still awaiting a decision per session and re-post them after `session/history`; send `chat/turnState { sessionId, running }` so the UI shows Stop; Stop targets the session whose turn is running; always send `completionsEnabled: true` to the core and gate completions client-side; `applyEdit` must map virtual cell URIs back to the notebook cell (never create files at `.cellN.<ext>` paths; reject `.cells.<ext>`).
 - `./gradlew test` and `./gradlew verifyPlugin` green before each commit; conventional commit messages; **no Co-Authored-By or other trailers**.
 
 ## Review Focus
