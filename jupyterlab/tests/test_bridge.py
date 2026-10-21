@@ -478,6 +478,24 @@ async def test_a_turn_done_before_its_send_answer_is_not_left_running(bridge: Br
     assert b.received[-1]["method"] == "chat/token"
 
 
+async def test_send_accepted_after_the_running_turn_ended_moves_the_session(bridge: Bridge, stub: StubCore) -> None:
+    a_id, a = await connect(bridge)
+    b_id, b = await connect(bridge)
+    await chat_send(bridge, a_id, "s1", id=2)
+    stub.emit({"id": forwarded_send(stub, a_id, 2)["id"], "result": {}})
+    await chat_send(bridge, b_id, "s1", id=3)  # a's turn still runs: a keeps the session for now
+    # a's turn ends before the core reads b's send, which it then accepts.
+    stub.emit({"method": "chat/done", "params": {"sessionId": "s1", "stopReason": "done"}})
+    stub.emit({"id": forwarded_send(stub, b_id, 3)["id"], "result": {}})
+    stub.emit({"method": "chat/token", "params": {"sessionId": "s1", "delta": "b's turn", "kind": "text"}})
+    assert b.received[-1]["method"] == "chat/token"
+    assert a.received[-1]["method"] == "chat/done"
+    # …and it runs: a cannot take it back with a send of its own.
+    await chat_send(bridge, a_id, "s1", id=4)
+    stub.emit(apply_edit(-5, "s1"))
+    assert b.received[-1]["method"] == "workspace/applyEdit"
+
+
 async def test_apply_edit_routed_by_session_id(bridge: Bridge, stub: StubCore) -> None:
     a_id, a = await connect(bridge)
     b_id, b = await connect(bridge)

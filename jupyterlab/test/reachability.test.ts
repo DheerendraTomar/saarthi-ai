@@ -16,7 +16,7 @@ class FakeClient {
 }
 
 describe('watchUnreachable', () => {
-  it('notifies once per error episode with a Retry that reconnects, and dismisses on ready', () => {
+  it('notifies on each entry into error with a Retry that reconnects, and dismisses on ready', () => {
     const client = new FakeClient();
     const shown: Array<{ message: string; retry: () => void }> = [];
     const dismissed: string[] = [];
@@ -29,18 +29,19 @@ describe('watchUnreachable', () => {
     });
 
     client.set('error');
-    client.set('connecting'); // Retry pressed
-    client.set('error'); // and failed again: no second notification
     expect(shown).toHaveLength(1);
     expect(shown[0].message).toBe(UNREACHABLE_MESSAGE);
     expect(shown[0].message).toContain('jupyter server extension list');
-    shown[0].retry();
+    shown[0].retry(); // JupyterLab closes the toast on the click
     expect(client.reconnect).toHaveBeenCalledTimes(1);
+    client.set('connecting');
+    client.set('error'); // the retry failed: a fresh notification, the old one dismissed
+    expect(shown).toHaveLength(2);
+    expect(dismissed).toEqual(['n1']);
 
     client.set('ready');
-    expect(dismissed).toEqual(['n1']);
+    expect(dismissed).toEqual(['n1', 'n2']);
     client.set('reconnecting');
-    client.set('error');
     expect(shown).toHaveLength(2);
     sub.dispose();
   });

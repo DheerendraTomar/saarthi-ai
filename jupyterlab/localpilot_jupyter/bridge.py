@@ -109,8 +109,9 @@ class Bridge:
         self._pending_calls: dict[str, tuple[str, str]] = {}
         # forwarded chat/history id → session whose pending call is replayed after the response
         self._replay_after: dict[str, str] = {}
-        # forwarded chat/send id → its session (a successful response starts a turn)
-        self._send_after: dict[str, str] = {}
+        # forwarded chat/send id → [session, whether it had a running turn when forwarded,
+        # stale]; a successful response starts a turn unless the turn already ended (stale)
+        self._send_after: dict[str, list[Any]] = {}
         # sessions with a running turn (successful chat/send until chat/done)
         self._running: set[str] = set()
         # document uri → tabs that have it open
@@ -261,7 +262,7 @@ class Bridge:
         if replay_session is not None:
             self._replay_after[forwarded] = replay_session
         if isinstance(send_session, str):
-            self._send_after[forwarded] = send_session
+            self._send_after[forwarded] = [send_session, send_session in self._running, False]
         msg["id"] = forwarded
         if not self._send_core(json.dumps(msg)):
             self._pending_client.pop(forwarded, None)
@@ -374,11 +375,14 @@ class Bridge:
             self.log.debug("LocalPilot: dropped a core response to unknown id %r", forwarded)
             return
         tab_id, original = self._pending_client.pop(forwarded)
-        sent_session = self._send_after.pop(forwarded, None)
-        if sent_session is not None and "error" not in msg:
-            # The core accepted this tab's turn: it runs, and it is this tab's.
-            self._running.add(sent_session)
+        sent = self._send_after.pop(forwarded, None)
+        if sent is not None and "error" not in msg:
+            # The core accepted this tab's turn: it is this tab's, and it runs unless it
+            # already ended (its chat/done can beat this answer).
+            sent_session, _, stale = sent
             self._owners[sent_session] = tab_id
+            if not stale:
+                self._running.add(sent_session)
         msg["id"] = original
         self._send_tab(tab_id, json.dumps(msg))
         session = self._replay_after.pop(forwarded, None)
@@ -397,9 +401,12 @@ class Bridge:
             if method == "chat/done":
                 self._running.discard(session)
                 # The core spawns the turn before answering chat/send, so a turn that ends at
-                # once can finish before that answer: it must not mark the session running.
-                for key in [k for k, s in self._send_after.items() if s == session]:
-                    del self._send_after[key]
+                # once can finish before that answer: a send forwarded while nothing ran is that
+                # turn, and must not mark the session running. A send forwarded during another
+                # turn may still be accepted after this done; its answer decides.
+                for entry in self._send_after.values():
+                    if entry[0] == session and not entry[1]:
+                        entry[2] = True
             if method == "chat/toolCall" and isinstance(call, str) and params.get("requiresApproval"):
                 self._pending_calls[session] = (call, line)
             elif method == "chat/done" or (
