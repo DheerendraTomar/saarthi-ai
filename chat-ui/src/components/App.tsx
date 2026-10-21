@@ -1,6 +1,6 @@
 import { memo } from "preact/compat";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
-import { applyTheme, type CompletionSettings, type HostBridge, type ModelKind } from "../host";
+import { applyTheme, type HostBridge, type ModelKind, type SettingsPatch } from "../host";
 import type { Attachment, ChatToolResult, Decision, JsonValue, OllamaState } from "../protocol";
 import { initialState, isSessionRunning, reduce } from "../state";
 import type { State } from "../state";
@@ -175,8 +175,9 @@ export function App({ bridge }: AppProps) {
         current = msg.next;
         bridge.post(msg.next === null ? { type: "chat/newSession" } : { type: "chat/switchSession", sessionId: msg.next });
       } else if (msg.type === "status") {
-        // First report, Ollama came back or a pull finished: (re)load the installed models.
-        if (msg.ollama === "ok" && ollama !== "ok") bridge.post({ type: "models/list" });
+        // First report, Ollama came back, a pull finished or a model went missing:
+        // (re)load the installed models — the picker is how a missing model is fixed.
+        if (msg.ollama !== "down" && msg.ollama !== ollama) bridge.post({ type: "models/list" });
         ollama = msg.ollama;
       }
       dispatch(msg);
@@ -218,7 +219,7 @@ export function App({ bridge }: AppProps) {
   );
 
   const onSelectModel = useCallback((kind: ModelKind, name: string) => bridge.post({ type: "model/select", kind, name }), [bridge]);
-  const onPatch = useCallback((patch: Partial<CompletionSettings>) => bridge.post({ type: "settings/set", patch }), [bridge]);
+  const onPatch = useCallback((patch: SettingsPatch) => bridge.post({ type: "settings/set", patch }), [bridge]);
   const onResetLearning = useCallback(() => {
     bridge.post({ type: "completion/resetLearning" });
     bridge.post({ type: "completion/stats" });
@@ -258,7 +259,13 @@ export function App({ bridge }: AppProps) {
           onToggleManage={() => togglePanel("sessions")}
         />
         <div class="header-right">
-          <ModelPicker kind="chat" models={state.models} ollama={state.status.ollama} onSelect={onSelectModel} />
+          <ModelPicker
+            kind="chat"
+            models={state.models}
+            ollama={state.status.ollama}
+            onSelect={onSelectModel}
+            hideDownState={state.status.ollama === "down"}
+          />
           <button
             type="button"
             class={`icon secondary${panel === "settings" ? " on" : ""}`}
@@ -285,6 +292,7 @@ export function App({ bridge }: AppProps) {
       {panel === "settings" ? (
         <SettingsPanel
           settings={state.settings}
+          settingsSeq={state.settingsSeq}
           stats={state.stats}
           models={state.models}
           ollama={state.status.ollama}

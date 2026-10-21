@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { CompletionSettings, ModelKind } from "../host";
+import type { CompletionSettings, ModelKind, SettingsPatch } from "../host";
 import type { CompletionStats, OllamaState } from "../protocol";
 import type { ModelsState } from "../state";
 import { ModelPicker } from "./ModelPicker";
@@ -9,6 +9,8 @@ interface NumberFieldProps {
   label: string;
   value: number;
   min: number;
+  /** `settingsSeq`: every `settings/current` resets the field, so a rejected write cannot stick. */
+  seq: number;
   onCommit(value: number): void;
 }
 
@@ -19,9 +21,9 @@ interface NumberFieldProps {
  * (preact/compat maps `onChange` to `input` for number inputs, hence the
  * listener on the element.)
  */
-function NumberField({ id, label, value, min, onCommit }: NumberFieldProps) {
+function NumberField({ id, label, value, min, seq, onCommit }: NumberFieldProps) {
   const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
+  useEffect(() => setDraft(String(value)), [value, seq]);
   const ref = useRef<HTMLInputElement>(null);
   const latest = useRef({ value, min, onCommit });
   latest.current = { value, min, onCommit };
@@ -94,15 +96,16 @@ function StatsTable({ stats }: { stats: CompletionStats }) {
 
 export interface SettingsPanelProps {
   settings: CompletionSettings | null;
+  settingsSeq: number;
   stats: CompletionStats | null;
   models: ModelsState | null;
   ollama: OllamaState | "unknown";
-  onPatch(patch: Partial<CompletionSettings>): void;
+  onPatch(patch: SettingsPatch): void;
   onSelectModel(kind: ModelKind, name: string): void;
   onResetLearning(): void;
 }
 
-export function SettingsPanel({ settings, stats, models, ollama, onPatch, onSelectModel, onResetLearning }: SettingsPanelProps) {
+export function SettingsPanel({ settings, settingsSeq, stats, models, ollama, onPatch, onSelectModel, onResetLearning }: SettingsPanelProps) {
   return (
     <section class="panel settings-panel" aria-label="Completion settings">
       <h2>Completions</h2>
@@ -117,6 +120,7 @@ export function SettingsPanel({ settings, stats, models, ollama, onPatch, onSele
             label="Max tokens"
             value={settings.completionMaxTokens}
             min={1}
+            seq={settingsSeq}
             onCommit={(v) => onPatch({ completionMaxTokens: v })}
           />
           <NumberField
@@ -124,6 +128,7 @@ export function SettingsPanel({ settings, stats, models, ollama, onPatch, onSele
             label="Debounce (ms)"
             value={settings.completionDebounceMs}
             min={0}
+            seq={settingsSeq}
             onCommit={(v) => onPatch({ completionDebounceMs: v })}
           />
           <NumberField
@@ -131,6 +136,7 @@ export function SettingsPanel({ settings, stats, models, ollama, onPatch, onSele
             label="Context budget (tokens)"
             value={settings.completionContextTokens}
             min={1}
+            seq={settingsSeq}
             onCommit={(v) => onPatch({ completionContextTokens: v })}
           />
           <div class="setting checkbox">

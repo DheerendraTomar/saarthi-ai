@@ -89,6 +89,10 @@ describe("model picker", () => {
 
     fireEvent.change(picker, { target: { value: "llama3.2:3b" } });
     expect(bridge.sent).toContainEqual({ type: "model/select", kind: "chat", name: "llama3.2:3b" });
+    expect(picker.value).toBe("llama3.2:3b");
+    // The host's next list is the truth: a rejected write does not stick.
+    emit({ type: "models/list", models: MODELS, current: CURRENT, ollama: "ok" });
+    expect(picker.value).toBe("qwen2.5-coder:7b");
 
     // The completion picker (settings panel) warns about no-FIM models but keeps them selectable.
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
@@ -108,6 +112,19 @@ describe("model picker", () => {
     expect(chat.selectedOptions[0].textContent).toContain("not installed");
   });
 
+  it("model_missing_status_requests_models", () => {
+    const { bridge, emit } = setup();
+    // Fresh install, configured model not pulled: the picker is the way out, so load it.
+    emit({ type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' });
+    expect(bridge.sent.filter((m) => m.type === "models/list")).toHaveLength(1);
+    // Still missing: no repeat. Down: nothing to ask. Back up: ask again.
+    emit({ type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' });
+    emit({ type: "status", ollama: "down", detail: "refused" });
+    expect(bridge.sent.filter((m) => m.type === "models/list")).toHaveLength(1);
+    emit({ type: "status", ollama: "ok", detail: "" });
+    expect(bridge.sent.filter((m) => m.type === "models/list")).toHaveLength(2);
+  });
+
   it("model_picker_shows_ollama_down_state", () => {
     const { bridge, emit, container } = setup();
     // Nothing known yet and Ollama down: a clear state, never an empty silent picker.
@@ -120,6 +137,13 @@ describe("model picker", () => {
     // An empty list with an error is the same unavailable state even if `ollama` says ok.
     emit({ type: "models/list", models: [], current: CURRENT, ollama: "ok", error: "bad response" });
     expect(container.querySelector(".model-picker.down")).toBeTruthy();
+
+    // The header does not repeat "Ollama down" next to the status pill; Settings still shows it.
+    emit({ type: "status", ollama: "down", detail: "refused" });
+    expect(container.querySelector(".header .model-picker.down")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(container.querySelector(".settings-panel .model-picker.down")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 
     // Once the list is known, a later down report keeps the last-known list, marked stale.
     emit({ type: "models/list", models: MODELS, current: CURRENT, ollama: "ok" });
@@ -174,6 +198,12 @@ describe("settings panel", () => {
     commit(maxTokens, "2.5");
     commit(maxTokens, "");
     expect(bridge.sent.length).toBe(posted);
+    expect(maxTokens.value).toBe("32");
+
+    // A committed value the host did not apply is reset by the next settings/current, even if unchanged.
+    commit(maxTokens, "64");
+    expect(maxTokens.value).toBe("64");
+    emit({ type: "settings/current", settings: SETTINGS });
     expect(maxTokens.value).toBe("32");
 
     // Stats per language.
@@ -250,11 +280,14 @@ describe("session deletion", () => {
     openSessions(emit);
     fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
     expect(bridge.sent.filter((m) => m.type === "session/clearAll")).toHaveLength(0);
-    expect(screen.getByText("Delete all sessions?")).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Confirm clear all" }).textContent).toContain("Delete all sessions?");
+    // Focus moves into the confirm step (the safe choice)…
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
 
-    // Cancel backs out without posting.
+    // Cancel backs out without posting, and focus returns to "Clear all".
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByText("Delete all sessions?")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Clear all" }));
     expect(bridge.sent.filter((m) => m.type === "session/clearAll")).toHaveLength(0);
 
     // Confirm posts once.
@@ -270,7 +303,9 @@ describe("session deletion", () => {
     emit({ type: "chat/turnState", sessionId: "s1", running: true });
 
     const running = within(list).getByRole("button", { name: 'Delete session "Fix the build"' }) as HTMLButtonElement;
-    expect(running.disabled).toBe(true);
+    // aria-disabled, not disabled: still focusable, so the reason is reachable by keyboard.
+    expect(running.getAttribute("aria-disabled")).toBe("true");
+    expect(running.disabled).toBe(false);
     expect(running.getAttribute("title")).toMatch(/turn is running/);
     // The reason is visible too, not only in a tooltip.
     const row = running.closest("li") as HTMLElement;
@@ -280,12 +315,12 @@ describe("session deletion", () => {
 
     // Other sessions stay deletable during the turn.
     const other = within(list).getByRole("button", { name: 'Delete session "Explain parser"' }) as HTMLButtonElement;
-    expect(other.disabled).toBe(false);
+    expect(other.getAttribute("aria-disabled")).toBeNull();
     fireEvent.click(other);
     expect(bridge.sent).toContainEqual({ type: "session/delete", sessionId: "s2" });
 
     // When the turn ends, the current session is deletable again.
     emit({ type: "chat/done", sessionId: "s1", stopReason: "done" });
-    expect(running.disabled).toBe(false);
+    expect(running.getAttribute("aria-disabled")).toBeNull();
   });
 });

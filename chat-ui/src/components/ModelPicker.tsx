@@ -22,6 +22,8 @@ export interface ModelPickerProps {
   /** From the `status` notification: a down report also marks a known list stale. */
   ollama: OllamaState | "unknown";
   onSelect(kind: ModelKind, name: string): void;
+  /** Render nothing for the "Ollama down" state (the header's status pill already says so). */
+  hideDownState?: boolean;
 }
 
 const LABEL: Record<ModelKind, string> = { chat: "Chat model", completion: "Completion model" };
@@ -31,16 +33,18 @@ const LABEL: Record<ModelKind, string> = { chat: "Chat model", completion: "Comp
  * the first list it says so, with Ollama down and nothing cached it shows an
  * explicit "Ollama down" state, and with a cached list it marks it stale.
  */
-export function ModelPicker({ kind, models, ollama, onSelect }: ModelPickerProps) {
+export function ModelPicker({ kind, models, ollama, onSelect, hideDownState }: ModelPickerProps) {
   const current = models?.current[kind] ?? "";
   // The pick shows immediately; the host's next `models/list` confirms it.
   const [selected, setSelected] = useState(current);
-  useEffect(() => setSelected(current), [current]);
+  // Every fresh `models/list` resets the pick, so a rejected write cannot stick.
+  useEffect(() => setSelected(current), [current, models?.seq]);
 
   const unavailable =
     (models === null && ollama === "down") ||
     (models !== null && models.list.length === 0 && (models.ollama === "down" || models.error !== undefined));
   if (unavailable) {
+    if (hideDownState) return null;
     return (
       <div class={`model-picker down ${kind}`} role="status" title={models?.error ?? "Ollama is not reachable"}>
         No models — Ollama down

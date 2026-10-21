@@ -30,6 +30,9 @@ export interface CompletionSettings {
   adaptiveCompletions: boolean;
 }
 
+/** What `settings/set` may change (the completion model is set with `model/select`). */
+export type SettingsPatch = Partial<Omit<CompletionSettings, "completionModel">>;
+
 /** Messages the UI sends to the host. */
 export type UiToHost =
   | { type: "chat/send"; message: string; attachments: Attachment[] }
@@ -49,8 +52,8 @@ export type UiToHost =
   | { type: "model/select"; kind: ModelKind; name: string }
   /** Ask for `settings/current`. */
   | { type: "settings/get" }
-  /** Persist the given settings; the host answers with `settings/current`. */
-  | { type: "settings/set"; patch: Partial<CompletionSettings> }
+  /** Persist the given settings; the host answers with `settings/current`. The completion model goes through `model/select`. */
+  | { type: "settings/set"; patch: SettingsPatch }
   /** Core `chat/deleteSession`; the host answers `session/deleted` or `ui/error` (turn running). */
   | { type: "session/delete"; sessionId: string }
   /** Core `chat/clearSessions` (already confirmed by the user). */

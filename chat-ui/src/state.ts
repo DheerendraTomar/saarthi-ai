@@ -58,6 +58,8 @@ export interface ModelsState {
   error?: string;
   /** `list` is a cached copy: the latest report was an empty list with Ollama down / an error. */
   stale: boolean;
+  /** Bumped on every `models/list`, so pickers drop an unconfirmed pick even when `current` is unchanged. */
+  seq: number;
 }
 
 export interface State {
@@ -77,6 +79,8 @@ export interface State {
   models: ModelsState | null;
   /** `null` until the host's first `settings/current`. */
   settings: CompletionSettings | null;
+  /** Bumped on every `settings/current`, so fields drop unconfirmed edits even when values are unchanged. */
+  settingsSeq: number;
   /** `null` until the host's first `completion/stats`. */
   stats: CompletionStats | null;
   /** Sessions with a turn in progress (any session, not only the current one). */
@@ -107,6 +111,7 @@ export function initialState(): State {
     notice: null,
     models: null,
     settings: null,
+    settingsSeq: 0,
     stats: null,
     runningSessions: [],
   };
@@ -302,12 +307,13 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
         current: event.current,
         ollama: event.ollama,
         stale: keep,
+        seq: (state.models?.seq ?? 0) + 1,
       };
       if (event.error !== undefined) models.error = event.error;
       return { ...state, models };
     }
     case "settings/current":
-      return { ...state, settings: event.settings };
+      return { ...state, settings: event.settings, settingsSeq: state.settingsSeq + 1 };
     case "completion/stats":
       return { ...state, stats: event.stats };
     case "session/deleted": {

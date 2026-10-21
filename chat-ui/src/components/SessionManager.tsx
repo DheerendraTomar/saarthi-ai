@@ -1,4 +1,4 @@
-import { useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import type { SessionSummary } from "../protocol";
 import { TrashIcon } from "./icons";
 
@@ -15,6 +15,18 @@ export interface SessionManagerProps {
 
 export function SessionManager({ sessions, currentSessionId, isRunning, onSwitch, onDelete, onClearAll }: SessionManagerProps) {
   const [confirming, setConfirming] = useState(false);
+  const clearRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const opened = useRef(false);
+  // Focus follows the confirm step: Cancel when it opens, "Clear all" when it closes.
+  useEffect(() => {
+    if (confirming) {
+      opened.current = true;
+      cancelRef.current?.focus();
+    } else if (opened.current) {
+      clearRef.current?.focus();
+    }
+  }, [confirming]);
   const anyRunning = sessions.some((s) => isRunning(s.sessionId));
   return (
     <section class="panel session-manager" aria-label="Manage sessions">
@@ -41,26 +53,25 @@ export function SessionManager({ sessions, currentSessionId, isRunning, onSwitch
                   Running
                 </span>
               ) : null}
-              <span class="delete-wrap" title={running ? RUNNING_REASON : undefined}>
                 <button
                   type="button"
                   class="icon secondary"
                   aria-label={`Delete session "${title}"`}
                   title={running ? RUNNING_REASON : "Delete session"}
-                  disabled={running}
+                  // aria-disabled (not disabled) keeps the reason reachable by keyboard and tooltip.
+                  aria-disabled={running ? "true" : undefined}
                   onClick={() => {
                     if (!running) onDelete(s.sessionId);
                   }}
                 >
                   <TrashIcon />
                 </button>
-              </span>
             </li>
           );
         })}
       </ul>
       {confirming ? (
-        <div class="confirm" role="alertdialog" aria-label="Confirm clear all">
+        <div class="confirm" role="group" aria-label="Confirm clear all">
           <span>Delete all sessions?</span>
           {anyRunning ? <span class="muted">Running sessions are kept.</span> : null}
           <button
@@ -73,12 +84,18 @@ export function SessionManager({ sessions, currentSessionId, isRunning, onSwitch
           >
             Delete all
           </button>
-          <button type="button" class="secondary" onClick={() => setConfirming(false)}>
+          <button ref={cancelRef} type="button" class="secondary" onClick={() => setConfirming(false)}>
             Cancel
           </button>
         </div>
       ) : (
-        <button type="button" class="secondary" disabled={sessions.length === 0} onClick={() => setConfirming(true)}>
+        <button
+          ref={clearRef}
+          type="button"
+          class="secondary"
+          disabled={sessions.length === 0}
+          onClick={() => setConfirming(true)}
+        >
           Clear all
         </button>
       )}

@@ -79,10 +79,11 @@ button {
   padding: 4px 10px;
   cursor: pointer;
 }
-button:hover:not(:disabled) {
+button:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--lp-button-hover);
 }
-button:disabled {
+button:disabled,
+button[aria-disabled="true"] {
   opacity: 0.5;
   cursor: default;
 }
@@ -90,7 +91,7 @@ button.secondary {
   color: var(--lp-button2-fg);
   background: var(--lp-button2-bg);
 }
-button.secondary:hover:not(:disabled) {
+button.secondary:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--vscode-button-secondaryHoverBackground, #45494e);
 }
 button:focus-visible,
@@ -446,6 +447,7 @@ select:focus-visible {
 /* Header controls: model picker, icon buttons */
 .header-right {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   min-width: 0;
@@ -482,6 +484,12 @@ button.danger {
   color: var(--lp-input-fg);
   background: var(--lp-input-bg);
   border-color: var(--lp-input-border);
+}
+.model-picker {
+  min-width: 0;
+}
+.model-picker select {
+  width: 100%;
 }
 .model-picker.stale select {
   border-style: dashed;
