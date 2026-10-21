@@ -57,12 +57,14 @@ import kotlinx.serialization.json.JsonObject
 import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
 import org.cef.handler.CefLifeSpanHandlerAdapter
+import org.cef.handler.CefLoadHandlerAdapter
 import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
 import java.awt.BorderLayout
 import java.awt.datatransfer.StringSelection
 import java.net.URI
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.JPanel
 import javax.swing.SwingConstants
 
@@ -121,13 +123,24 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
 
     /**
      * Keeps the browser on the chat page: chat-ui renders http(s)/mailto links as real anchors, and following one would
-     * replace the page (and give the remote page the bridge). Those navigations and every popup are cancelled; web and
-     * mail links open in the system browser / mail client instead.
+     * replace the page (and give the remote page the bridge). Those navigations and every popup are cancelled; a web or
+     * mail link the user clicked (a gesture in the main frame) opens in the system browser / mail client instead, and
+     * script-driven or sub-frame navigations are cancelled silently. `about:blank` (the browser's initial page) is
+     * allowed only until the chat page has loaded, so the context menu's Back cannot blank the pane.
      */
     private fun installNavigationGuard(browser: JBCefBrowser) {
-        fun openExternally(url: String?) {
-            if (url != null && ChatHtml.opensExternally(url)) BrowserUtil.browse(url)
+        val pageLoaded = AtomicBoolean(false)
+        fun browse(url: String) {
+            // CEF callbacks run on the CEF thread; open the link from the EDT.
+            ApplicationManager.getApplication().invokeLater { BrowserUtil.browse(url) }
         }
+        browser.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
+            override fun onLoadEnd(cefBrowser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
+                if (frame?.isMain != false && ChatHtml.isAllowedNavigation(frame?.url ?: "", ChatHtml.PAGE_URL, pageLoaded = true)) {
+                    pageLoaded.set(true)
+                }
+            }
+        }, browser.cefBrowser)
         browser.jbCefClient.addRequestHandler(object : CefRequestHandlerAdapter() {
             override fun onBeforeBrowse(
                 cefBrowser: CefBrowser?,
@@ -137,20 +150,20 @@ class ChatToolWindowFactory : ToolWindowFactory, DumbAware {
                 isRedirect: Boolean,
             ): Boolean {
                 val url = request?.url ?: return true
-                if (ChatHtml.isAllowedNavigation(url, ChatHtml.PAGE_URL)) return false
-                openExternally(url)
+                if (ChatHtml.isAllowedNavigation(url, ChatHtml.PAGE_URL, pageLoaded.get())) return false
+                if (ChatHtml.opensExternally(url, userGesture, frame?.isMain)) browse(url)
                 return true
             }
 
             // Ctrl/middle-click ("open in a new tab"): never inside the chat browser.
             override fun onOpenURLFromTab(cefBrowser: CefBrowser?, frame: CefFrame?, targetUrl: String?, userGesture: Boolean): Boolean {
-                openExternally(targetUrl)
+                if (targetUrl != null && ChatHtml.opensExternally(targetUrl, userGesture, frame?.isMain)) browse(targetUrl)
                 return true
             }
         }, browser.cefBrowser)
         browser.jbCefClient.addLifeSpanHandler(object : CefLifeSpanHandlerAdapter() {
             override fun onBeforePopup(cefBrowser: CefBrowser?, frame: CefFrame?, targetUrl: String?, targetFrameName: String?): Boolean {
-                openExternally(targetUrl)
+                if (targetUrl != null && ChatHtml.opensExternally(targetUrl)) browse(targetUrl)
                 return true
             }
         }, browser.cefBrowser)
@@ -187,20 +200,30 @@ object ChatHtml {
     const val RESOURCE = "/chat/index.html"
 
     /**
-     * The URL the page is loaded under (`loadHTML(html, PAGE_URL)`; JCEF serves the HTML from memory for it). Fixed, so
-     * the navigation guard can recognise it: `loadHTML(html)` alone would pick a random `file:///jbcefbrowser/` URL.
+     * The URL the page is loaded under: `loadHTML(html, PAGE_URL)` serves the in-memory HTML at exactly this
+     * `file:///jbcefbrowser/…` URL (JCEF keeps it verbatim; no file is read). It is fixed so the navigation guard can
+     * recognise the page; `loadHTML(html)` without a URL would use a generated `file:///jbcefbrowser/<n>` one.
      */
     const val PAGE_URL = "file:///jbcefbrowser/localpilot-chat.html"
 
     private val EXTERNAL_SCHEMES = setOf("http", "https", "mailto")
 
     /**
-     * Whether the chat browser may navigate to [url]: only its own page [ownUrl] (an in-page `#fragment` included) and
-     * `about:blank`. Anything else would take the browser off the chat (losing its state) and hand the bridge — every
-     * host → UI message and the `cefQuery` function — to that page; the guard cancels it.
+     * Whether the chat browser may navigate to [url]: only its own page [ownUrl] (an in-page `#fragment` included), and
+     * `about:blank` only while the page has not loaded yet ([pageLoaded] false; afterwards it would only blank the
+     * pane, e.g. via the context menu's Back). Anything else would take the browser off the chat (losing its state) and
+     * hand the bridge — every host → UI message and the `cefQuery` function — to that page; the guard cancels it.
      */
-    fun isAllowedNavigation(url: String, ownUrl: String): Boolean =
-        url == "about:blank" || url == ownUrl || url.startsWith("$ownUrl#")
+    fun isAllowedNavigation(url: String, ownUrl: String, pageLoaded: Boolean): Boolean =
+        url == ownUrl || url.startsWith("$ownUrl#") || (url == "about:blank" && !pageLoaded)
+
+    /**
+     * Whether a navigation the guard cancelled opens in the system browser / mail client: an http(s)/mailto link the
+     * user clicked ([userGesture]) in the main frame ([isMainFrame] null = unknown, treated as main). Script-driven or
+     * sub-frame navigations are cancelled silently.
+     */
+    fun opensExternally(url: String, userGesture: Boolean, isMainFrame: Boolean?): Boolean =
+        userGesture && isMainFrame != false && opensExternally(url)
 
     /** Whether a link the guard cancelled is opened in the system browser / mail client instead (http(s), mailto). */
     fun opensExternally(url: String): Boolean {

@@ -667,9 +667,10 @@ class ChatBridgeTest {
     @Test
     fun navigation_allows_only_own_page_and_opens_links_externally() {
         val own = ChatHtml.PAGE_URL
-        assertTrue(ChatHtml.isAllowedNavigation(own, own))
-        assertTrue("in-page anchor", ChatHtml.isAllowedNavigation("$own#top", own))
-        assertTrue(ChatHtml.isAllowedNavigation("about:blank", own))
+        for (loaded in listOf(false, true)) {
+            assertTrue(ChatHtml.isAllowedNavigation(own, own, pageLoaded = loaded))
+            assertTrue("in-page anchor", ChatHtml.isAllowedNavigation("$own#top", own, pageLoaded = loaded))
+        }
         for (url in listOf(
             "https://example.com/",
             "http://localhost:11434/api/tags",
@@ -683,7 +684,8 @@ class ChatBridgeTest {
             "about:blankx",
             "",
         )) {
-            assertFalse(url, ChatHtml.isAllowedNavigation(url, own))
+            assertFalse(url, ChatHtml.isAllowedNavigation(url, own, pageLoaded = false))
+            assertFalse(url, ChatHtml.isAllowedNavigation(url, own, pageLoaded = true))
         }
         assertTrue(ChatHtml.opensExternally("https://example.com/a?b#c"))
         assertTrue(ChatHtml.opensExternally("HTTP://example.com"))
@@ -691,6 +693,27 @@ class ChatBridgeTest {
         assertFalse(ChatHtml.opensExternally("file:///etc/passwd"))
         assertFalse(ChatHtml.opensExternally("javascript:alert(1)"))
         assertFalse(ChatHtml.opensExternally("not a url"))
+    }
+
+    @Test
+    fun about_blank_is_allowed_only_before_the_page_has_loaded() {
+        val own = ChatHtml.PAGE_URL
+        assertTrue("the browser's initial blank page", ChatHtml.isAllowedNavigation("about:blank", own, pageLoaded = false))
+        assertFalse("Back must not blank the chat", ChatHtml.isAllowedNavigation("about:blank", own, pageLoaded = true))
+    }
+
+    @Test
+    fun cancelled_links_open_externally_only_on_a_user_gesture_in_the_main_frame() {
+        for (url in listOf("https://example.com/", "mailto:a@b.c")) {
+            assertTrue(url, ChatHtml.opensExternally(url, userGesture = true, isMainFrame = true))
+            assertTrue("$url, frame unknown", ChatHtml.opensExternally(url, userGesture = true, isMainFrame = null))
+            assertFalse("$url, script navigation", ChatHtml.opensExternally(url, userGesture = false, isMainFrame = true))
+            assertFalse("$url, script navigation", ChatHtml.opensExternally(url, userGesture = false, isMainFrame = null))
+            assertFalse("$url, sub-frame", ChatHtml.opensExternally(url, userGesture = true, isMainFrame = false))
+        }
+        for (url in listOf("file:///etc/passwd", "javascript:alert(1)", "not a url")) {
+            assertFalse(url, ChatHtml.opensExternally(url, userGesture = true, isMainFrame = true))
+        }
     }
 
     @Test
