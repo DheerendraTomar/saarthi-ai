@@ -17,8 +17,8 @@ Requires Rust (stable), Node 20+ and npm; the bundled core is built for this mac
 
 ```sh
 npm ci                                   # once, from the repo root
-bash scripts/package-vscode.sh           # → dist/localpilot-0.2.2.vsix
-code --install-extension dist/localpilot-0.2.2.vsix --force
+bash scripts/package-vscode.sh           # → dist/localpilot-0.2.2-darwin-arm64.vsix
+code --install-extension dist/localpilot-0.2.2-darwin-arm64.vsix --force
 code --list-extensions | grep localpilot # → localpilot.localpilot
 ```
 

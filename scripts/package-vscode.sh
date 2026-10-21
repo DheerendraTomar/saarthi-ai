@@ -29,9 +29,10 @@ rm -f vscode/out/*.map
 
 # 4. Package. node_modules are not shipped: esbuild already bundled every dependency.
 version="$(node -p 'require("./vscode/package.json").version')"
-vsix="$repo/dist/localpilot-$version.vsix"
+target="${VSCE_TARGET:-darwin-arm64}"   # the bundled core is aarch64-apple-darwin only
+vsix="$repo/dist/localpilot-$version-$target.vsix"
 mkdir -p dist
-(cd vscode && npx --no-install vsce package --no-dependencies --allow-missing-repository -o "$vsix")
+(cd vscode && npx --no-install vsce package --no-dependencies --allow-missing-repository --target "$target" -o "$vsix")
 
 # 5. The package must contain the core and the chat page.
 listing="$(unzip -l "$vsix")"

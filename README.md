@@ -30,8 +30,8 @@ ollama serve &                           # or launch the Ollama app
 ollama pull qwen2.5-coder:0.5b-base      # completions
 ollama pull qwen3.8:27b-mlx              # chat
 npm ci
-bash scripts/package-vscode.sh           # → dist/localpilot-0.2.2.vsix
-code --install-extension dist/localpilot-0.2.2.vsix --force
+bash scripts/package-vscode.sh           # → dist/localpilot-0.2.2-darwin-arm64.vsix
+code --install-extension dist/localpilot-0.2.2-darwin-arm64.vsix --force
 ```
 
 Open a folder in VS Code: ghost text appears as you type, and `Cmd+Shift+L`
