@@ -62,9 +62,10 @@ body {
 
 .header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px 8px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--lp-border);
 }
@@ -440,4 +441,150 @@ select:focus-visible {
 .diff-more:hover:not(:disabled) {
   background: none;
   text-decoration: underline;
+}
+
+/* Header controls: model picker, icon buttons */
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 5px;
+}
+button.icon.on {
+  outline: 1px solid var(--lp-focus);
+}
+button.danger {
+  color: var(--lp-button-fg);
+  background: var(--lp-error);
+}
+.muted {
+  color: var(--lp-muted);
+}
+.model-picker select,
+.setting input[type="number"] {
+  min-width: 0;
+  max-width: 220px;
+  font: inherit;
+  color: var(--lp-dropdown-fg);
+  background: var(--lp-dropdown-bg);
+  border: 1px solid var(--lp-dropdown-border);
+  border-radius: 2px;
+  padding: 2px 4px;
+}
+.setting input[type="number"] {
+  width: 90px;
+  color: var(--lp-input-fg);
+  background: var(--lp-input-bg);
+  border-color: var(--lp-input-border);
+}
+.model-picker.stale select {
+  border-style: dashed;
+  color: var(--lp-muted);
+}
+.model-picker.down {
+  font-size: 0.9em;
+  color: var(--lp-error);
+  border: 1px solid var(--lp-border);
+  border-radius: 2px;
+  padding: 1px 6px;
+}
+.model-warning {
+  font-size: 0.9em;
+  color: var(--lp-warn);
+  margin-top: 2px;
+}
+
+/* Panels under the header: session manager, settings */
+.panel {
+  max-height: 60%;
+  overflow: auto;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--lp-border);
+  background: var(--lp-card-bg);
+}
+.panel h2 {
+  font-size: 1em;
+  margin: 4px 0 6px;
+}
+.panel h2 + * {
+  margin-top: 0;
+}
+.setting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+  margin-bottom: 6px;
+}
+.setting.checkbox {
+  justify-content: flex-start;
+}
+.session-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+}
+.session-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.session-list .session-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  color: var(--lp-fg);
+  background: transparent;
+  padding: 2px 4px;
+}
+.session-list .session-title:hover:not(:disabled) {
+  background: var(--lp-user-bg);
+}
+.session-list li.current .session-title {
+  font-weight: 600;
+}
+.running-badge {
+  font-size: 0.85em;
+  color: var(--lp-warn);
+}
+.confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+table.stats {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92em;
+  margin-bottom: 6px;
+}
+table.stats th,
+table.stats td {
+  text-align: right;
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--lp-border);
+}
+table.stats th:first-child,
+table.stats td:first-child {
+  text-align: left;
+}
+table.stats th {
+  color: var(--lp-muted);
+  font-weight: normal;
+}
+.log-path code {
+  font-family: var(--lp-mono);
+  word-break: break-all;
 }

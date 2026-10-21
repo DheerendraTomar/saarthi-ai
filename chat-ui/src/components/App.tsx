@@ -1,12 +1,16 @@
 import { memo } from "preact/compat";
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "preact/hooks";
-import { applyTheme, type HostBridge } from "../host";
-import type { Attachment, ChatToolResult, Decision, JsonValue } from "../protocol";
-import { initialState, reduce } from "../state";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
+import { applyTheme, type CompletionSettings, type HostBridge, type ModelKind } from "../host";
+import type { Attachment, ChatToolResult, Decision, JsonValue, OllamaState } from "../protocol";
+import { initialState, isSessionRunning, reduce } from "../state";
 import type { State } from "../state";
 import { Composer } from "./Composer";
+import { GearIcon, ListIcon } from "./icons";
 import { Message } from "./Message";
 import type { CodeAction } from "./Message";
+import { ModelPicker } from "./ModelPicker";
+import { SessionManager } from "./SessionManager";
+import { SettingsPanel } from "./SettingsPanel";
 import { ToolCard } from "./ToolCard";
 
 export interface AppProps {
@@ -69,7 +73,15 @@ function StatusPill({ status, pull, bridge }: Pick<State, "status" | "pull"> & {
   );
 }
 
-function SessionSwitcher({ sessions, currentSessionId, bridge }: Pick<State, "sessions" | "currentSessionId"> & { bridge: HostBridge }) {
+type Panel = "sessions" | "settings" | null;
+
+interface SessionSwitcherProps extends Pick<State, "sessions" | "currentSessionId"> {
+  bridge: HostBridge;
+  managing: boolean;
+  onToggleManage(): void;
+}
+
+function SessionSwitcher({ sessions, currentSessionId, bridge, managing, onToggleManage }: SessionSwitcherProps) {
   const known = currentSessionId !== null && sessions.some((s) => s.sessionId === currentSessionId);
   return (
     <div class="sessions">
@@ -101,6 +113,16 @@ function SessionSwitcher({ sessions, currentSessionId, bridge }: Pick<State, "se
         onClick={() => bridge.post({ type: "chat/newSession" })}
       >
         New
+      </button>
+      <button
+        type="button"
+        class={`icon secondary${managing ? " on" : ""}`}
+        aria-label="Manage sessions"
+        aria-pressed={managing}
+        title="Manage sessions"
+        onClick={onToggleManage}
+      >
+        <ListIcon />
       </button>
     </div>
   );
@@ -138,10 +160,25 @@ const ToolCallRow = memo(ToolCallRowView);
 export function App({ bridge }: AppProps) {
   const [state, dispatch] = useReducer(reduce, undefined, initialState);
   const listRef = useRef<HTMLDivElement>(null);
+  const [panel, setPanel] = useState<Panel>(null);
 
   useEffect(() => {
+    // Mirrors of state the handler needs synchronously (several host messages
+    // can arrive before a re-render, e.g. one `session/deleted` per cleared session).
+    let current: string | null = null;
+    let ollama: OllamaState | null = null;
     const off = bridge.onMessage((msg) => {
       if (msg.type === "ui/theme") applyTheme(msg.vars);
+      if (msg.type === "session/list") current = msg.current;
+      else if (msg.type === "session/history") current = msg.sessionId;
+      else if (msg.type === "session/deleted" && msg.sessionId === current) {
+        current = msg.next;
+        bridge.post(msg.next === null ? { type: "chat/newSession" } : { type: "chat/switchSession", sessionId: msg.next });
+      } else if (msg.type === "status") {
+        // First report, Ollama came back or a pull finished: (re)load the installed models.
+        if (msg.ollama === "ok" && ollama !== "ok") bridge.post({ type: "models/list" });
+        ollama = msg.ollama;
+      }
       dispatch(msg);
     });
     bridge.post({ type: "ui/ready" });
@@ -180,6 +217,22 @@ export function App({ bridge }: AppProps) {
     [bridge],
   );
 
+  const onSelectModel = useCallback((kind: ModelKind, name: string) => bridge.post({ type: "model/select", kind, name }), [bridge]);
+  const onPatch = useCallback((patch: Partial<CompletionSettings>) => bridge.post({ type: "settings/set", patch }), [bridge]);
+  const onResetLearning = useCallback(() => {
+    bridge.post({ type: "completion/resetLearning" });
+    bridge.post({ type: "completion/stats" });
+  }, [bridge]);
+  const togglePanel = (p: Exclude<Panel, null>) => {
+    const next = panel === p ? null : p;
+    setPanel(next);
+    if (next === "settings") {
+      bridge.post({ type: "settings/get" });
+      bridge.post({ type: "completion/stats" });
+      bridge.post({ type: "models/list" });
+    }
+  };
+
   // Results are their own rows in `messages`; join them into their cards.
   const results = useMemo(() => {
     const calls = new Set<string>();
@@ -197,9 +250,49 @@ export function App({ bridge }: AppProps) {
   return (
     <div class="app">
       <header class="header">
-        <SessionSwitcher sessions={state.sessions} currentSessionId={state.currentSessionId} bridge={bridge} />
-        <StatusPill status={state.status} pull={state.pull} bridge={bridge} />
+        <SessionSwitcher
+          sessions={state.sessions}
+          currentSessionId={state.currentSessionId}
+          bridge={bridge}
+          managing={panel === "sessions"}
+          onToggleManage={() => togglePanel("sessions")}
+        />
+        <div class="header-right">
+          <ModelPicker kind="chat" models={state.models} ollama={state.status.ollama} onSelect={onSelectModel} />
+          <button
+            type="button"
+            class={`icon secondary${panel === "settings" ? " on" : ""}`}
+            aria-label="Settings"
+            aria-pressed={panel === "settings"}
+            title="Completion settings"
+            onClick={() => togglePanel("settings")}
+          >
+            <GearIcon />
+          </button>
+          <StatusPill status={state.status} pull={state.pull} bridge={bridge} />
+        </div>
       </header>
+      {panel === "sessions" ? (
+        <SessionManager
+          sessions={state.sessions}
+          currentSessionId={state.currentSessionId}
+          isRunning={(id) => isSessionRunning(state, id)}
+          onSwitch={(sessionId) => bridge.post({ type: "chat/switchSession", sessionId })}
+          onDelete={(sessionId) => bridge.post({ type: "session/delete", sessionId })}
+          onClearAll={() => bridge.post({ type: "session/clearAll" })}
+        />
+      ) : null}
+      {panel === "settings" ? (
+        <SettingsPanel
+          settings={state.settings}
+          stats={state.stats}
+          models={state.models}
+          ollama={state.status.ollama}
+          onPatch={onPatch}
+          onSelectModel={onSelectModel}
+          onResetLearning={onResetLearning}
+        />
+      ) : null}
       <div class="messages" ref={listRef} role="log" aria-live="polite" onScroll={onScroll}>
         {state.messages.map((m, i) => {
           if (m.kind === "toolCall") {

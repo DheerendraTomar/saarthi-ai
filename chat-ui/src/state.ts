@@ -1,7 +1,7 @@
 // Chat panel state and the pure reducer that applies host messages and local
 // UI events to it. Components render from `State` only.
-import type { HostToUi } from "./host";
-import type { HistoryMessage, JsonValue, OllamaState, Range, SessionSummary } from "./protocol";
+import type { CompletionSettings, HostToUi } from "./host";
+import type { CompletionStats, HistoryMessage, JsonValue, ModelInfo, OllamaState, Range, SessionSummary } from "./protocol";
 
 export interface UserMsg {
   kind: "user";
@@ -50,6 +50,16 @@ export interface PullState {
   total?: number;
 }
 
+export interface ModelsState {
+  /** Installed models; the last-known list while Ollama is unreachable. */
+  list: ModelInfo[];
+  current: { chat: string; completion: string };
+  ollama: OllamaState;
+  error?: string;
+  /** `list` is a cached copy: the latest report was an empty list with Ollama down / an error. */
+  stale: boolean;
+}
+
 export interface State {
   sessions: SessionSummary[];
   currentSessionId: string | null;
@@ -63,6 +73,19 @@ export interface State {
   activeFile: { uri: string; selection?: Range } | null;
   /** A short, non-message notice (context full, host error). */
   notice: string | null;
+  /** `null` until the host's first `models/list`. */
+  models: ModelsState | null;
+  /** `null` until the host's first `settings/current`. */
+  settings: CompletionSettings | null;
+  /** `null` until the host's first `completion/stats`. */
+  stats: CompletionStats | null;
+  /** Sessions with a turn in progress (any session, not only the current one). */
+  runningSessions: string[];
+}
+
+/** Whether `sessionId` has a turn in progress (deleting it would be refused). */
+export function isSessionRunning(state: State, sessionId: string): boolean {
+  return state.runningSessions.includes(sessionId) || (sessionId === state.currentSessionId && state.streaming !== null);
 }
 
 /** Events originating in the UI itself (not from the host). */
@@ -82,7 +105,29 @@ export function initialState(): State {
     status: { ollama: "unknown", detail: "" },
     activeFile: null,
     notice: null,
+    models: null,
+    settings: null,
+    stats: null,
+    runningSessions: [],
   };
+}
+
+/** Updates `runningSessions`; runs before the current-session filter so other sessions' turns are tracked too. */
+function trackRunning(state: State, event: HostToUi | UiEvent): State {
+  let id: string | null = null;
+  let running = false;
+  if (event.type === "composer/send") {
+    id = state.currentSessionId;
+    running = true;
+  } else if (event.type === "chat/turnState") {
+    id = event.sessionId;
+    running = event.running;
+  } else if (event.type === "chat/done" || event.type === "session/deleted") {
+    id = event.sessionId;
+  }
+  if (id === null || state.runningSessions.includes(id) === running) return state;
+  const runningSessions = running ? [...state.runningSessions, id] : state.runningSessions.filter((s) => s !== id);
+  return { ...state, runningSessions };
 }
 
 /** Moves a non-empty streaming buffer into `messages` as an assistant message. */
@@ -120,6 +165,7 @@ function fromHistory(history: HistoryMessage[]): Msg[] {
  * (when no session is known yet, every session is accepted).
  */
 export function reduce(state: State, event: HostToUi | UiEvent): State {
+  state = trackRunning(state, event);
   if ("sessionId" in event && event.type.startsWith("chat/")) {
     if (state.currentSessionId !== null && event.sessionId !== state.currentSessionId) return state;
   }
@@ -247,6 +293,37 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
     }
     case "ui/theme":
       return state; // applied to the document by App (applyTheme)
+    case "models/list": {
+      const unavailable = event.models.length === 0 && (event.ollama === "down" || event.error !== undefined);
+      // Never trade a known list for an empty one just because Ollama is unreachable.
+      const keep = unavailable && state.models !== null && state.models.list.length > 0;
+      const models: ModelsState = {
+        list: keep && state.models ? state.models.list : event.models,
+        current: event.current,
+        ollama: event.ollama,
+        stale: keep,
+      };
+      if (event.error !== undefined) models.error = event.error;
+      return { ...state, models };
+    }
+    case "settings/current":
+      return { ...state, settings: event.settings };
+    case "completion/stats":
+      return { ...state, stats: event.stats };
+    case "session/deleted": {
+      const sessions = state.sessions.filter((s) => s.sessionId !== event.sessionId);
+      if (event.sessionId !== state.currentSessionId) return { ...state, sessions };
+      // The open session is gone: clear the view; App asks the host to open `next` (or a new one).
+      return {
+        ...state,
+        sessions,
+        currentSessionId: event.next,
+        messages: [],
+        streaming: null,
+        pendingApprovals: new Map(),
+        notice: null,
+      };
+    }
     default: {
       // Exhaustiveness: a new HostToUi variant must be handled above.
       const unknown: never = event;

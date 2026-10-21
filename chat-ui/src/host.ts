@@ -8,13 +8,27 @@ import type {
   ChatToolCall,
   ChatToolResult,
   Decision,
+  CompletionStats,
   HistoryMessage,
   JsonValue,
+  ModelInfo,
   OllamaPullProgress,
+  OllamaState,
   Range,
   SessionSummary,
   StatusNotification,
 } from "./protocol";
+
+export type ModelKind = "chat" | "completion";
+
+/** The completion settings the settings panel edits (host settings, e.g. `localpilot.*` in VS Code). */
+export interface CompletionSettings {
+  completionModel: string;
+  completionMaxTokens: number;
+  completionDebounceMs: number;
+  completionContextTokens: number;
+  adaptiveCompletions: boolean;
+}
 
 /** Messages the UI sends to the host. */
 export type UiToHost =
@@ -28,7 +42,23 @@ export type UiToHost =
   | { type: "ui/copy"; text: string }
   | { type: "ui/openDiff"; toolCallId: string }
   | { type: "ollama/start" }
-  | { type: "ollama/pull"; model: string };
+  | { type: "ollama/pull"; model: string }
+  /** Ask for a fresh `models/list` (host calls core `ollama/models`). */
+  | { type: "models/list" }
+  /** Persist the chat or completion model setting (the host restarts the core as needed). */
+  | { type: "model/select"; kind: ModelKind; name: string }
+  /** Ask for `settings/current`. */
+  | { type: "settings/get" }
+  /** Persist the given settings; the host answers with `settings/current`. */
+  | { type: "settings/set"; patch: Partial<CompletionSettings> }
+  /** Core `chat/deleteSession`; the host answers `session/deleted` or `ui/error` (turn running). */
+  | { type: "session/delete"; sessionId: string }
+  /** Core `chat/clearSessions` (already confirmed by the user). */
+  | { type: "session/clearAll" }
+  /** Ask for `completion/stats`. */
+  | { type: "completion/stats" }
+  /** Core `completion/resetLearning`; the UI follows it with `completion/stats`. */
+  | { type: "completion/resetLearning" };
 
 /** Messages the host sends to the UI: core notifications verbatim + host-originated ones. */
 export type HostToUi =
@@ -45,7 +75,27 @@ export type HostToUi =
   | { type: "ui/activeFile"; uri: string | null; selection?: Range }
   | { type: "ui/error"; message: string }
   /** Host-originated: theme colours/fonts as `--vscode-*` custom properties (hosts that cannot share CSS variables, e.g. an iframe). */
-  | { type: "ui/theme"; vars: Record<string, string> };
+  | { type: "ui/theme"; vars: Record<string, string> }
+  /**
+   * Host-originated: installed models and the configured choices. When Ollama
+   * is unreachable send `models: []` with `ollama: "down"` (and `error`); the
+   * UI keeps showing the last-known list.
+   */
+  | {
+      type: "models/list";
+      models: ModelInfo[];
+      current: { chat: string; completion: string };
+      ollama: OllamaState;
+      error?: string;
+    }
+  | { type: "settings/current"; settings: CompletionSettings }
+  | { type: "completion/stats"; stats: CompletionStats }
+  /**
+   * Host-originated: `sessionId` was deleted. `next` is the most recent
+   * remaining session (or `null`); if the deleted one was current the UI
+   * switches to `next` (`chat/switchSession`) or starts a new one.
+   */
+  | { type: "session/deleted"; sessionId: string; next: string | null };
 
 export interface HostBridge {
   post(msg: UiToHost): void;

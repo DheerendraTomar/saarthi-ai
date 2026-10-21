@@ -102,3 +102,36 @@ export interface HistoryMessage {
   /** Tool calls made by an `"assistant"` message (omitted when empty). */
   toolCalls?: HistoryToolCall[];
 }
+
+/** One installed model, from `ollama/models`. */
+export interface ModelInfo {
+  name: string;
+  sizeBytes: number;
+  family?: string;
+  /** The model's template supports fill-in-the-middle (`insert`), needed for completions. */
+  supportsInsert: boolean;
+  supportsTools: boolean;
+}
+
+/** Per-language entry of `completion/stats`. */
+export interface CompletionLanguageStats {
+  served: number;
+  accepted: number;
+  partial: number;
+  rejected: number;
+  typedThrough: number;
+  /** (accepted + partial) / served, in [0, 1]; 0 when nothing was served. */
+  acceptRate: number;
+  learnedMaxLines: number;
+  learnedNumPredict: number;
+  /** Style examples the next snippet refresh inserts. */
+  examples: number;
+}
+
+/** Result of `completion/stats`. */
+export interface CompletionStats {
+  languages: Record<string, CompletionLanguageStats>;
+  /** `null` before the core is initialized with a workspace. */
+  logPath: string | null;
+  adaptive: boolean;
+}

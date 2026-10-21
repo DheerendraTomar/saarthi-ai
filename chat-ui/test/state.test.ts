@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialState, reduce } from "../src/state";
+import { initialState, isSessionRunning, reduce } from "../src/state";
 import type { State, UiEvent } from "../src/state";
 import type { HostToUi } from "../src/host";
 
@@ -223,5 +223,47 @@ describe("pull progress lifecycle", () => {
 
   it("initial_status_is_unknown_until_host_reports", () => {
     expect(initialState().status.ollama).toBe("unknown");
+  });
+
+  it("running_sessions_tracked_across_sessions", () => {
+    const list: HostToUi = {
+      type: "session/list",
+      sessions: [
+        { sessionId: "s1", title: "a", updatedAtMs: 2 },
+        { sessionId: "s2", title: "b", updatedAtMs: 1 },
+      ],
+      current: "s1",
+    };
+    // A turn started in s1, then the user switched to s2: s1 still counts as running.
+    let s = run([list, { type: "composer/send", text: "go" }, { type: "session/history", sessionId: "s2", messages: [] }]);
+    expect(s.currentSessionId).toBe("s2");
+    expect(isSessionRunning(s, "s1")).toBe(true);
+    expect(isSessionRunning(s, "s2")).toBe(false);
+    // Its chat/done (another session's turn event) still clears it.
+    s = run([{ type: "chat/done", sessionId: "s1", stopReason: "done" }], s);
+    expect(isSessionRunning(s, "s1")).toBe(false);
+    s = run([{ type: "chat/turnState", sessionId: "s1", running: true }], s);
+    expect(isSessionRunning(s, "s1")).toBe(true);
+    s = run([{ type: "chat/turnState", sessionId: "s1", running: false }], s);
+    expect(isSessionRunning(s, "s1")).toBe(false);
+  });
+
+  it("session_deleted_drops_it_and_clears_the_view_only_when_current", () => {
+    const list: HostToUi = {
+      type: "session/list",
+      sessions: [
+        { sessionId: "s1", title: "a", updatedAtMs: 2 },
+        { sessionId: "s2", title: "b", updatedAtMs: 1 },
+      ],
+      current: "s1",
+    };
+    let s = run([list, { type: "session/history", sessionId: "s1", messages: [{ role: "user", content: "x" }] }]);
+    s = run([{ type: "session/deleted", sessionId: "s2", next: "s1" }], s);
+    expect(s.sessions.map((x) => x.sessionId)).toEqual(["s1"]);
+    expect(s.messages).toHaveLength(1);
+    s = run([{ type: "session/deleted", sessionId: "s1", next: null }], s);
+    expect(s.sessions).toEqual([]);
+    expect(s.currentSessionId).toBeNull();
+    expect(s.messages).toEqual([]);
   });
 });
