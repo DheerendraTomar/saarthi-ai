@@ -64,7 +64,10 @@ interface NotebookSync {
     fun saved(file: VirtualFile)
     fun closed(file: VirtualFile)
 
-    /** The core (re)started: re-send `didOpen` for every virtual document. */
+    /**
+     * The core (re)started: re-send `didOpen` for every virtual document. Runs inside a restartable read action, so
+     * it must not call a cancellable API (`checkCanceled`, …) once it started notifying: build everything, then send.
+     */
     fun replay()
 }
 
@@ -381,17 +384,23 @@ class DocumentSyncService(private val project: Project, private val cs: Coroutin
     var listener: DocumentSyncListener? = null
         private set
 
+    /** Notebook cell sync (Task 4): `locate`/`isNotebookDocument`/`cellForUri` for the provider and applyEdit. */
+    @Volatile
+    var notebookCells: NotebookCellSync? = null
+        private set
+
     /** Installs the sync once (idempotent); the listeners live until the project closes. */
     @Synchronized
-    fun install(): DocumentSyncListener = listener ?: DocumentSyncListener(
-        project,
-        CoreDocumentSink(LocalPilotCore.getInstance(project).process),
-        cs,
-        this,
-        LocalPilotCore.getInstance(project).workspace,
-    ).also {
-        listener = it
-        it.install()
+    fun install(): DocumentSyncListener {
+        listener?.let { return it }
+        val sink = CoreDocumentSink(LocalPilotCore.getInstance(project).process)
+        val cells = NotebookCellSync(sink, cs)
+        return DocumentSyncListener(project, sink, cs, this, LocalPilotCore.getInstance(project).workspace).also {
+            it.notebookSync = cells
+            notebookCells = cells
+            listener = it
+            it.install()
+        }
     }
 
     override fun dispose() = Unit
