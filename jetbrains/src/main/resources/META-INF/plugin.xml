@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.thelaconicguy.saarthi</id>
     <name>Saarthi AI</name>
-    <vendor>thelaconicguy</vendor>
+    <vendor>DST</vendor>
     <description><![CDATA[
     <p>Copilot-style coding assistant that runs entirely on your Mac, backed by a local
     <a href="https://ollama.com">Ollama</a>: ghost-text inline completions (including notebook

@@ -1,7 +1,7 @@
 # LocalPilot for JetBrains IDEs
 
 Listed on the JetBrains Marketplace as **Saarthi AI** (plugin ID
-`com.thelaconicguy.saarthi`, vendor `thelaconicguy`). It supports **macOS on
+`com.thelaconicguy.saarthi`, vendor `DST`). It supports **macOS on
 Apple Silicon only**: the zip bundles only the `aarch64-apple-darwin` core, and the
 no-network sandbox needs macOS. Inside the IDE it still shows as LocalPilot.
 
