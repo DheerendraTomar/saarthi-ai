@@ -9,7 +9,7 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.project.ProjectManager
 import dev.localpilot.actions.LocalPilotHost
 
-const val PLUGIN_ID = "com.thelaconicguy.saarthi"
+const val PLUGIN_ID = "site.primelab.saarthi"
 
 /**
  * "Install Plugin from Disk" loads LocalPilot without a restart (all its extension points are dynamic), and startup
