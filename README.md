@@ -1,5 +1,9 @@
 # LocalPilot
 
+Published as **Saarthi AI** ([primelab.site/saarthi](https://primelab.site/saarthi/)):
+VS Code Marketplace / Open VSX `thelaconicguy.ollama-pilot`, JetBrains Marketplace
+`site.primelab.saarthi`. MIT licensed.
+
 A Copilot-style coding assistant that runs entirely on your machine: inline
 (ghost text) completions and an agent chat that can edit files and run commands
 with your approval, backed by a local [Ollama](https://ollama.com). Nothing

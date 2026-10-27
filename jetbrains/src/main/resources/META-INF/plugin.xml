@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>site.primelab.saarthi</id>
     <name>Saarthi AI</name>
-    <vendor>DST</vendor>
+    <vendor url="https://primelab.site/saarthi/" email="hello@primelab.site">DST</vendor>
     <description><![CDATA[
     <p>Copilot-style coding assistant that runs entirely on your Mac, backed by a local
     <a href="https://ollama.com">Ollama</a>: ghost-text inline completions (including notebook
@@ -23,6 +23,9 @@
     <p>Setup: install Ollama, then in a terminal run <code>ollama pull qwen2.5-coder:0.5b-base</code>
     (completions) and <code>ollama pull qwen3.8:27b-mlx</code> (chat), or pick other models in
     <i>Settings → Tools → LocalPilot</i>. Open the chat with <code>Cmd+Shift+L</code>.</p>
+
+    <p>Website: <a href="https://primelab.site/saarthi/">primelab.site/saarthi</a> ·
+    Source (MIT): <a href="https://github.com/DheerendraTomar/saarthi-ai">github.com/DheerendraTomar/saarthi-ai</a></p>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
