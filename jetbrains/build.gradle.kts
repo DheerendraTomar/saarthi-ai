@@ -55,10 +55,23 @@ tasks.test {
 intellijPlatform {
     pluginConfiguration {
         version = providers.gradleProperty("pluginVersion")
+        changeNotes = """
+            <p><b>0.2.0</b>: published as Saarthi AI. Everything stays on your machine.</p>
+            <ul>
+              <li>Only an Ollama on this computer (localhost) is used; other addresses are refused.</li>
+              <li>Start Ollama runs it in a macOS no-network sandbox with cloud features off.</li>
+              <li>Approved agent commands run without network access.</li>
+              <li>Model downloads were removed: copy the <code>ollama pull</code> command instead.</li>
+            </ul>
+        """.trimIndent()
         ideaVersion {
             sinceBuild = providers.gradleProperty("pluginSinceBuild")
             untilBuild = provider { null }
         }
+    }
+    // First upload is manual on plugins.jetbrains.com; later ones: PUBLISH_TOKEN=… ./gradlew publishPlugin
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
     }
     pluginVerification {
         ides {

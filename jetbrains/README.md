@@ -1,5 +1,10 @@
 # LocalPilot for JetBrains IDEs
 
+Listed on the JetBrains Marketplace as **Saarthi AI** (plugin ID
+`com.thelaconicguy.saarthi`, vendor `thelaconicguy`). It supports **macOS on
+Apple Silicon only**: the zip bundles only the `aarch64-apple-darwin` core, and the
+no-network sandbox needs macOS. Inside the IDE it still shows as LocalPilot.
+
 The LocalPilot plugin for PyCharm 2026.2 (build 262+; other IntelliJ-based IDEs of
 the same build should work but are untested). It bundles the `localpilot-core`
 sidecar and the shared chat UI, and talks to a local [Ollama](https://ollama.com):
@@ -236,3 +241,11 @@ from `../dist/core/` (run `scripts/build-core.sh` once) and the chat UI from
 `src/main/resources/chat/index.html` (run the package script, or
 `npm run build -w chat-ui` and copy `chat-ui/dist/index.html` there). CI:
 `.github/workflows/jetbrains.yml` (macOS, JDK 25, Node 20: `test verifyPlugin`).
+
+## Publishing to the JetBrains Marketplace
+
+1. `SKIP_CORE_BUILD=1 bash scripts/package-jetbrains.sh` builds `dist/localpilot-jetbrains-<version>.zip`.
+2. **First release:** upload that zip by hand at plugins.jetbrains.com ("Upload plugin").
+   JetBrains reviews new plugins by hand before they appear.
+3. **Later releases:** bump `pluginVersion` in `gradle.properties` and the change notes in
+   `build.gradle.kts`, then `PUBLISH_TOKEN=<Marketplace token> ./gradlew publishPlugin`.
