@@ -91,11 +91,13 @@ async def test_partial_and_large_lines_are_reassembled(fake_core_binary: Path, w
     try:
         await asyncio.wait_for(core.start({}), TIMEOUT)
         big = "x" * 300_000  # far over asyncio's default 64 KiB line limit
-        core.send_line(json.dumps({"jsonrpc": "2.0", "id": "t1:9", "method": "ollama/pull", "params": {"model": big}}))
+        core.send_line(json.dumps({"jsonrpc": "2.0", "id": "t1:9", "method": "ollama/status", "params": {"pad": big}}))
         reply = await eventually(lambda: next((m for m in lines if m.get("id") == "t1:9"), None))
-        assert reply["result"] == {}
-        progress = [m for m in lines if m.get("method") == "ollama/pullProgress"]
-        assert progress and progress[0]["params"]["model"] == big
+        assert reply["result"]["ollama"] == "ok"
+        # A large reply line (the error echoes the model name) is reassembled too.
+        core.send_line(json.dumps({"jsonrpc": "2.0", "id": "t1:10", "method": "ollama/pull", "params": {"model": big}}))
+        reply = await eventually(lambda: next((m for m in lines if m.get("id") == "t1:10"), None))
+        assert big in reply["error"]["message"]
     finally:
         await core.stop()
 

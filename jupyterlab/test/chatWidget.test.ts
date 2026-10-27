@@ -72,7 +72,7 @@ function setup(overrides: Partial<ChatWidgetDeps> = {}) {
     isSyncedUri: (uri) => uri === CELL,
     insertAtCursor: jest.fn(() => true),
     startOllama: jest.fn(),
-    pullModel: jest.fn(async () => undefined),
+    copy: jest.fn(async () => undefined),
     onChatActiveChanged: jest.fn(),
     themeVars: () => ({ '--vscode-foreground': '#101010' }),
     settings: () => store.settings,
@@ -365,10 +365,12 @@ describe('ChatWidget', () => {
     expect(deps.insertAtCursor).toHaveBeenCalledWith('print(1)');
     await fromUi({ type: 'ollama/start' });
     expect(deps.startOllama).toHaveBeenCalledTimes(1);
-    await fromUi({ type: 'ollama/pull', model: '' });
-    expect(deps.pullModel).toHaveBeenCalledWith('');
+    // Models are never downloaded by the extension: the UI copies `ollama pull` via ui/copy.
+    await fromUi({ type: 'ui/copy', text: 'ollama pull qwen' });
+    expect(deps.copy).toHaveBeenCalledWith('ollama pull qwen');
+    const before = posted.length;
     client.notifyUi('ollama/pullProgress', { model: 'm', status: 'pulling', completed: 1, total: 2 });
-    expect(posted.at(-1)).toEqual({ type: 'ollama/pullProgress', model: 'm', status: 'pulling', completed: 1, total: 2 });
+    expect(posted).toHaveLength(before);
     await fromUi({ type: 'ui/openDiff', toolCallId: 'x' });
     await fromUi({ type: 'bogus' });
     expect(client.calls).toEqual([]);

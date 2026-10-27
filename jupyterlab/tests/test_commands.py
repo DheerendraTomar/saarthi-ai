@@ -1,12 +1,18 @@
-"""commands.run_command: confinement, output tails, timeout."""
+"""commands.run_command: sandbox, confinement, output tails, timeout (real runs need macOS)."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
+import pytest
+
 from localpilot_jupyter.commands import COMMAND_TIMEOUT_S, OUTPUT_TAIL_CHARS, run_command
+from localpilot_jupyter.sandbox import NETWORK_NOTE
+
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="commands run only in the macOS sandbox")
 
 
 async def test_runs_in_confined_cwd_and_reports_exit_code(tmp_path: Path) -> None:
@@ -16,7 +22,15 @@ async def test_runs_in_confined_cwd_and_reports_exit_code(tmp_path: Path) -> Non
     res = await run_command({"command": "pwd; echo oops >&2; exit 3", "cwd": str(sub)}, root)
     assert res["exitCode"] == 3
     assert Path(res["stdout"].strip()).resolve() == sub.resolve()
-    assert res["stderr"] == "oops\n"
+    assert res["stderr"] == "oops\n" + NETWORK_NOTE + "\n"
+
+
+async def test_network_is_blocked_and_loopback_is_not(tmp_path: Path) -> None:
+    res = await run_command({"command": "curl -sS -m 5 https://example.com"}, tmp_path)
+    assert res["exitCode"] != 0
+    assert NETWORK_NOTE in res["stderr"]
+    ok = await run_command({"command": "echo ok"}, tmp_path)
+    assert (ok["exitCode"], ok["stdout"], ok["stderr"]) == (0, "ok\n", "")
 
 
 async def test_relative_and_missing_cwd_resolve_inside_root(tmp_path: Path) -> None:

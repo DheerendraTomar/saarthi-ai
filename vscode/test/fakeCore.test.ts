@@ -162,23 +162,12 @@ describe("fakeCore", () => {
     expect(((await f.call("chat/history", { sessionId: "nope" })).result as { messages: unknown[] }).messages).toEqual([]);
   });
 
-  it("pull_streams_progress_then_resolves_or_fails", async () => {
-    const ok = fake({ FAKE_OLLAMA: "modelMissing" });
-    await ok.initialize();
-    const res = await ok.call("ollama/pull", { model: "m" });
-    expect(res.result).toEqual({});
-    const progress = ok.msgs.filter((m) => m.method === "ollama/pullProgress");
-    expect(progress).toHaveLength(3);
-    expect(progress.every((m) => m.params?.model === "m")).toBe(true);
-    expect(ok.msgs.indexOf(progress[2])).toBeLessThan(ok.msgs.indexOf(res));
-    // The model is now present: status flips to ok.
-    await ok.waitFor((m) => m.method === "status" && (m.params as { ollama: string }).ollama === "ok");
-
-    const bad = fake({ FAKE_PULL_FAIL: "1" });
-    await bad.initialize();
-    const err = await bad.call("ollama/pull", { model: "m" });
+  it("pull_is_refused", async () => {
+    const f = fake({ FAKE_OLLAMA: "modelMissing" });
+    await f.initialize();
+    const err = await f.call("ollama/pull", { model: "m" });
     expect(err.error?.code).toBe(-32000);
-    expect(bad.msgs.filter((m) => m.method === "ollama/pullProgress")).toHaveLength(3);
+    expect(f.msgs.filter((m) => m.method === "ollama/pullProgress")).toHaveLength(0);
   });
 
   it("v2_models_session_deletion_and_stats", async () => {

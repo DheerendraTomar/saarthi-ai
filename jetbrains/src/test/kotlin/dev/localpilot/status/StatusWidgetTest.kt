@@ -17,10 +17,8 @@ class StatusWidgetTest : BasePlatformTestCase() {
         assertEquals("LocalPilot: model missing", text(ready.copy(ollama = "modelMissing")))
         assertEquals("LocalPilot: crashed", text(ready.copy(core = CoreState.CRASHED, ollama = "down")))
         assertEquals("LocalPilot: completions off", text(ready, enabled = false))
-        // Ollama problems outrank the paused state; a running pull outranks everything.
+        // Ollama problems outrank the paused state.
         assertEquals("LocalPilot: Ollama down", text(ready.copy(ollama = "down"), enabled = false))
-        assertEquals("LocalPilot: pulling 42%", text(ready.copy(core = CoreState.CRASHED, pullPercent = 42)))
-        assertEquals("LocalPilot: pulling…", text(ready.copy(pullPercent = -1)))
     }
 
     fun test_status_shows_completions_paused_during_chat() {

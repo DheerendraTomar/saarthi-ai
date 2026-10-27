@@ -23,10 +23,10 @@ script needs).
 ```sh
 pip install "jupyterlab>=4.5,<5"           # provides jlpm
 npm ci                                     # once, from the repo root
-bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.2.1-py3-none-any.whl
-pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.2.1-py3-none-any.whl
+bash scripts/package-jupyterlab.sh         # → dist/localpilot_jupyter-0.3.0-py3-none-any.whl
+pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.3.0-py3-none-any.whl
 jupyter server extension list              # → localpilot_jupyter enabled, OK
-jupyter labextension list                  # → localpilot-jupyter v0.2.1 enabled OK
+jupyter labextension list                  # → localpilot-jupyter v0.3.0 enabled OK
 ```
 
 `--no-deps` keeps pip from reinstalling (or upgrading) JupyterLab and the rest of
@@ -51,20 +51,38 @@ itself (`etc/jupyter/jupyter_server_config.d/localpilot_jupyter.json`).
 
 ## Start Ollama
 
-LocalPilot talks only to a local [Ollama](https://ollama.com) (`ollamaUrl`, default
-`http://localhost:11434`, as seen from the **Jupyter server**).
+LocalPilot talks only to an [Ollama](https://ollama.com) on this machine (`ollamaUrl`,
+default `http://localhost:11434`, as seen from the **Jupyter server**; any host that
+is not localhost, 127.0.0.0/8 or ::1 is refused). It never downloads models: pull
+them yourself in a terminal.
 
 ```sh
-ollama serve                               # or launch the Ollama app
 ollama pull qwen2.5-coder:0.5b-base        # inline completions (default)
 ollama pull qwen3.8:27b-mlx                # agent chat (default)
 ```
 
-From JupyterLab, **Start Ollama (in a terminal)** (command palette, category
-LocalPilot, or the chat view's **Start Ollama** button) opens a JupyterLab terminal
-and types `ollama serve` into it, so Ollama runs on the Jupyter server's machine
-and stops when you close that terminal. **Pull Model with Ollama…** pulls the
-completion or chat model with progress in the status bar.
+**Start Ollama (sandboxed, in a terminal)** (command palette, category LocalPilot, or
+the chat view's **Start Ollama** button) asks the server for the start line, opens a
+JupyterLab terminal and types it in. The server decides the line:
+
+- macOS with `~/Library/LaunchAgents/local.ollama.sandboxed.plist`: restarts that
+  LaunchAgent (`launchctl bootstrap gui/$(id -u) <plist> 2>/dev/null || launchctl
+  kickstart gui/$(id -u)/local.ollama.sandboxed`).
+- macOS otherwise: `OLLAMA_NO_CLOUD=1 OLLAMA_HOST=127.0.0.1:11434 exec
+  /usr/bin/sandbox-exec -f <profile> ollama serve`, using the bundled no-network
+  profile (`localpilot_jupyter/sandbox/no-network.sb`). It stops when you close the terminal.
+- Not macOS: nothing starts. LocalPilot only starts Ollama inside a no-network
+  sandbox; start Ollama yourself with `OLLAMA_NO_CLOUD=1`.
+
+## Commands run without network access
+
+Commands the agent runs (after you approve them) run on the Jupyter server as
+`/usr/bin/sandbox-exec -f <profile> /bin/sh -c <command>` in a directory inside the
+server root. The profile allows everything except network: only this machine
+(loopback) is reachable and DNS is blocked, so `git push`, `pip install`, `curl` and
+the like fail. A failing command gets the line `(LocalPilot runs commands without
+network access)` appended to its stderr. If the sandbox is unavailable (not macOS,
+or `sandbox-exec` or the profile is missing), the command is not run at all.
 
 ## Keyboard shortcut
 
@@ -85,7 +103,7 @@ extension's `localpilot.*` settings, without the prefix:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `ollamaUrl` | `http://localhost:11434` | Base URL of Ollama, as seen from the Jupyter server. |
+| `ollamaUrl` | `http://localhost:11434` | Base URL of the Ollama on this machine (localhost, 127.0.0.1 or ::1), as seen from the Jupyter server. Other hosts are refused. |
 | `completionModel` | `qwen2.5-coder:0.5b-base` | FIM model for inline completions; `qwen2.5-coder:1.5b-base` is the higher-quality alternative. |
 | `chatModel` | `qwen3.8:27b-mlx` | Tool-calling model for agent chat. |
 | `completionsEnabled` | `true` | Show ghost-text completions. **Client-side**: no core restart. Also toggled by **Pause/Resume Inline Completions**. |
@@ -175,11 +193,14 @@ Walk this after installing a new build (`jupyter lab` restarted, models pulled):
    **Restart LocalPilot Core** from the palette: the chat view shows **Ollama down**
    and the status bar shows `Ollama down`.
 2. **Start Ollama** — click **Start Ollama** in the chat view (or run **Start Ollama
-   (in a terminal)**): a JupyterLab terminal opens running `ollama serve`, and the
-   banner clears.
-3. **Pull model** — set `completionModel` to a model you don't have (e.g.
+   (sandboxed, in a terminal)**): a JupyterLab terminal opens and runs the sandboxed
+   start line (LaunchAgent restart, or `sandbox-exec … ollama serve`), and the
+   banner clears. On Linux/Windows it shows the "needs macOS" error and starts nothing.
+3. **Model missing** — set `completionModel` to a model you don't have (e.g.
    `qwen2.5-coder:1.5b-base` after `ollama rm` of it): the chat view shows **Model
-   missing**; click **Pull model** and watch `Pulling N%` in the status bar finish.
+   missing** with **Copy pull command** (no Pull button; there is no `Pulling N%`).
+   Click it, paste in a terminal, run it; the banner clears. **Copy Ollama Pull
+   Command…** in the palette does the same.
 4. **Ghost text in a notebook** — open an `.ipynb` with a Python kernel, type
    `def fibonacci(n):` and a newline in a code cell: grey ghost text appears;
    `Tab` accepts it.
@@ -188,6 +209,9 @@ Walk this after installing a new build (`jupyter lab` restarted, models pulled):
    in a code cell and ask for a change to that cell: the diff card shows the cell
    (`….ipynb.cell<N>.py`); click **Approve**: the cell changes in place and the
    notebook is saved (no unsaved-changes dot on its tab).
+7a. **Run command, no network** — ask the chat to run `curl -sS https://example.com`
+   and approve: it fails (could not resolve host) and stderr ends with `(LocalPilot
+   runs commands without network access)`. `echo ok` works.
 7. **Run command, denied** — ask the chat to run `ls`: a command card appears; click
    **Deny**: nothing runs, and the agent says it was denied.
 8. **Theme** — switch **Settings → Theme** between JupyterLab Light and Dark: the
@@ -230,12 +254,19 @@ Walk this after installing a new build (`jupyter lab` restarted, models pulled):
   Build one (`bash scripts/build-core.sh`) and set `LOCALPILOT_CORE_BINARY` or
   `c.LocalPilot.core_binary`.
 - **"Ollama down"**: Ollama isn't answering at `ollamaUrl` from the Jupyter server.
-  Start it (above), then **Restart LocalPilot Core**. Check
+  Start it (above; **Start Ollama** is sandboxed), then **Restart LocalPilot Core**. Check
   `curl http://localhost:11434/api/tags` on the server machine.
-- **"Model missing" / no ghost text**: pull the configured model and check
-  `ollama list`. Completions also pause while `completionsEnabled` is off and while
+- **"Model missing" / no ghost text**: LocalPilot does not download models. Use
+  **Copy pull command** (chat view) or **Copy Ollama Pull Command…** (palette), run
+  `ollama pull <model>` in a terminal, and check `ollama list`. Completions also pause while `completionsEnabled` is off and while
   a chat reply is generating; check that **LocalPilot** is enabled under
   **Settings → Inline Completer**.
+- **Commands fail with "no network"**: by design. Agent commands run in a no-network
+  sandbox; run network steps (`pip install`, `git push`, downloads) yourself in a terminal.
+- **"Not run: … no-network sandbox (macOS)"**: the sandbox is unavailable (not macOS,
+  or `/usr/bin/sandbox-exec` or the bundled profile is missing), so commands are refused.
+- **Start Ollama says it needs macOS**: LocalPilot only starts Ollama inside the
+  sandbox. Start Ollama yourself with `OLLAMA_NO_CLOUD=1 ollama serve`.
 - **403 on `/localpilot/rpc`**: LocalPilot needs the same permission as terminals
   (`execute` on `terminals`), because the agent can run commands.
 - **"LocalPilot unreachable"** (status bar, plus a notification with **Retry**): the

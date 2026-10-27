@@ -45,12 +45,10 @@
         <action id="LocalPilot.NewSession" class="dev.localpilot.actions.NewSessionAction"
                 text="New LocalPilot Chat" description="Start a new LocalPilot chat session"/>
         <action id="LocalPilot.StartOllama" class="dev.localpilot.actions.StartOllamaAction"
-                text="Start Ollama" description="Open a Run tab running `ollama serve`" icon="AllIcons.Actions.Execute"/>
+                text="Start Ollama" description="Start Ollama inside the no-network sandbox (macOS)" icon="AllIcons.Actions.Execute"/>
         <action id="LocalPilot.Retry" class="dev.localpilot.actions.RetryAction"
                 text="Check Ollama Again" description="Probe Ollama again (restarts a stopped LocalPilot core)"
                 icon="AllIcons.Actions.Refresh"/>
-        <action id="LocalPilot.PullModel" class="dev.localpilot.actions.PullModelAction"
-                text="Pull Model…" description="Pull the completion or chat model with Ollama" icon="AllIcons.Actions.Download"/>
         <action id="LocalPilot.SelectChatModel" class="dev.localpilot.actions.SelectChatModelAction"
                 text="Select Chat Model…" description="Pick the LocalPilot chat model from the models installed in Ollama"/>
         <action id="LocalPilot.SelectCompletionModel" class="dev.localpilot.actions.SelectCompletionModelAction"
@@ -70,7 +68,6 @@
             <separator/>
             <reference ref="LocalPilot.StartOllama"/>
             <reference ref="LocalPilot.Retry"/>
-            <reference ref="LocalPilot.PullModel"/>
             <separator/>
             <reference ref="LocalPilot.SelectChatModel"/>
             <reference ref="LocalPilot.SelectCompletionModel"/>

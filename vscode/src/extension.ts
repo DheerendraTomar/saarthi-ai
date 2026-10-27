@@ -4,12 +4,13 @@ import * as vscode from "vscode";
 import { applyEdit, type ApplyEditParams } from "./chat/applyEdit";
 import { CHAT_VIEW_TYPE, ChatViewProvider, type StatusNotification } from "./chat/chatView";
 import { runCommand, type RunCommandParams } from "./chat/runCommand";
-import { checkStatus, COMMANDS, pullModel, registerCommands, startOllama, type CommandDeps } from "./commands";
+import { checkStatus, COMMANDS, registerCommands, setExtensionPath, startOllama, type CommandDeps } from "./commands";
 import { DocumentSync } from "./documentSync";
 import { InlineProvider } from "./inlineProvider";
 import { ModelCatalog } from "./models";
 import { CoreClient, type CoreClientOptions } from "./rpc/coreClient";
 import { readSettings, resolveBinaryPath, type Settings } from "./settings";
+import { sandboxProfilePath } from "./sandbox";
 import { StatusBar } from "./statusBar";
 
 /** Settings changes are batched for this long before the core restarts. */
@@ -30,6 +31,7 @@ let current: { client: CoreClient } | undefined;
 const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function activate(context: vscode.ExtensionContext): LocalPilotApi | undefined {
+  setExtensionPath(context.extensionPath);
   const output = vscode.window.createOutputChannel("LocalPilot");
   const statusBar = new StatusBar();
   context.subscriptions.push(output, statusBar);
@@ -149,7 +151,6 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
     root,
     html: () => readFileSync(join(context.extensionPath, "media", "chat.html"), "utf8"),
     startOllama: () => startOllama(deps),
-    pullModel: (model) => pullModel(deps, model),
     // The core pauses completions while chat generates (spec §5(10)); show it.
     onChatActiveChanged: (active) => statusBar.setChatActive(active),
     models,
@@ -157,7 +158,7 @@ export function activate(context: vscode.ExtensionContext): LocalPilotApi | unde
 
   // Core → client requests (the core sends them only after the user approved in the chat).
   client.onRequest("workspace/applyEdit", (params) => applyEdit(params as ApplyEditParams, { resolveCell: (uri) => sync.cellForUri(uri) }));
-  client.onRequest("workspace/runCommand", (params) => runCommand(params as RunCommandParams, output, { defaultCwd: root }));
+  client.onRequest("workspace/runCommand", (params) => runCommand(params as RunCommandParams, output, { defaultCwd: root, sandboxProfile: sandboxProfilePath(context.extensionPath) }));
   // The chat view relays `status` to the webview itself; the status bar listens here.
   client.onNotification("status", (params) => statusBar.setStatus(params as StatusNotification));
   client.onDidChangeState((state) => {

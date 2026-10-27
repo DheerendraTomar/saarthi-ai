@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 — 2026-10-27
+
+- Nothing leaves the machine: `localpilot.ollamaUrl` must point at this machine (localhost, 127.0.0.0/8, `::1`); other hosts are refused. The bundled core ignores proxies and redirects.
+- LocalPilot no longer downloads models. Removed **Pull Model** (`localpilot.pullModel`), pull progress and the Pull model buttons; when a model is missing, **Copy pull command** copies `ollama pull <model>` to run in a terminal.
+- **Start Ollama** starts Ollama inside a no-network sandbox (macOS `sandbox-exec`, bundled `sandbox/no-network.sb`, `OLLAMA_NO_CLOUD=1`), via the `local.ollama.sandboxed` launch agent when it is installed. Off macOS it starts nothing and says so.
+- Approved agent commands run inside the same no-network sandbox. Where that is not possible (not macOS, no `sandbox-exec`, no profile) they are not run. Failed commands end with "(LocalPilot runs commands without network access)".
+
 ## 0.2.2 — 2026-10-21
 
 - Typing through a suggestion is reported once for the whole run: when the rest of a suggestion you are typing into is shown again, its watch is handed over without a report, so a backspace no longer logs the run as rejected before you accept it, and long type-throughs are no longer cut off (and logged rejected) after 8 keys.

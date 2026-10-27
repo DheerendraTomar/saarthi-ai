@@ -228,8 +228,13 @@ Behaviour to rely on:
 - `capabilities` is `{ completion: true, chat: true, bench: false }`:
   `bench/run` is not served over RPC (it answers `-32601`); use the `bench`
   subcommand.
-- `ollama/pull` streams `ollama/pullProgress` notifications and responds when
-  the pull finishes.
+- `ollama/pull` always fails with `-32600`: LocalPilot never makes Ollama
+  download anything (that reaches the internet). The error message names the
+  `ollama pull <model>` to run in a terminal.
+- The core talks only to `ollamaUrl`, and only if it is on this machine
+  (`localhost`, `127.0.0.0/8` or `::1`). Any other host is refused before a DNS
+  lookup or connection (status `down`, detail "… is not on this machine …").
+  Proxy settings and redirects are ignored.
 
 Error codes: `-32600` invalid request, `-32601` method not found, `-32602`
 invalid params, `-32603` internal error (also used when a core→client request

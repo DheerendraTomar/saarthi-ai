@@ -5,6 +5,7 @@ import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.SystemInfo
+import dev.localpilot.sandbox.Sandbox
 import dev.localpilot.sync.workspaceOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -28,10 +29,11 @@ import java.util.concurrent.TimeUnit
  * `{ exitCode, stdout, stderr }`), the counterpart of the VS Code host's `vscode/src/chat/runCommand.ts`. The core
  * only sends it after the user approved the command.
  *
- * - Runs through the shell as VS Code's `spawn(…, { shell: true })` does: `/bin/sh -c <command>` on macOS/Linux,
- *   `cmd.exe /d /s /c <command>` on Windows, with the IDE's console environment
+ * - Runs only inside the no-network sandbox: `/usr/bin/sandbox-exec -f <profile> /bin/sh -c <command>` as an argv
+ *   list (the command is never interpolated into another string), with the IDE's console environment
  *   ([GeneralCommandLine.ParentEnvironmentType.CONSOLE], which on macOS includes the login shell's variables). Stdin
- *   is closed.
+ *   is closed. Fails closed: off macOS, or without sandbox-exec or the profile, the command is not run (exit -1).
+ *   A non-zero exit gets a one-line note on stderr that commands have no network.
  * - cwd: the `cwd` param (absolute, or relative to the workspace) confined to [workspace] (the root itself allowed),
  *   else the workspace.
  * - stdout and stderr are captured separately; each keeps its last [OUTPUT_TAIL_CHARS] characters, marked when cut.
@@ -48,6 +50,7 @@ class RunCommand(
     private val workspace: Path?,
     private val console: ConsoleOutput = ConsoleOutput.None,
     private val timeoutMs: Long = COMMAND_TIMEOUT_MS,
+    private val profile: Path? = Sandbox.bundledProfile(),
 ) : CommandRunner {
     constructor(project: Project) : this(workspaceOf(project), LocalPilotConsole(project))
 
@@ -88,9 +91,14 @@ class RunCommand(
             console.print("$ $command\n[not run: ${e.message}]\n", ConsoleOutput.Kind.SYSTEM)
             return result(-1, "", e.message ?: "invalid cwd")
         }
+        val plan = Sandbox.planCommand(command, SystemInfo.isMac, profile, Files.isExecutable(Path.of(Sandbox.SANDBOX_EXEC)))
+        if (plan is Sandbox.CommandPlan.Refuse) {
+            console.print("$ $command\n[not run: ${plan.stderr}]\n", ConsoleOutput.Kind.SYSTEM)
+            return result(-1, "", plan.stderr)
+        }
         console.print("$ $command    (cwd: $cwd)\n", ConsoleOutput.Kind.SYSTEM)
         return try {
-            withContext(Dispatchers.IO) { execute(command, cwd) }
+            withContext(Dispatchers.IO) { execute((plan as Sandbox.CommandPlan.Run).argv, cwd) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: ProcessCanceledException) {
@@ -114,8 +122,8 @@ class RunCommand(
         return path
     }
 
-    private suspend fun execute(command: String, cwd: Path): JsonElement {
-        val commandLine = (if (SystemInfo.isWindows) GeneralCommandLine("cmd.exe", "/d", "/s", "/c", command) else GeneralCommandLine("/bin/sh", "-c", command))
+    private suspend fun execute(argv: List<String>, cwd: Path): JsonElement {
+        val commandLine = GeneralCommandLine(argv)
             .withWorkingDirectory(cwd)
             .withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
             .withCharset(StandardCharsets.UTF_8)
@@ -143,7 +151,9 @@ class RunCommand(
                 return result(-1, stdout.value(), err + (if (err.isNotEmpty() && !err.endsWith("\n")) "\n" else "") + note)
             }
             console.print("[exit code $exit]\n", ConsoleOutput.Kind.SYSTEM)
-            return result(exit, stdout.value(), stderr.value())
+            val err = Sandbox.withNetworkNote(stderr.value(), exit)
+            if (exit != 0) console.print("${Sandbox.NO_NETWORK_NOTE}\n", ConsoleOutput.Kind.SYSTEM)
+            return result(exit, stdout.value(), err)
         } finally {
             // Coroutine cancellation (or a failure) must not leave the command running.
             if (process.isAlive) killTree(process)

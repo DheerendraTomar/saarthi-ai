@@ -20,18 +20,37 @@ but wires these controls in its next update.
 | [`jetbrains/`](jetbrains/README.md) | The JetBrains plugin for PyCharm 2026.2 (build 262+): ghost text in files and notebook cells, chat tool window (bundles the core). |
 | `chat-ui/` | The chat webview, shared by IDE clients. |
 | `rpc-client/` | TypeScript JSON-RPC client for the core. |
+| `sandbox/` | `no-network.sb`, the macOS sandbox profile the IDE clients bundle. |
+
+## Privacy: nothing leaves your machine
+
+- The core talks only to an Ollama on this machine. An `ollamaUrl` pointing at
+  any other host is refused, and proxy settings are ignored.
+- LocalPilot never downloads models. When a model is missing, the chat offers
+  to copy the `ollama pull <model>` command for you to run in a terminal.
+- **Start Ollama** (all IDEs, macOS) starts Ollama inside a no-network sandbox
+  (`sandbox-exec` with [`sandbox/no-network.sb`](sandbox/no-network.sb), plus
+  `OLLAMA_NO_CLOUD=1`). Only this machine is reachable, and DNS lookups are
+  blocked. If a LaunchAgent named `local.ollama.sandboxed` is installed, it is
+  started instead.
+- Commands the agent runs (after you approve them) run in the same sandbox, so
+  they have no network access. Run `npm install`, `git push` and similar
+  commands in your own terminal. On other platforms, LocalPilot refuses to run
+  commands rather than run them unsandboxed.
+- The chat view loads nothing from the network (its Content-Security-Policy
+  blocks remote images and scripts). Links open only when you click them.
 
 Design: [`docs/superpowers/specs/2026-10-20-localpilot-design.md`](docs/superpowers/specs/2026-10-20-localpilot-design.md).
 
 ## Quick start (VS Code, macOS arm64)
 
 ```sh
-ollama serve &                           # or launch the Ollama app
+ollama serve &                           # pull first; afterwards use the sandboxed "Start Ollama" in the IDE
 ollama pull qwen2.5-coder:0.5b-base      # completions
 ollama pull qwen3.8:27b-mlx              # chat
 npm ci
-bash scripts/package-vscode.sh           # → dist/localpilot-0.2.2-darwin-arm64.vsix
-code --install-extension dist/localpilot-0.2.2-darwin-arm64.vsix --force
+bash scripts/package-vscode.sh           # → dist/localpilot-0.3.0-darwin-arm64.vsix
+code --install-extension dist/localpilot-0.3.0-darwin-arm64.vsix --force
 ```
 
 Open a folder in VS Code: ghost text appears as you type, and `Cmd+Shift+L`
@@ -43,8 +62,8 @@ opens the chat. Settings, the manual smoke checklist and troubleshooting are in
 ```sh
 pip install "jupyterlab>=4.5,<5"         # JupyterLab 4.5 in this Python env (provides jlpm)
 npm ci
-bash scripts/package-jupyterlab.sh       # → dist/localpilot_jupyter-0.1.1-py3-none-any.whl
-pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.1.1-py3-none-any.whl
+bash scripts/package-jupyterlab.sh       # → dist/localpilot_jupyter-0.3.0-py3-none-any.whl
+pip install --no-deps --force-reinstall dist/localpilot_jupyter-0.3.0-py3-none-any.whl
 jupyter lab
 ```
 
@@ -59,11 +78,11 @@ Needs a JDK 25 (e.g. Temurin 25), Node.js 20+, and Rust to build the core (or
 
 ```sh
 npm ci
-bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.1.zip
+bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.2.0.zip
 ```
 
 In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** →
-`dist/localpilot-jetbrains-0.1.1.zip` (it loads without a restart; if an open
+`dist/localpilot-jetbrains-0.2.0.zip` (it loads without a restart; if an open
 project looks inert, reopen it). With Ollama running and the
 models pulled (above), ghost text appears in files and notebook cells, and
 `Cmd+Shift+L` opens the chat tool window. Settings, the manual smoke checklist and

@@ -7,7 +7,7 @@ import type { Settings } from './settings';
 export const COMMANDS = {
   openChat: 'localpilot:open-chat',
   startOllama: 'localpilot:start-ollama',
-  pullModel: 'localpilot:pull-model',
+  copyPullCommand: 'localpilot:copy-pull-command',
   newSession: 'localpilot:new-session',
   toggleCompletions: 'localpilot:toggle-completions',
   restartCore: 'localpilot:restart-core',
@@ -27,9 +27,6 @@ export const OPEN_CHAT_KEYS = ['Alt Shift L'];
 
 export const PALETTE_CATEGORY = 'LocalPilot';
 
-/** What `ollama serve` is typed into (a JupyterLab terminal). */
-export const OLLAMA_COMMAND = 'ollama serve\n';
-
 /** `Terminal.ITerminalConnection`, the part used here. */
 export interface TerminalConnection {
   readonly name: string;
@@ -48,8 +45,6 @@ export interface TerminalManager {
 export interface CommandUi {
   info(message: string): void;
   error(message: string): void;
-  /** Lets the user pick a model to pull; undefined when cancelled. */
-  pickModel(choices: string[]): Promise<string | undefined>;
   /** Lets the user pick one of `items` (not editable), `selected` preselected; undefined when cancelled. */
   pickItem(title: string, items: string[], selected?: string): Promise<string | undefined>;
   /** A confirmation dialog; true when the user chose `acceptLabel`. */
@@ -79,8 +74,10 @@ export interface CommandDeps {
   restartCore(): Promise<void>;
   /** Fresh Ollama status from `ollama/status` → status bar + chat. */
   onStatus(status: OllamaStatus): void;
-  /** Pull progress in percent, undefined when done (status bar). */
-  onPullProgress(percent: number | undefined): void;
+  /** Copies text to the clipboard. */
+  copy(text: string): Promise<void> | void;
+  /** `GET /localpilot/ollama-command`: the sandboxed start line, or why there is none. */
+  ollamaCommand(): Promise<{ command?: string; error?: string }>;
   ui: CommandUi;
   /** `ICommandPalette` when available. */
   palette?: { addItem(options: { command: string; category: string }): IDisposable } | null;
@@ -97,26 +94,33 @@ export async function checkStatus(deps: Pick<CommandDeps, 'client' | 'onStatus'>
 let ollamaTerminal: TerminalConnection | undefined;
 
 /**
- * Opens a JupyterLab terminal running `ollama serve` (or re-shows the one
- * started earlier, if it still runs). LocalPilot never starts Ollama by
- * itself: this runs only on a user action. Then re-checks the status twice so
- * a "down" warning clears by itself.
+ * Opens a JupyterLab terminal and types the line the server gives (Ollama
+ * inside the no-network sandbox, or the sandboxed LaunchAgent), or re-shows
+ * the terminal started earlier, if it still runs. LocalPilot never starts
+ * Ollama by itself: this runs only on a user action. Where the server cannot
+ * sandbox (not macOS), nothing starts. Then re-checks the status twice so a
+ * "down" warning clears by itself.
  */
 export async function startOllama(deps: CommandDeps): Promise<void> {
   if (!deps.terminals.isAvailable()) {
-    deps.ui.error('LocalPilot: this Jupyter server has terminals disabled. Run `ollama serve` in a shell yourself.');
+    deps.ui.error('LocalPilot: this Jupyter server has terminals disabled, so Ollama is not started. Start it yourself with OLLAMA_NO_CLOUD=1.');
     return;
   }
   try {
     const running = new Set([...deps.terminals.running()].map((t) => t.name));
     if (!ollamaTerminal || ollamaTerminal.isDisposed || !running.has(ollamaTerminal.name)) {
+      const { command, error } = await deps.ollamaCommand();
+      if (!command) {
+        deps.ui.error(`LocalPilot: ${error ?? 'the server gave no command to start Ollama'}`);
+        return;
+      }
       ollamaTerminal = await deps.terminals.startNew();
       // Queued by the connection until its socket is open.
-      ollamaTerminal.send({ type: 'stdin', content: [OLLAMA_COMMAND] });
+      ollamaTerminal.send({ type: 'stdin', content: [`${command}\n`] });
     }
     await deps.commands.execute('terminal:open', { name: ollamaTerminal.name });
   } catch (e) {
-    deps.ui.error(`LocalPilot: could not open a terminal for Ollama: ${errorMessage(e)}`);
+    deps.ui.error(`LocalPilot: could not start Ollama: ${errorMessage(e)}`);
     return;
   }
   for (const ms of [3000, 10000]) {
@@ -124,40 +128,21 @@ export async function startOllama(deps: CommandDeps): Promise<void> {
   }
 }
 
-const pulling = new Set<string>();
-
 /**
- * Pulls a model through the core (`ollama/pull`), with the status bar showing
- * the percentage from `ollama/pullProgress`. `model` undefined → let the user
- * pick one of the configured models; `""` (the chat UI's default) → the
- * completion model.
+ * LocalPilot does not download models. Copies `ollama pull <model>` (to run in
+ * a terminal) for the given model, or one the user picks of the configured ones.
  */
-export async function pullModel(deps: CommandDeps, model?: string): Promise<void> {
+export async function copyPullCommand(deps: CommandDeps, model?: string): Promise<void> {
   const settings = deps.settings();
   let name = model?.trim();
-  if (!name && model === '') name = settings.completionModel;
-  if (!name) name = (await deps.ui.pickModel([settings.completionModel, settings.chatModel]))?.trim();
-  if (!name || pulling.has(name)) return;
-  const target = name;
-  pulling.add(target);
-  deps.onPullProgress(0);
-  deps.ui.info(`LocalPilot: pulling ${target}…`);
-  const sub = deps.client.onNotification('ollama/pullProgress', (raw) => {
-    const p = raw as { model?: string; completed?: number; total?: number };
-    if (p.model === target && p.total && p.completed !== undefined) deps.onPullProgress((p.completed / p.total) * 100);
-  });
-  try {
-    await deps.client.request('ollama/pull', { model: target });
-    deps.ui.info(`LocalPilot: ${target} is ready.`);
-    // Clears a "model missing" warning right away (the core's next probe could be 30 s off).
-    await checkStatus(deps).catch(() => undefined);
-  } catch (e) {
-    deps.ui.error(`LocalPilot: pulling ${target} failed: ${errorMessage(e)}`);
-  } finally {
-    sub.dispose();
-    pulling.delete(target);
-    deps.onPullProgress(undefined);
+  if (!name) {
+    const choices = [...new Set([settings.completionModel, settings.chatModel])];
+    name = (await deps.ui.pickItem('Model to pull in a terminal', choices, choices[0]))?.trim();
   }
+  if (!name) return;
+  const text = `ollama pull ${name}`;
+  await deps.copy(text);
+  deps.ui.info(`LocalPilot: copied \`${text}\`. Run it in a terminal.`);
 }
 
 /** `986000000` → "986 MB", `17000000000` → "17.0 GB". */
@@ -180,7 +165,7 @@ export async function selectModel(deps: CommandDeps, kind: ModelKind): Promise<v
     return;
   }
   if (!Array.isArray(models) || models.length === 0) {
-    deps.ui.error('LocalPilot: no models are installed in Ollama. Pull one first (Pull Model with Ollama…).');
+    deps.ui.error('LocalPilot: no models are installed in Ollama. Run `ollama pull <model>` in a terminal first (Copy Ollama Pull Command).');
     return;
   }
   const key = MODEL_SETTING[kind];
@@ -270,15 +255,16 @@ export function registerCommands(deps: CommandDeps): IDisposable {
   set.add(commands.addCommand(COMMANDS.openChat, { label: 'Open LocalPilot Chat', execute: openChat }));
   set.add(
     commands.addCommand(COMMANDS.startOllama, {
-      label: 'Start Ollama (in a terminal)',
-      caption: 'Opens a JupyterLab terminal running `ollama serve`',
+      label: 'Start Ollama (sandboxed, in a terminal)',
+      caption: 'Opens a JupyterLab terminal that starts Ollama inside a no-network sandbox (macOS)',
       execute: () => startOllama(deps)
     })
   );
   set.add(
-    commands.addCommand(COMMANDS.pullModel, {
-      label: 'Pull Model with Ollama…',
-      execute: (args) => pullModel(deps, typeof args.model === 'string' ? args.model : undefined)
+    commands.addCommand(COMMANDS.copyPullCommand, {
+      label: 'Copy Ollama Pull Command…',
+      caption: 'Copies `ollama pull <model>`; LocalPilot does not download models',
+      execute: (args) => copyPullCommand(deps, typeof args.model === 'string' ? args.model : undefined)
     })
   );
   set.add(

@@ -5,7 +5,7 @@ type Tone = 'normal' | 'warning' | 'error';
 
 /**
  * The "LocalPilot" status-bar item, with the VS Code extension's texts and
- * precedence (most important first): a running pull, a stopped core, Ollama
+ * precedence (most important first): a stopped core, Ollama
  * down / model missing, completions paused (by the user, or while a chat reply
  * is generating), otherwise all good. While the WebSocket (re)connects it
  * reads "LocalPilot" like VS Code's "starting"; when the server extension is
@@ -17,7 +17,6 @@ export class StatusItem extends Widget {
   private status?: OllamaStatus;
   private connection: ConnectionState = 'connecting';
   private coreError?: string;
-  private pullPercent?: number;
   private completionsEnabled = true;
   private chatActive = false;
   private onClick?: () => void;
@@ -59,12 +58,6 @@ export class StatusItem extends Widget {
     this.render();
   }
 
-  /** Pull progress in percent (0–100), or undefined when no pull is running. */
-  setPull(percent: number | undefined): void {
-    this.pullPercent = percent === undefined ? undefined : Math.max(0, Math.min(100, Math.round(percent)));
-    this.render();
-  }
-
   setCompletionsEnabled(enabled: boolean): void {
     this.completionsEnabled = enabled;
     this.render();
@@ -87,10 +80,7 @@ export class StatusItem extends Widget {
     let text = 'LocalPilot';
     let tooltip = 'LocalPilot: running locally via Ollama. Click for LocalPilot commands.';
     let tone: Tone = 'normal';
-    if (this.pullPercent !== undefined) {
-      text = `Pulling ${this.pullPercent}%`;
-      tooltip = 'LocalPilot: pulling a model. Click for LocalPilot commands.';
-    } else if (this.connection === 'error') {
+    if (this.connection === 'error') {
       text = 'LocalPilot unreachable';
       tooltip =
         `${this.coreError ?? 'LocalPilot server extension not reachable'}. ` +
@@ -106,7 +96,7 @@ export class StatusItem extends Widget {
       tone = 'warning';
     } else if (this.status?.ollama === 'modelMissing') {
       text = 'Model missing';
-      tooltip = `LocalPilot: ${this.status.detail}. Click for LocalPilot commands (Pull Model with Ollama).`;
+      tooltip = `LocalPilot: ${this.status.detail}. Click for LocalPilot commands (Copy Ollama Pull Command, then run it in a terminal).`;
       tone = 'warning';
     } else if (!this.completionsEnabled) {
       text = 'completions paused';

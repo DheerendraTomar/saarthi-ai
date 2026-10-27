@@ -14,7 +14,7 @@ from traitlets.config import Configurable
 
 from .bridge import Bridge
 from .core_process import CoreProcess
-from .handlers import SETTINGS_KEY, RestartHandler, RpcWebSocket, StatusHandler
+from .handlers import SETTINGS_KEY, OllamaCommandHandler, RestartHandler, RpcWebSocket, StatusHandler
 
 BIN_DIR = Path(__file__).parent / "bin"
 
@@ -85,6 +85,7 @@ class LocalPilotApp(ExtensionApp):
             [
                 (r"/localpilot/status", StatusHandler),
                 (r"/localpilot/restart", RestartHandler),
+                (r"/localpilot/ollama-command", OllamaCommandHandler),
                 (r"/localpilot/rpc", RpcWebSocket),
             ]
         )

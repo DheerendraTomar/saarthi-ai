@@ -1,0 +1,14 @@
+;; LocalPilot's no-network sandbox (macOS `sandbox-exec -f no-network.sb <cmd>`).
+;; Used for the Ollama server ("Start Ollama") and for agent `run_command`s.
+;; Everything is allowed except the network: only this machine (loopback) can
+;; be reached, and DNS lookups are blocked so not even hostnames leave.
+;; Child processes inherit these rules.
+(version 1)
+(allow default)
+(deny network*)
+(allow network-bind      (local ip "localhost:*"))
+(allow network-inbound   (local ip "localhost:*"))
+(allow network-outbound  (remote ip "localhost:*"))
+(allow network-outbound  (remote unix-socket))
+(allow network*          (local unix-socket))
+(deny network-outbound   (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))

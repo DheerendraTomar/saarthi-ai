@@ -14,7 +14,6 @@
 //   FAKE_IGNORE_SHUTDOWN=1            answer `shutdown` but keep running (also ignores stdin EOF): a hung core
 //   FAKE_INDEX_FIRST=1                send `index/ready` before the `initialize` response (a race the
 //                                     README tells clients to handle)
-//   FAKE_PULL_FAIL=1                  `ollama/pull` streams progress, then fails with RPC error -32000
 //                                     (FAKE_OLLAMA=down also makes `ollama/models` fail with -32000)
 //
 // Behaviour:
@@ -35,8 +34,7 @@
 //   chat/history        → { sessionId, messages } — the scripted turns of that session (user, assistant
 //                          with toolCalls, tool, assistant); [] for an unknown session
 //   ollama/status       → the current status
-//   ollama/pull         → 3 `ollama/pullProgress` notifications then {} (status becomes ok, `status` sent);
-//                          with FAKE_PULL_FAIL=1 → error -32000 after the progress
+//   ollama/pull         → always error -32000 (the real core never downloads models)
 //   ollama/models       → { models: [2 fake models, one without supportsInsert] }; Ollama down → -32000
 //   chat/deleteSession  → {} (drops the session); -32602 "turn running …" while its turn runs
 //   chat/clearSessions  → { deleted: n, skipped: [running session ids] } (running sessions are kept)
@@ -65,7 +63,6 @@ const DELAY_MS = Number(process.env.FAKE_DELAY_MS ?? 0);
 const CRASH_AFTER = process.env.FAKE_CRASH_AFTER ? Number(process.env.FAKE_CRASH_AFTER) : undefined;
 const IGNORE_SHUTDOWN = process.env.FAKE_IGNORE_SHUTDOWN === "1";
 const INDEX_FIRST = process.env.FAKE_INDEX_FIRST === "1";
-const PULL_FAIL = process.env.FAKE_PULL_FAIL === "1";
 
 const DETAILS = {
   ok: "Ollama is running",
@@ -239,19 +236,8 @@ async function handleRequest(msg) {
       });
     case "ollama/status":
       return respond(id, ollamaStatus);
-    case "ollama/pull": {
-      const model = params?.model ?? "";
-      notify("ollama/pullProgress", { model, status: "pulling manifest" });
-      notify("ollama/pullProgress", { model, status: "downloading", completed: 50, total: 100 });
-      notify("ollama/pullProgress", { model, status: "downloading", completed: 100, total: 100 });
-      if (PULL_FAIL) return fail(id, -32000, `pull of ${model} failed: Ollama is not reachable`);
-      respond(id, {});
-      if (ollamaStatus.ollama !== "ok") {
-        ollamaStatus = { ollama: "ok", detail: DETAILS.ok };
-        notify("status", ollamaStatus);
-      }
-      return;
-    }
+    case "ollama/pull":
+      return fail(id, -32000, "LocalPilot does not download models; run `ollama pull " + (params?.model ?? "<model>") + "` in a terminal");
     case "ollama/models":
       if (ollamaStatus.ollama === "down") return fail(id, -32000, DETAILS.down);
       return respond(id, { models: FAKE_MODELS });

@@ -23,6 +23,10 @@ npm run build -w chat-ui
 mkdir -p vscode/media
 cp chat-ui/dist/index.html vscode/media/chat.html
 
+# 2b. No-network sandbox profile (Start Ollama and agent commands run inside it).
+mkdir -p vscode/sandbox
+cp sandbox/no-network.sb vscode/sandbox/no-network.sb
+
 # 3. Extension bundle, minified, without source maps (the UI was built above).
 npm run build -w vscode -- --production --skip-ui
 rm -f vscode/out/*.map
@@ -34,9 +38,9 @@ vsix="$repo/dist/localpilot-$version-$target.vsix"
 mkdir -p dist
 (cd vscode && npx --no-install vsce package --no-dependencies --allow-missing-repository --target "$target" -o "$vsix")
 
-# 5. The package must contain the core and the chat page.
+# 5. The package must contain the core, the chat page and the sandbox profile.
 listing="$(unzip -l "$vsix")"
-for f in "extension/bin/$triple/$(basename "$core")" extension/media/chat.html extension/out/extension.js; do
+for f in "extension/bin/$triple/$(basename "$core")" extension/media/chat.html extension/sandbox/no-network.sb extension/out/extension.js; do
   if ! grep -q " $f\$" <<<"$listing"; then
     echo "package-vscode: $f is missing from $vsix" >&2
     exit 1

@@ -329,7 +329,7 @@ class ChatService(private val project: Project, cs: CoroutineScope) : Disposable
         onChatActiveChanged = { active -> if (!project.isDisposed) LocalPilotHost.getInstance(project).setChatActive(active) },
     )
 
-    /** Replaces the edit/command/Ollama hooks (Task 5d: ApplyEdit, RunCommand, StartOllama/PullModel actions). */
+    /** Replaces the edit/command/Ollama hooks (Task 5d: ApplyEdit, RunCommand, StartOllama action). */
     fun installHooks(hooks: HostHooks) {
         bridge.hooks = hooks
     }

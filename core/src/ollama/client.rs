@@ -31,11 +31,17 @@ pub const SHOW_CONCURRENCY: usize = 8;
 /// Parsed lines buffered between the body reader task and the consumer.
 const STREAM_BUFFER: usize = 16;
 
-/// Client for one Ollama server. Cheap to clone.
+/// Client for one Ollama server on this machine. Cheap to clone.
+///
+/// A base URL that is not loopback (`localhost`, `127.0.0.0/8`, `::1`) is
+/// refused: every request fails with [`OllamaError::Down`] before any DNS
+/// lookup or connection, so prompts and code never leave the machine.
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
     http: reqwest::Client,
     base_url: String,
+    /// Whether `base_url` points at this machine; requests are refused otherwise.
+    local: bool,
     keep_alive: String,
 }
 
@@ -81,12 +87,17 @@ impl OllamaClient {
     /// its own.
     pub fn new(base_url: String, keep_alive: String) -> Self {
         // No total timeout: generations can legitimately run for minutes.
+        // No proxies (a proxy could relay "localhost" traffic elsewhere) and
+        // no redirects (Ollama never sends any; following one could leave the machine).
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("HTTP client configuration is valid");
         Self {
             http,
+            local: is_local_url(&base_url),
             base_url: base_url.trim_end_matches('/').to_owned(),
             keep_alive,
         }
@@ -178,24 +189,6 @@ impl OllamaClient {
     pub async fn loaded_models(&self) -> Result<Vec<String>> {
         let body: ModelList = self.get_json("/api/ps").await?;
         Ok(body.names())
-    }
-
-    /// `POST /api/pull`, forwarding every progress line to `progress` until
-    /// Ollama reports `success`. A closed `progress` receiver does not stop
-    /// the pull.
-    pub async fn pull(&self, model: &str, progress: mpsc::Sender<PullProgress>) -> Result<()> {
-        let request = self
-            .http
-            .post(self.url("/api/pull"))
-            .json(&json!({"model": model, "stream": true}));
-        let response = self.send(request, Some(model)).await?;
-        let mut lines = ndjson_stream(response, CancellationToken::new(), |p: &PullProgress| {
-            p.status == "success"
-        });
-        while let Some(line) = lines.next().await {
-            let _ = progress.send(line?).await;
-        }
-        Ok(())
     }
 
     /// Streaming `POST /api/generate`.
@@ -314,6 +307,12 @@ impl OllamaClient {
         request: reqwest::RequestBuilder,
         model: Option<&str>,
     ) -> Result<reqwest::Response> {
+        if !self.local {
+            return Err(OllamaError::Down(format!(
+                "{} is not on this machine; LocalPilot only talks to an Ollama running locally (localhost)",
+                self.base_url
+            )));
+        }
         let response = request.send().await.map_err(|err| {
             if err.is_connect() || err.is_timeout() {
                 OllamaError::Down(format!("{}: {}", self.base_url, describe(&err)))
@@ -348,6 +347,26 @@ impl OllamaClient {
             _ = cancel.cancelled() => Err(OllamaError::Cancelled),
             response = self.send(request, Some(model)) => response,
         }
+    }
+}
+
+/// True for an `http(s)` URL whose host is `localhost` or a loopback address.
+fn is_local_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    // The parser lowercases hosts and keeps IPv6 brackets: "[::1]".
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
     }
 }
 
@@ -523,6 +542,33 @@ impl LineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_urls() {
+        for url in [
+            "http://localhost:11434",
+            "http://LocalHost:1/",
+            "https://localhost",
+            "http://127.0.0.1:11434",
+            "http://127.9.8.7",
+            "http://[::1]:11434",
+        ] {
+            assert!(is_local_url(url), "{url}");
+        }
+        for url in [
+            "http://example.com",
+            "http://10.0.0.1:11434",
+            "http://0.0.0.0:11434",
+            "http://localhost.example.com",
+            "http://localhost@example.com",
+            "ftp://localhost",
+            "http://[::2]",
+            "localhost:11434",
+            "",
+        ] {
+            assert!(!is_local_url(url), "{url}");
+        }
+    }
 
     fn drain(buffer: &mut LineBuffer) -> Vec<String> {
         std::iter::from_fn(|| buffer.next_line())

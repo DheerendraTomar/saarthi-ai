@@ -10,14 +10,13 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use localpilot_core::ollama::{
     ChatMessage, ChatRequest, GenerateRequest, OllamaClient, OllamaError, OllamaState, Options,
-    PullProgress, Role, ToolSpec,
+    Role, ToolSpec,
 };
 use mock_ollama::{
     MockOllama, ModelInfo, Script, chat_done, chat_text, chat_tool_call, generate_chunk,
     generate_done,
 };
 use serde_json::json;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const KEEP_ALIVE: &str = "30m";
@@ -372,46 +371,54 @@ async fn status_reports_missing_model_by_name() {
     assert_eq!(ok.ollama, OllamaState::Ok, "detail: {}", ok.detail);
 }
 
+/// LocalPilot only ever talks to an Ollama on this machine: any other host is
+/// refused before a connection (or DNS lookup) is attempted.
 #[tokio::test]
-async fn pull_forwards_progress() {
-    let mock = MockOllama::start(Script {
-        pull: vec![
-            json!({"status": "pulling manifest"}),
-            json!({"status": "pulling 2bada8a74506", "digest": "sha256:2bada8a74506", "total": 100, "completed": 40}),
-            json!({"status": "pulling 2bada8a74506", "digest": "sha256:2bada8a74506", "total": 100, "completed": 100}),
-            json!({"status": "success"}),
-        ],
-        ..Script::default()
-    })
-    .await;
-    let (tx, mut rx) = mpsc::channel(16);
-
-    tokio::time::timeout(WAIT, client(&mock).pull("qwen3.8:27b-mlx", tx))
-        .await
-        .expect("pull finishes")
-        .expect("pull ok");
-
-    let mut progress: Vec<PullProgress> = Vec::new();
-    while let Some(p) = rx.recv().await {
-        progress.push(p);
+async fn non_local_ollama_url_is_refused_without_connecting() {
+    for url in [
+        "http://192.0.2.1:11434",
+        "http://example.com:11434",
+        "https://ollama.com",
+        "http://localhost.example.com:11434",
+        "http://localhost@example.com:11434",
+        "http://0.0.0.0:11434",
+        "not a url",
+    ] {
+        let client = OllamaClient::new(url.to_owned(), KEEP_ALIVE.to_owned());
+        let started = Instant::now();
+        let err = client.version().await.expect_err(url);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{url}: tried to connect"
+        );
+        match err {
+            OllamaError::Down(detail) => {
+                assert!(detail.contains("not on this machine"), "{url}: {detail}")
+            }
+            other => panic!("{url}: expected Down, got {other:?}"),
+        }
+        let status = client.status("a", "b").await;
+        assert_eq!(status.ollama, OllamaState::Down, "{url}");
+        assert!(
+            status.detail.contains("not on this machine"),
+            "{url}: {}",
+            status.detail
+        );
     }
-    let statuses: Vec<&str> = progress.iter().map(|p| p.status.as_str()).collect();
-    assert_eq!(
-        statuses,
-        [
-            "pulling manifest",
-            "pulling 2bada8a74506",
-            "pulling 2bada8a74506",
-            "success"
-        ]
-    );
-    assert_eq!(progress[1].completed, Some(40));
-    assert_eq!(progress[2].total, Some(100));
-    assert_eq!(progress[1].digest.as_deref(), Some("sha256:2bada8a74506"));
+}
 
-    let requests = mock.received_requests();
-    assert_eq!(requests[0].0, "/api/pull");
-    assert_eq!(requests[0].1["model"], "qwen3.8:27b-mlx");
+#[tokio::test]
+async fn local_ollama_urls_are_allowed() {
+    let mock = MockOllama::start(Script::default()).await;
+    let port = mock.url.rsplit(':').next().unwrap().trim_end_matches('/');
+    for url in [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}/"),
+        format!("http://LOCALHOST:{port}"),
+    ] {
+        let client = OllamaClient::new(url.clone(), KEEP_ALIVE.to_owned());
+        assert!(client.version().await.is_ok(), "{url}");
+    }
 }
 
 fn info(size: u64, family: &str, capabilities: &[&str]) -> ModelInfo {

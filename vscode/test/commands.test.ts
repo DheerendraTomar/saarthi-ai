@@ -4,6 +4,8 @@ import {
   deleteSession,
   resetLearning,
   selectModel,
+  setExtensionPath,
+  startOllama,
   showCompletionStats,
   type CommandDeps,
 } from "../src/commands";
@@ -34,7 +36,7 @@ function answerPicks(...choices: Array<string | undefined>): void {
 }
 
 function makeDeps(client: FakeChatClient) {
-  const calls = { deleted: [] as string[], cleared: 0, startOllama: 0, pulls: 0, refreshed: 0 };
+  const calls = { deleted: [] as string[], cleared: 0, startOllama: 0, refreshed: 0 };
   const deps = {
     client,
     models: new ModelCatalog(client),
@@ -49,7 +51,6 @@ function makeDeps(client: FakeChatClient) {
       postModels: async () => void (calls.refreshed += 1),
     },
     startOllama: () => void (calls.startOllama += 1),
-    pullModel: () => void (calls.pulls += 1),
   } as unknown as CommandDeps;
   return { deps, calls };
 }
@@ -141,14 +142,41 @@ describe("model pickers", () => {
 });
 
 describe("model picker with nothing installed", () => {
-  it("offers_pull_model_when_ollama_has_no_models", async () => {
+  it("offers_copy_pull_command_when_ollama_has_no_models", async () => {
     const client = new FakeChatClient((m) => (m === "ollama/models" ? { models: [] } : {}));
-    const { deps, calls } = makeDeps(client);
-    answerPicks("Pull model");
+    const { deps } = makeDeps(client);
+    answerPicks("Copy pull command");
     await selectModel(deps, "completion");
-    expect(picks[0].options?.placeHolder).toBe("No models are installed in Ollama. Pull one first.");
-    expect(picks[0].items.map((i) => i.label)).toEqual(["$(cloud-download) Pull model"]);
-    expect(calls.pulls).toBe(1);
+    expect(picks[0].options?.placeHolder).toMatch(/ollama pull <model>/);
+    expect(picks[0].items.map((i) => i.label)).toEqual(["$(copy) Copy pull command"]);
+    expect(registry.clipboard).toBe(`ollama pull ${deps.settings().completionModel}`);
+  });
+});
+
+describe("startOllama", () => {
+  const deps = { client: new FakeChatClient(() => ({})), onStatus: () => {} };
+  const plist = "/h/Library/LaunchAgents/local.ollama.sandboxed.plist";
+
+  it("uses_the_launch_agent_when_installed", () => {
+    startOllama(deps, { platform: "darwin", home: "/h", exists: (p) => p === plist });
+    expect(registry.terminals.map((t) => t.sent)).toEqual([[expect.stringContaining(`launchctl bootstrap gui/`)]]);
+    expect(registry.terminals[0].sent[0]).toContain("kickstart");
+  });
+
+  it("falls_back_to_sandbox_exec_with_the_bundled_profile", () => {
+    setExtensionPath("/ext dir");
+    startOllama(deps, { platform: "darwin", home: "/h", exists: (p) => p !== plist });
+    expect(registry.terminals[0].sent).toEqual([
+      "OLLAMA_NO_CLOUD=1 OLLAMA_HOST=127.0.0.1:11434 exec /usr/bin/sandbox-exec -f '/ext dir/sandbox/no-network.sb' ollama serve",
+    ]);
+  });
+
+  it("refuses_without_the_profile_and_off_macos", () => {
+    startOllama(deps, { platform: "darwin", home: "/h", exists: () => false });
+    startOllama(deps, { platform: "linux", home: "/h", exists: () => true });
+    expect(registry.terminals).toEqual([]);
+    expect(registry.messages.map((m) => m.level)).toEqual(["error", "error"]);
+    expect(registry.messages[1].message).toMatch(/macOS.*OLLAMA_NO_CLOUD=1/);
   });
 });
 

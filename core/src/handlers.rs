@@ -22,7 +22,7 @@ use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +30,7 @@ use crate::agent::{AgentRunner, TurnReservation};
 use crate::completion::CompletionEngine;
 use crate::completion::feedback::FeedbackLog;
 use crate::index::{WorkspaceIndex, watcher};
-use crate::ollama::{OllamaClient, OllamaError, OllamaState, OllamaStatus, PullProgress};
+use crate::ollama::{OllamaClient, OllamaError, OllamaState, OllamaStatus};
 use crate::overlay::{DocumentStore, normalize_path, uri_to_path};
 use crate::protocol::{
     Capabilities, ChatApproveParams, ChatDeleteSessionParams, ChatDone, ChatHistoryParams,
@@ -38,8 +38,7 @@ use crate::protocol::{
     CompletionAcceptedParams, CompletionCancelParams, CompletionOutcomeParams,
     CompletionRejectedParams, CompletionRequestParams, CompletionResetLearningResult,
     DidChangeParams, DidCloseParams, DidOpenParams, DidSaveParams, IndexReady, IndexStatus,
-    InitializeParams, InitializeResult, OllamaModelsResult, OllamaPullParams, OllamaPullProgress,
-    OllamaPullResult, StopReason, methods,
+    InitializeParams, InitializeResult, OllamaModelsResult, OllamaPullParams, StopReason, methods,
 };
 use crate::rpc::{Ctx, Handler, RpcError};
 use crate::settings::Settings;
@@ -58,9 +57,6 @@ pub const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// JSON-RPC "Invalid Request": used for calls made in the wrong state.
 const INVALID_REQUEST: i64 = -32600;
-
-/// Buffered `ollama/pull` progress lines.
-const PULL_BUFFER: usize = 32;
 
 /// Everything built by `initialize`.
 pub struct AppState {
@@ -375,10 +371,16 @@ impl AppHandler {
                 Ok(to_json(status))
             }
             methods::OLLAMA_PULL => {
+                // LocalPilot never makes Ollama download anything: downloads
+                // reach the internet, so the user runs them in a terminal.
                 let params: OllamaPullParams = parse(params)?;
-                pull(&state, params.model, &ctx).await?;
-                state.refresh_status(&ctx).await;
-                Ok(to_json(OllamaPullResult {}))
+                Err(RpcError::new(
+                    INVALID_REQUEST,
+                    format!(
+                        "LocalPilot does not download models; run `ollama pull {}` in a terminal",
+                        params.model
+                    ),
+                ))
             }
             methods::COMPLETION_STATS => {
                 parse::<Value>(params)?;
@@ -559,33 +561,6 @@ async fn status_loop(state: std::sync::Weak<AppState>, ctx: Ctx) {
             state.refresh_status(&ctx).await;
         }
     }
-}
-
-/// Runs `ollama/pull`, forwarding progress as `ollama/pullProgress`.
-async fn pull(state: &AppState, model: String, ctx: &Ctx) -> Result<(), RpcError> {
-    let (tx, mut rx) = mpsc::channel::<PullProgress>(PULL_BUFFER);
-    let forward = {
-        let ctx = ctx.clone();
-        let model = model.clone();
-        tokio::spawn(async move {
-            while let Some(p) = rx.recv().await {
-                ctx.notify(
-                    methods::OLLAMA_PULL_PROGRESS,
-                    to_json(OllamaPullProgress {
-                        model: model.clone(),
-                        status: p.status,
-                        completed: p.completed,
-                        total: p.total,
-                    }),
-                );
-            }
-        })
-    };
-    let outcome = state.ollama.pull(&model, tx).await;
-    // `tx` was moved into `pull` and is dropped now, so the forwarder ends
-    // after sending everything; the response then follows the progress.
-    let _ = forward.await;
-    outcome.map_err(ollama_error)
 }
 
 fn ollama_error(err: OllamaError) -> RpcError {

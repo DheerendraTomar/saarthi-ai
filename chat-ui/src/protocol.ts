@@ -71,14 +71,6 @@ export interface StatusNotification {
   detail: string;
 }
 
-/** Notification `ollama/pullProgress`. */
-export interface OllamaPullProgress {
-  model: string;
-  status: string;
-  completed?: number;
-  total?: number;
-}
-
 export interface SessionSummary {
   sessionId: string;
   title: string;

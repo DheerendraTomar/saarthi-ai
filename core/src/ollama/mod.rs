@@ -1,4 +1,4 @@
-//! The core's only Ollama client: health checks, model listing, pulls, and
+//! The core's only Ollama client: health checks, model listing, and
 //! streaming `/api/generate` + `/api/chat` with hard cancellation.
 
 mod client;

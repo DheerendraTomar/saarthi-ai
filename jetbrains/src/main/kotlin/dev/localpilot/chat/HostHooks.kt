@@ -21,16 +21,10 @@ interface CommandRunner {
     suspend fun run(params: JsonElement): JsonElement
 }
 
-/** The UI's "Start Ollama" / "Pull model" buttons. Implemented by Task 5d's StartOllama / PullModel actions. */
+/** The UI's "Start Ollama" button. Implemented by the StartOllama action. */
 interface OllamaActions {
-    /** Opens the IDE terminal running `ollama serve` (never started automatically). Called on the bridge's thread. */
+    /** Starts a sandboxed Ollama (never started automatically). Called on the bridge's thread. */
     fun start()
-
-    /**
-     * Core `ollama/pull { model }` with a progress indicator; returns when the pull finished or failed.
-     * Called on the bridge's single-threaded dispatcher: must suspend while waiting, never block.
-     */
-    suspend fun pull(model: String)
 }
 
 /**
@@ -59,7 +53,6 @@ data class HostHooks(
         }
         val ollama = object : OllamaActions {
             override fun start() = Unit
-            override suspend fun pull(model: String) = Unit
         }
     }
 }

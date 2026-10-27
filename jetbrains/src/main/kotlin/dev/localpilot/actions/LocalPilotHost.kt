@@ -21,11 +21,9 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.progress.ProcessCanceledException
-import com.intellij.openapi.progress.ProgressIndicator
-import com.intellij.openapi.progress.Task
-import com.intellij.openapi.progress.runBlockingCancellable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.util.SystemInfo
 import dev.localpilot.chat.ApplyEdit
 import dev.localpilot.chat.ChatService
@@ -35,11 +33,10 @@ import dev.localpilot.chat.RunCommand
 import dev.localpilot.rpc.CoreProcess
 import dev.localpilot.rpc.CoreState
 import dev.localpilot.rpc.LocalPilotCore
+import dev.localpilot.sandbox.Sandbox
 import dev.localpilot.settings.LocalPilotSettings
 import dev.localpilot.sync.DocumentSyncService
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -52,29 +49,27 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import java.net.HttpURLConnection
 import java.net.URI
-import java.util.concurrent.ConcurrentHashMap
+import java.awt.datatransfer.StringSelection
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
-/** What the status bar shows: the core's state, the last Ollama status (`ok` / `down` / `modelMissing`), a running pull. */
+/** What the status bar shows: the core's state and the last Ollama status (`ok` / `down` / `modelMissing`). */
 data class HostStatus(
     val core: CoreState = CoreState.STOPPED,
     /** The core's last `status` / `ollama/status` answer; null until one arrived. */
     val ollama: String? = null,
     val detail: String = "",
-    /** Percent of a running `ollama/pull`; null when none runs (or its size is not known yet: -1). */
-    val pullPercent: Int? = null,
     /** A chat turn is streaming (completions wait for it: chat and completions share the model server). */
     val chatActive: Boolean = false,
 )
 
 /**
  * The project's host side that is not the chat view: the ONE [RunCommand] (its console tab), the chat's
- * [OllamaActions] (Start Ollama, Pull model), the Ollama status the status bar shows and the "Ollama down" /
+ * [OllamaActions] (Start Ollama), the Ollama status the status bar shows and the "Ollama down" /
  * "model missing" balloons. [install] wires everything into the chat bridge before the core starts.
  *
  * Threading: [status] is a thread-safe flow; core notification handlers only update it (they run on the core's
@@ -93,8 +88,6 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
     /** One per project: each [dev.localpilot.chat.LocalPilotConsole] opens its own Run tab. */
     val runCommand: RunCommand by lazy { RunCommand(project) }
 
-    private val pulling = ConcurrentHashMap.newKeySet<String>()
-
     /** The last successful `ollama/models` answer (the pickers show it while Ollama is down). */
     @Volatile
     var lastKnownModels: List<ModelInfo>? = null
@@ -107,10 +100,9 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
 
     private val process: CoreProcess get() = LocalPilotCore.getInstance(project).process
 
-    /** The chat UI's "Start Ollama" / "Pull model" buttons. */
+    /** The chat UI's "Start Ollama" button. */
     val ollama: OllamaActions = object : OllamaActions {
         override fun start() = startOllama()
-        override suspend fun pull(model: String) = pullModel(model)
     }
 
     /** Whether [ensureInstalled] ran for this project. */
@@ -257,7 +249,7 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
                 "LocalPilot: model missing",
                 detail.ifBlank { "A configured model is not installed in Ollama." },
                 NotificationType.WARNING,
-            ).addAction(NotificationAction.createSimpleExpiring("Pull model") { PullModelAction.choose(project, null) })
+            ).addAction(NotificationAction.createSimpleExpiring("Copy pull command") { copyPullCommand(detail) })
                 .addAction(NotificationAction.createSimpleExpiring("Retry") { retry() })
             else -> return
         }
@@ -269,8 +261,8 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
     // ------------------------------------------------------------ Start Ollama
 
     /**
-     * Opens (or re-shows) an "Ollama" tab in the Run tool window running `ollama serve` — only ever on a user click,
-     * LocalPilot never starts Ollama by itself. Returns at once (the process is spawned off the EDT); re-probes the
+     * Opens (or re-shows) an "Ollama" tab in the Run tool window that starts a sandboxed Ollama (see [Sandbox]) — only
+     * ever on a user click, LocalPilot never starts Ollama by itself. Not on macOS: an error balloon, nothing started. Returns at once (the process is spawned off the EDT); re-probes the
      * status after 3 s and 10 s so the "down" warning clears by itself.
      *
      * A Run tab, not the Terminal tool window: the terminal plugin's API to open a tab with a command is deprecated
@@ -294,10 +286,15 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
                     notify("Ollama is already running.", NotificationType.INFORMATION)
                     return@launch
                 }
+                val plan = ollamaStartPlan()
+                if (plan is Sandbox.OllamaStart.Unsupported) {
+                    notify(plan.message, NotificationType.ERROR)
+                    return@launch
+                }
                 val handler = try {
-                    withContext(Dispatchers.IO) { OSProcessHandler(ollamaServeCommand()) }
+                    withContext(Dispatchers.IO) { OSProcessHandler(ollamaCommandLine(plan as Sandbox.OllamaStart.Shell)) }
                 } catch (e: ExecutionException) {
-                    notify("Could not run `ollama serve`: ${e.message}. Install Ollama from ollama.com.", NotificationType.ERROR)
+                    notify("Could not start Ollama: ${e.message}. Install Ollama from ollama.com.", NotificationType.ERROR)
                     return@launch
                 }
                 withContext(Dispatchers.EDT + ModalityState.nonModal().asContextElement()) { showOllamaConsole(handler) }
@@ -337,74 +334,14 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
         handler.startNotify()
     }
 
-    // ------------------------------------------------------------ Pull model
+    // ------------------------------------------------------------ Pull command
 
-    /**
-     * Core `ollama/pull { model }` (`""` = the completion model) shown as a cancellable background task fed by
-     * `ollama/pullProgress`; the status bar shows the percentage. Suspends (never blocks) until the pull ended or the
-     * task was cancelled. A pull of a model that is already being pulled returns at once.
-     *
-     * The protocol has no pull cancel, so the request runs in the project scope, not in the task: cancelling the
-     * progress task only stops watching. The model stays marked as pulling (no second pull is started) and the status
-     * bar keeps its percentage until the core answers.
-     */
-    suspend fun pullModel(model: String) {
-        val target = model.trim().ifEmpty { LocalPilotSettings.getInstance().state.completionModel }
-        if (!pulling.add(target)) return
-        val indicatorRef = AtomicReference<ProgressIndicator?>()
-        _status.update { it.copy(pullPercent = -1) }
-        val sub = process.onNotification(PULL_PROGRESS) { raw ->
-            val p = raw as? JsonObject ?: return@onNotification
-            if ((p["model"] as? JsonPrimitive)?.content != target) return@onNotification
-            val indicator = indicatorRef.get()
-            (p["status"] as? JsonPrimitive)?.content?.let { indicator?.text2 = it }
-            val total = (p["total"] as? JsonPrimitive)?.longOrNull
-            val completed = (p["completed"] as? JsonPrimitive)?.longOrNull
-            if (total != null && total > 0 && completed != null) {
-                val fraction = (completed.toDouble() / total).coerceIn(0.0, 1.0)
-                indicator?.isIndeterminate = false
-                indicator?.fraction = fraction
-                _status.update { it.copy(pullPercent = (fraction * 100).toInt()) }
-            }
-        }
-        val call = cs.async { process.requestJson(OLLAMA_PULL, buildJsonObject { put("model", target) }) }
-        call.invokeOnCompletion {
-            sub.dispose()
-            pulling.remove(target)
-            if (pulling.isEmpty()) _status.update { it.copy(pullPercent = null) }
-        }
-        val outcome = CompletableDeferred<Throwable?>()
-        val task = object : Task.Backgroundable(project, "LocalPilot: pulling $target", true) {
-            override fun run(indicator: ProgressIndicator) {
-                indicator.isIndeterminate = true
-                indicatorRef.set(indicator)
-                try {
-                    // Cancelling the indicator cancels only this wait, never the core's pull.
-                    runBlockingCancellable { call.await() }
-                    outcome.complete(null)
-                } catch (e: Throwable) {
-                    outcome.complete(e)
-                    if (e is ProcessCanceledException || e is CancellationException) throw e
-                } finally {
-                    indicatorRef.set(null)
-                }
-            }
-
-            // Also runs when the task never started (project closing): the caller must not wait forever.
-            override fun onFinished() {
-                outcome.complete(CancellationException("pull of $target was cancelled"))
-            }
-        }
-        withContext(Dispatchers.EDT + ModalityState.any().asContextElement()) { task.queue() }
-        when (val error = outcome.await()) {
-            null -> {
-                notify("$target is ready.", NotificationType.INFORMATION)
-                // Clears a "model missing" warning right away (the core's next probe could be 30 s off).
-                checkStatusQuietly()
-            }
-            is CancellationException, is ProcessCanceledException -> Unit
-            else -> notify("Pulling $target failed: ${error.message}", NotificationType.ERROR)
-        }
+    /** LocalPilot never downloads models: it puts `ollama pull <model>` on the clipboard to run in a terminal. */
+    fun copyPullCommand(detail: String = "") {
+        val st = LocalPilotSettings.getInstance().state
+        val text = Sandbox.pullCommands(detail, listOf(st.completionModel, st.chatModel))
+        CopyPasteManager.getInstance().setContents(StringSelection(text))
+        notify("Copied to the clipboard; run it in a terminal:\n$text", NotificationType.INFORMATION)
     }
 
     // ------------------------------------------------------------ helpers
@@ -435,17 +372,28 @@ class LocalPilotHost(private val project: Project, private val cs: CoroutineScop
     companion object {
         const val STATUS = "status"
         const val OLLAMA_STATUS = "ollama/status"
-        const val OLLAMA_PULL = "ollama/pull"
         const val OLLAMA_MODELS = "ollama/models"
-        const val PULL_PROGRESS = "ollama/pullProgress"
         const val OLLAMA_TAB = "Ollama"
         private val LOG = logger<LocalPilotHost>()
 
         fun getInstance(project: Project): LocalPilotHost = project.service()
 
-        /** `ollama serve` through the user's shell environment (PATH from the login shell on macOS). */
-        fun ollamaServeCommand(): GeneralCommandLine =
-            (if (SystemInfo.isWindows) GeneralCommandLine("cmd.exe", "/d", "/s", "/c", "ollama serve") else GeneralCommandLine("/bin/sh", "-c", "exec ollama serve"))
+        /** The launch agent of the user's sandboxed Ollama, if they set one up. */
+        private fun launchAgentPlist(): Path = Path.of(System.getProperty("user.home"), "Library/LaunchAgents/${Sandbox.LAUNCH_AGENT_LABEL}.plist")
+
+        fun ollamaStartPlan(): Sandbox.OllamaStart {
+            val plist = launchAgentPlist()
+            val profile = Sandbox.bundledProfile()
+            return Sandbox.planOllamaStart(
+                SystemInfo.isMac, plist, Files.isRegularFile(plist),
+                profile?.takeIf { Files.isRegularFile(it) }, Files.isExecutable(Path.of(Sandbox.SANDBOX_EXEC)),
+            )
+        }
+
+        /** The plan through the user's shell environment (PATH from the login shell on macOS, so `ollama` resolves). */
+        fun ollamaCommandLine(plan: Sandbox.OllamaStart.Shell): GeneralCommandLine =
+            GeneralCommandLine(plan.argv)
+                .withEnvironment(plan.env)
                 .withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
                 .withCharset(Charsets.UTF_8)
 

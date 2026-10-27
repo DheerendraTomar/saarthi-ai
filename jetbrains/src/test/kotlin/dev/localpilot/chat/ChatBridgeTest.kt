@@ -465,17 +465,13 @@ class ChatBridgeTest {
             put("sessionId", "s2")
             put("stopReason", "done")
         })
-        h.core.emit("ollama/pullProgress", buildJsonObject {
-            put("model", "m")
-            put("type", "spoofed")
-        })
         settle()
         val done = h.posted.first()
         assertEquals("chat/done", done.type)
         assertEquals("s2", done.str("sessionId"))
         assertEquals("done", done.str("stopReason"))
         assertTrue("finished turn refreshes the list", "session/list" in h.types())
-        assertEquals("ollama/pullProgress", h.ofType("ollama/pullProgress").single().type)
+        assertTrue("ollama/pullProgress" !in ChatBridge.RELAYED)
     }
 
     @Test
@@ -581,18 +577,14 @@ class ChatBridgeTest {
                 override fun start() {
                     seen += "start"
                 }
-                override suspend fun pull(model: String) {
-                    seen += "pull:$model"
-                }
             },
         )
         assertEquals("true", h.core.requestHandlers.getValue(ChatBridge.APPLY_EDIT)(applyParams).jsonObject["applied"]!!.jsonPrimitive.content)
         h.core.requestHandlers.getValue(ChatBridge.RUN_COMMAND)(buildJsonObject { put("command", "pytest") })
         h.ui("""{"type":"ollama/start"}""")
-        h.ui("""{"type":"ollama/pull","model":"qwen"}""")
         h.ui("""{"type":"ui/insertAtCursor","text":"x = 1"}""")
         h.ui("""{"type":"ui/copy","text":"y"}""")
-        assertEquals(listOf("apply:true", "run:pytest", "start", "pull:qwen"), seen)
+        assertEquals(listOf("apply:true", "run:pytest", "start"), seen)
         assertEquals(listOf("x = 1"), h.editors.inserted)
         assertEquals(listOf("y"), h.editors.copied)
     }

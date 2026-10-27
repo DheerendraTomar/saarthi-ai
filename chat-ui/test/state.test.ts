@@ -123,7 +123,6 @@ describe("reduce", () => {
       { type: "chat/toolResult", sessionId: "s1", toolCallId: "t1", ok: false, summary: "denied" },
       { type: "chat/done", sessionId: "s1", stopReason: "stopped" },
       { type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' },
-      { type: "ollama/pullProgress", model: "m:1b", status: "pulling", completed: 5, total: 10 },
       { type: "session/list", sessions: [], current: null },
       { type: "session/history", sessionId: "s1", messages: [] },
       { type: "ui/activeFile", uri: "file:///a.py" },
@@ -140,13 +139,8 @@ describe("reduce", () => {
     expect(seen[1].pendingApprovals.get("t1")?.name).toBe("edit_file");
     expect(seen[2].pendingApprovals.size).toBe(0);
     expect(seen[4].status).toEqual({ ollama: "modelMissing", detail: 'model "m:1b" is not installed' });
-    expect(seen[5].pull).toEqual({ model: "m:1b", status: "pulling", completed: 5, total: 10 });
-    expect(seen[8].activeFile).toEqual({ uri: "file:///a.py" });
+    expect(seen[7].activeFile).toEqual({ uri: "file:///a.py" });
     expect(s.notice).toBe("boom");
-
-    // A finished pull clears the progress.
-    s = reduce(s, { type: "ollama/pullProgress", model: "m:1b", status: "success" });
-    expect(s.pull).toBeUndefined();
   });
 });
 
@@ -203,24 +197,7 @@ describe("reattaching to a running turn", () => {
   });
 });
 
-describe("pull progress lifecycle", () => {
-  const progress: HostToUi = { type: "ollama/pullProgress", model: "m:1b", status: "pulling", completed: 1, total: 4 };
-
-  it("failed_pull_is_cleared_by_ui_error_or_status", () => {
-    let s = run([progress, { type: "ui/error", message: "pull failed: no space" }]);
-    expect(s.pull).toBeUndefined();
-    expect(s.notice).toBe("pull failed: no space");
-
-    s = run([progress, { type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' }]);
-    expect(s.pull).toBeUndefined();
-    s = run([progress, { type: "status", ollama: "ok", detail: "" }]);
-    expect(s.pull).toBeUndefined();
-
-    // Progress after a status report shows again.
-    s = reduce(s, progress);
-    expect(s.pull?.completed).toBe(1);
-  });
-
+describe("status lifecycle", () => {
   it("initial_status_is_unknown_until_host_reports", () => {
     expect(initialState().status.ollama).toBe("unknown");
   });

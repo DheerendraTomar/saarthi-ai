@@ -118,8 +118,7 @@ select:focus-visible {
 }
 .status-pill.ok::before,
 .status-pill.down::before,
-.status-pill.missing::before,
-.status-pill.pulling::before {
+.status-pill.missing::before {
   content: "";
   width: 7px;
   height: 7px;
@@ -129,8 +128,7 @@ select:focus-visible {
 .status-pill.down::before {
   background: var(--lp-error);
 }
-.status-pill.missing::before,
-.status-pill.pulling::before {
+.status-pill.missing::before {
   background: var(--lp-warn);
 }
 .status-pill button {

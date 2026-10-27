@@ -48,6 +48,7 @@ dependencies {
 tasks.test {
     // CoreProcessTest drives the VS Code fake core (`node vscode/test/fakeCore.mjs`), so the tests need Node.js >= 20:
     // found via LOCALPILOT_TEST_NODE, then PATH (node / node.exe), then ~/.nvm; without it those tests are skipped.
+    systemProperty("localpilot.sandboxProfile", layout.projectDirectory.file("../sandbox/no-network.sb").asFile.absolutePath)
     systemProperty("localpilot.fakeCore", layout.projectDirectory.file("../vscode/test/fakeCore.mjs").asFile.absolutePath)
 }
 
@@ -78,6 +79,10 @@ tasks.prepareSandbox {
         include("*/localpilot-core", "*/localpilot-core.exe")
         filePermissions { unix("rwxr-xr-x") }
         into(pluginName.map { "$it/lib/bin" })
+    }
+    // The no-network sandbox profile, a real file for `sandbox-exec -f`: lib/sandbox/no-network.sb (Sandbox.profilePath).
+    from(layout.projectDirectory.file("../sandbox/no-network.sb")) {
+        into(pluginName.map { "$it/lib/sandbox" })
     }
 }
 

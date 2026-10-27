@@ -18,8 +18,9 @@
 //!   `index/ready` notification ([`IndexReady`]) when it is done.
 //! - `workspace/applyEdit` and `workspace/runCommand` are requests sent **by
 //!   the core to the client**; the client's response becomes the tool result.
-//! - `ollama/pull` streams `ollama/pullProgress` notifications
-//!   ([`OllamaPullProgress`]) and responds when the pull finishes.
+//! - `ollama/pull` always fails: LocalPilot never makes Ollama download
+//!   anything (that would reach the internet); the error tells the user which
+//!   `ollama pull` to run in a terminal.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,7 +64,6 @@ pub mod methods {
     pub const CHAT_TOOL_RESULT: &str = "chat/toolResult";
     pub const CHAT_DONE: &str = "chat/done";
     pub const STATUS: &str = "status";
-    pub const OLLAMA_PULL_PROGRESS: &str = "ollama/pullProgress";
     pub const INDEX_READY: &str = "index/ready";
 
     // Core → client requests.
@@ -540,10 +540,6 @@ pub struct OllamaPullParams {
     pub model: String,
 }
 
-/// `ollama/pull` responds `{}` once the pull has finished.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OllamaPullResult {}
-
 /// Result of `ollama/models {}`: the models installed in Ollama, in
 /// `/api/tags` order.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,18 +606,6 @@ pub struct CompletionLanguageStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionResetLearningResult {}
 
-/// Notification `ollama/pullProgress`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OllamaPullProgress {
-    pub model: String,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<u64>,
-}
-
 // ---------------------------------------------------------------- bench
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,7 +666,6 @@ mod tests {
         assert_eq!(methods::APPLY_EDIT, "workspace/applyEdit");
         assert_eq!(methods::RUN_COMMAND, "workspace/runCommand");
         assert_eq!(methods::STATUS, "status");
-        assert_eq!(methods::OLLAMA_PULL_PROGRESS, "ollama/pullProgress");
         assert_eq!(methods::INDEX_READY, "index/ready");
     }
 

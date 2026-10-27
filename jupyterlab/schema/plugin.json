@@ -11,7 +11,7 @@
       "title": "Ollama URL",
       "type": "string",
       "default": "http://localhost:11434",
-      "description": "Base URL of the local Ollama server, as seen from the Jupyter server. LocalPilot talks to nothing else."
+      "description": "Base URL of the Ollama server on this machine (localhost, 127.0.0.1 or ::1), as seen from the Jupyter server. LocalPilot refuses any other host and talks to nothing else."
     },
     "completionModel": {
       "title": "Completion model",

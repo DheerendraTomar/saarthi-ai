@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "localpilot-jupyter"
-version = "0.2.1"
+version = "0.3.0"
 description = "LocalPilot for JupyterLab: local Ollama-backed completions and agent chat"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -25,10 +25,10 @@ test = ["pytest>=7", "pytest-jupyter[server]>=0.6", "pytest-asyncio>=0.21"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["localpilot_jupyter"]
-# The bundled core (localpilot_jupyter/bin/<triple>/localpilot-core) is git-ignored
-# but must ship in the wheel. The built labextension ships only as shared-data
+# The bundled core (localpilot_jupyter/bin/<triple>/localpilot-core) and the sandbox
+# profile (localpilot_jupyter/sandbox/no-network.sb) are git-ignored but must ship in the wheel. The built labextension ships only as shared-data
 # (share/jupyter/labextensions/...), not a second time inside the package.
-artifacts = ["localpilot_jupyter/bin"]
+artifacts = ["localpilot_jupyter/bin", "localpilot_jupyter/sandbox"]
 exclude = ["localpilot_jupyter/labextension"]
 
 [tool.hatch.build.targets.wheel.shared-data]
@@ -58,7 +58,7 @@ source_dir = "src"
 build_dir = "localpilot_jupyter/labextension"
 
 [tool.hatch.build.targets.sdist]
-artifacts = ["localpilot_jupyter/bin", "localpilot_jupyter/labextension"]
+artifacts = ["localpilot_jupyter/bin", "localpilot_jupyter/sandbox", "localpilot_jupyter/labextension"]
 exclude = [".venv", ".github", "node_modules", "lib", ".yarn"]
 
 [tool.pytest.ini_options]

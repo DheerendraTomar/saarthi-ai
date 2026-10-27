@@ -11,7 +11,10 @@ sidecar and the shared chat UI, and talks to a local [Ollama](https://ollama.com
 - **Model picker, sessions, settings panel and adaptive completions**, as in the
   VS Code extension (see [`../vscode/README.md`](../vscode/README.md)).
 
-Nothing leaves your machine.
+Nothing leaves your machine, and the plugin enforces it: the core refuses any Ollama
+URL that is not on this machine, LocalPilot never downloads models, Ollama is
+started inside a no-network sandbox, and every command the agent runs is
+sandboxed without network access (macOS `sandbox-exec`, see below).
 
 ## Build
 
@@ -19,14 +22,15 @@ On macOS arm64, with Rust, Node.js 20+ and a JDK 25 (e.g. Temurin 25):
 
 ```sh
 npm ci                                   # once, at the repo root
-bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.1.1.zip
+bash scripts/package-jetbrains.sh        # → dist/localpilot-jetbrains-0.2.0.zip
 ```
 
 The script builds the release core (`scripts/build-core.sh`; `SKIP_CORE_BUILD=1`
 reuses `dist/core/<triple>/localpilot-core`), builds the chat UI and copies it to
 `src/main/resources/chat/index.html` (gitignored), then runs `./gradlew buildPlugin`.
 Gradle's `prepareSandbox` puts the core at `lib/bin/<triple>/localpilot-core`
-inside the plugin, where the plugin looks for it. It finds JDK 25 via `JAVA_HOME`
+and the sandbox profile (`sandbox/no-network.sb`) at `lib/sandbox/no-network.sb`
+inside the plugin, where the plugin looks for them (the script checks both are in the zip). It finds JDK 25 via `JAVA_HOME`
 or `/usr/libexec/java_home -v 25`. The version comes from `gradle.properties`
 (`pluginVersion`).
 
@@ -37,7 +41,7 @@ machine's), so it is effectively macOS arm64 only. On another platform, set
 ## Install
 
 1. In PyCharm: **Settings → Plugins → ⚙ → Install Plugin from Disk…** and pick
-   `<repo>/dist/localpilot-jetbrains-0.1.1.zip`.
+   `<repo>/dist/localpilot-jetbrains-0.2.0.zip`.
 2. PyCharm 2026.2 loads it without a restart (all of LocalPilot's extension
    points are dynamic). Projects that are already open are set up when the plugin
    loads (document sync, chat hooks, core), and again lazily when the LocalPilot
@@ -53,18 +57,30 @@ directory. For PyCharm 2026.2 on macOS that is
 To update, install the new zip the same way (or delete `plugins/localpilot-jetbrains`
 first when unzipping by hand).
 
-## Start Ollama
+## Start Ollama and pull models
+
+LocalPilot does not download models. Pull them yourself, in a terminal:
 
 ```sh
-ollama serve &                           # or launch the Ollama app
 ollama pull qwen2.5-coder:0.5b-base      # completions (fill-in-the-middle)
 ollama pull qwen3.8:27b-mlx              # chat (tool calling)
 ```
 
 If Ollama is not running, LocalPilot shows an **Ollama down** balloon with
-**Start Ollama** (runs `ollama serve` in an "Ollama" tab of the Run tool window)
-and **Retry**. If a configured model is missing, the balloon offers **Pull model**
-(a cancellable background task with progress).
+**Start Ollama** and **Retry**. **Start Ollama** only starts a *sandboxed* Ollama
+(macOS only):
+
+- If `~/Library/LaunchAgents/local.ollama.sandboxed.plist` exists, it (re)starts
+  that launch agent (`launchctl bootstrap` / `kickstart`).
+- Otherwise it runs `sandbox-exec -f <plugin>/lib/sandbox/no-network.sb ollama serve`
+  with `OLLAMA_NO_CLOUD=1` and `OLLAMA_HOST=127.0.0.1:11434` in an "Ollama" tab of
+  the Run tool window.
+- On other systems it starts nothing and shows an error: start Ollama yourself
+  with `OLLAMA_NO_CLOUD=1`.
+
+If a configured model is missing, the balloon (and the model picker, when no model
+is installed) offers **Copy pull command**: it puts `ollama pull <model>` on the
+clipboard to run in a terminal.
 
 ## Using it
 
@@ -72,10 +88,10 @@ and **Retry**. If a configured model is missing, the balloon offers **Pull model
   Word** / **Insert Next Line** inline-completion actions accept part of it.
 - **Chat**: `Cmd+Shift+L` (macOS) / `Ctrl+Shift+L` opens the LocalPilot tool window.
 - **Status bar**: the LocalPilot widget shows the state (starting, Ollama down,
-  model missing, pulling N%, completions off, completions paused during chat,
+  model missing, completions off, completions paused during chat,
   crashed). Click it for the menu.
 - **Tools → LocalPilot** (and the status bar menu): Open LocalPilot Chat, New
-  LocalPilot Chat, Start Ollama (only if Ollama is not already answering), Check Ollama Again, Pull Model…, Select Chat Model…, Select Completion
+  LocalPilot Chat, Start Ollama (only if Ollama is not already answering), Check Ollama Again, Select Chat Model…, Select Completion
   Model…, Inline Completions (toggle), Show Completion Stats, Reset Completion
   Learning…, Restart LocalPilot Core.
 
@@ -90,7 +106,7 @@ core and the VS Code extension:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| Ollama URL (`ollamaUrl`) | `http://localhost:11434` | Base URL of the local Ollama server. |
+| Ollama URL (`ollamaUrl`) | `http://localhost:11434` | Must be on this machine (localhost, 127.0.0.1, ::1); any other host is refused. |
 | Completion model (`completionModel`) | `qwen2.5-coder:0.5b-base` | FIM model for inline completions; also set by **Select Completion Model…**. |
 | Show inline completions (`completionsEnabled`) | on | **Client-side**: no core restart. Also the **Inline Completions** toggle. |
 | Debounce (`completionDebounceMs`) | `120` | Delay after the last keystroke before a completion is requested. **Client-side**. |
@@ -115,11 +131,13 @@ Walk this after installing a new build (a project open, Ollama models pulled):
 
 1. **Ollama down** — quit Ollama, run **Tools → LocalPilot → Restart LocalPilot
    Core**: an **Ollama down** balloon appears and the status bar says so.
-2. **Start Ollama** — click **Start Ollama** in the balloon: an "Ollama" tab in the
-   Run tool window runs `ollama serve`; the status clears within ~10 s.
-3. **Pull model** — select a completion model you don't have (or `ollama rm` one):
-   the **Model missing** balloon offers **Pull model**; the background task shows
-   progress and ends with "… is ready".
+2. **Start Ollama** — click **Start Ollama** in the balloon: with the launch agent
+   `local.ollama.sandboxed` installed it is (re)started, otherwise an "Ollama" tab
+   in the Run tool window runs `sandbox-exec … ollama serve`; the status clears
+   within ~10 s. (Not on macOS: an error balloon, nothing starts.)
+3. **Copy pull command** — select a completion model you don't have (or
+   `ollama rm` one): the **Model missing** balloon offers **Copy pull command**;
+   the clipboard then holds `ollama pull <model>` (nothing is downloaded).
 4. **Ghost text in Python** — in a `.py` file type `def fibonacci(n):` and a
    newline: grey ghost text appears; `Tab` accepts it.
 5. **Ghost text in a notebook** — open an `.ipynb`, type in a code cell: ghost text
@@ -132,6 +150,9 @@ Walk this after installing a new build (a project open, Ollama models pulled):
    the cell changes in place and the notebook is saved.
 8. **Run command, denied** — ask the chat to run `ls`: a command card appears;
    **Deny**: nothing runs and the agent says it was denied.
+   **Run command, no network** — ask it to run `curl https://example.com` and
+   **Approve**: it fails ("Could not resolve host") and the result ends with
+   "(LocalPilot runs commands without network access)"; `echo ok` works.
 9. **Models (v2)** — pick a chat model in the chat's picker and a completion model
    via **Select Completion Model…** (models without fill-in-the-middle / tool calling
    are flagged). With Ollama quit, the chat picker shows **No models — Ollama down**
@@ -161,20 +182,21 @@ Walk this after installing a new build (a project open, Ollama models pulled):
   Next Word / Line count as partial accepts. These two actions are
   `@ApiStatus.Experimental` in 2026.2 (`verifyPlugin` warns about them).
 - **Start Ollama** uses a Run tool window tab, not the Terminal; closing the
-  project stops that `ollama serve`. If `ollama` is not on the login shell's
-  `PATH`, the tab shows `ollama: not found`.
-- The **Pull model** balloon offers the configured models rather than detecting
-  which one is missing.
+  project stops a `sandbox-exec … ollama serve` started from it (a launch agent
+  keeps running). If `ollama` is not on the login shell's `PATH`, the tab shows
+  `ollama: not found`.
+- **Copy pull command** copies the commands for the configured models (only the
+  one named in the status detail, when it names one) rather than detecting which
+  is missing.
+- **macOS only for commands and Start Ollama**: elsewhere the agent's commands are
+  refused (fail closed) and Start Ollama starts nothing.
 - **Dynamic install / update**: the plugin installs itself into open projects
   when it is loaded without a restart (verified by tests, not on every IDE
   build). If a project stays inert after installing or updating, reopen it or
   restart the IDE.
-- Cancelling a **Pull model** task only stops watching it: the protocol has no
-  pull cancel, so Ollama finishes the download (the status bar keeps the
-  percentage until it does).
 - Chat edits run on the EDT without modality, so an open modal dialog delays them
   until it closes; created files are not undone by **Undo**.
-- Windows is untested (the command runner's quoting, the bundled core).
+- Windows is unsupported: no sandbox, so commands and Start Ollama are refused.
 
 ## Troubleshooting
 
@@ -186,7 +208,18 @@ Walk this after installing a new build (a project open, Ollama models pulled):
 - **Logs**: `<project>/.localpilot/core.log` (raise **Log level** to `debug`), and
   the IDE log (**Help → Show Log in Finder**, search for `LocalPilot`).
 - **"Ollama down"**: check `curl http://localhost:11434/api/tags`, then **Check
-  Ollama Again**.
+  Ollama Again**. "not on this machine" in the detail means **Ollama URL** points
+  at another host; set it to `http://localhost:11434`.
+- **Model missing / pulling models**: LocalPilot never downloads. Use **Copy pull
+  command** and run `ollama pull <model>` in a terminal.
+- **A command fails with "Could not resolve host" or a connection error**: agent
+  commands run in a no-network sandbox on purpose (only loopback works). Install
+  dependencies yourself in a terminal.
+- **"LocalPilot runs commands only inside a no-network sandbox (macOS)"**: not on
+  macOS, or `/usr/bin/sandbox-exec` / `lib/sandbox/no-network.sb` is missing from
+  the plugin; reinstall the zip.
+- **Start Ollama did nothing / error balloon**: needs macOS. To change what it
+  starts, install the `local.ollama.sandboxed` launch agent.
 
 ## Development
 

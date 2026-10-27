@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds a self-contained LocalPilot plugin zip for JetBrains IDEs (PyCharm 2026.2+, build 262+) on this machine:
-#   release core → dist/core/<triple>/ (bundled by Gradle's prepareSandbox at lib/bin/<triple>/localpilot-core)
+#   release core → dist/core/<triple>/ (bundled by Gradle's prepareSandbox at lib/bin/<triple>/localpilot-core,
+#   next to sandbox/no-network.sb at lib/sandbox/)
 #   → chat UI → jetbrains/src/main/resources/chat/index.html → ./gradlew buildPlugin
 #   → dist/localpilot-jetbrains-<version>.zip
 # Usage: bash scripts/package-jetbrains.sh   (run `npm ci` once first on a clean checkout)
@@ -72,12 +73,14 @@ zip="$repo/dist/localpilot-jetbrains-$version.zip"
 mkdir -p dist
 cp "$built" "$zip"
 
-# 4. The zip must contain the plugin jar (with the chat page) and an executable core.
+# 4. The zip must contain the plugin jar (with the chat page), an executable core and the sandbox profile.
 listing="$(unzip -Z "$zip")"
 jar="localpilot-jetbrains/lib/localpilot-jetbrains-$version.jar"
 bin="localpilot-jetbrains/lib/bin/$triple/localpilot-core"
 grep -q " $jar\$" <<<"$listing" || die "$jar is missing from $zip"
 grep -q "^-rwx.* $bin\$" <<<"$listing" || die "$bin is missing from $zip or not executable"
+sandbox="localpilot-jetbrains/lib/sandbox/no-network.sb"
+grep -q " $sandbox\$" <<<"$listing" || die "$sandbox is missing from $zip"
 check_jar="$(dirname "$built")/plugin.jar.check"
 unzip -p "$zip" "$jar" > "$check_jar"
 jar_listing="$(unzip -l "$check_jar")"

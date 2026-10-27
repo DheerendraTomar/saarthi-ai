@@ -12,7 +12,6 @@ import type {
   HistoryMessage,
   JsonValue,
   ModelInfo,
-  OllamaPullProgress,
   OllamaState,
   Range,
   SessionSummary,
@@ -45,7 +44,6 @@ export type UiToHost =
   | { type: "ui/copy"; text: string }
   | { type: "ui/openDiff"; toolCallId: string }
   | { type: "ollama/start" }
-  | { type: "ollama/pull"; model: string }
   /** Ask for a fresh `models/list` (host calls core `ollama/models`). */
   | { type: "models/list" }
   /** Persist the chat or completion model setting (the host restarts the core as needed). */
@@ -70,7 +68,6 @@ export type HostToUi =
   | ({ type: "chat/toolResult" } & ChatToolResult)
   | ({ type: "chat/done" } & ChatDone)
   | ({ type: "status" } & StatusNotification)
-  | ({ type: "ollama/pullProgress" } & OllamaPullProgress)
   /** Host-originated: whether `sessionId` has a turn in progress (sent after `session/history`, so Stop shows for a running turn). */
   | { type: "chat/turnState"; sessionId: string; running: boolean }
   | { type: "session/list"; sessions: SessionSummary[]; current: string | null }

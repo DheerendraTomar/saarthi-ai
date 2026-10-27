@@ -70,15 +70,18 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start Ollama" }));
     expect(bridge.sent).toContainEqual({ type: "ollama/start" });
 
-    // Model missing → Pull posts the model parsed from detail.
+    // Model missing → LocalPilot never downloads; it copies the terminal command.
     emit({
       type: "status",
       ollama: "modelMissing",
       detail: 'model "qwen2.5-coder:0.5b-base" is not installed (run `ollama pull qwen2.5-coder:0.5b-base`)',
     });
     expect(screen.queryByRole("button", { name: "Start Ollama" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Pull model" }));
-    expect(bridge.sent).toContainEqual({ type: "ollama/pull", model: "qwen2.5-coder:0.5b-base" });
+    expect(screen.queryByRole("button", { name: "Pull model" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Copy pull command" }));
+    expect(bridge.sent).toContainEqual({ type: "ui/copy", text: "ollama pull qwen2.5-coder:0.5b-base" });
+    expect(bridge.sent.some((m) => (m.type as string) === "ollama/pull")).toBe(false);
+    expect(screen.getByRole("button", { name: "Copy pull command" }).textContent).toBe("Copied");
 
     // History replaces the rendered list.
     emit({ type: "session/history", sessionId: "s2", messages: [{ role: "user", content: "fresh" }] });
@@ -96,15 +99,12 @@ describe("App", () => {
 });
 
 describe("status pill", () => {
-  it("shows_checking_until_status_then_recovers_from_failed_pull", () => {
+  it("shows_checking_until_status_then_missing_model_command", () => {
     const { emit } = setup();
     expect(screen.getByText("Checking Ollama…")).toBeTruthy();
-    emit({ type: "ollama/pullProgress", model: "m:1b", status: "pulling", completed: 1, total: 4 });
-    expect(screen.getByText(/Pulling m:1b/)).toBeTruthy();
-    emit({ type: "ui/error", message: "pull failed" });
-    expect(screen.queryByText(/Pulling m:1b/)).toBeNull();
     emit({ type: "status", ollama: "modelMissing", detail: 'model "m:1b" is not installed' });
-    expect(screen.getByRole("button", { name: "Pull model" })).toBeTruthy();
+    const copy = screen.getByRole("button", { name: "Copy pull command" });
+    expect(copy.getAttribute("title")).toBe("ollama pull m:1b");
   });
 });
 

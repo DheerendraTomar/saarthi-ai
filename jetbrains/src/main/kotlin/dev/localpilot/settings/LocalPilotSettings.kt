@@ -167,7 +167,7 @@ class LocalPilotConfigurable : BoundSearchableConfigurable("LocalPilot", "dev.lo
         group("Ollama") {
             row("Ollama URL:") {
                 textField().bindText({ draft.ollamaUrl }, { draft.ollamaUrl = it.trim() }).columns(COLUMNS_LARGE)
-                    .comment("Base URL of the local Ollama server. LocalPilot talks to nothing else.")
+                    .comment("Must point at this machine (localhost, 127.0.0.1 or ::1). Any other host is refused: your code never leaves this computer.")
             }
         }
         group("Inline Completions") {

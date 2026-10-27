@@ -30,25 +30,44 @@ one core per window for the first workspace folder.
 
 ## Start Ollama
 
-LocalPilot talks only to a local [Ollama](https://ollama.com) (`localpilot.ollamaUrl`,
-default `http://localhost:11434`).
+LocalPilot talks only to a local [Ollama](https://ollama.com). `localpilot.ollamaUrl`
+(default `http://localhost:11434`) must point at this machine (localhost, 127.0.0.0/8
+or `::1`); any other host is refused, so prompts and code cannot be sent elsewhere.
+
+LocalPilot never downloads models. Pull them yourself in a terminal:
 
 ```sh
-ollama serve                             # or launch the Ollama app
 ollama pull qwen2.5-coder:0.5b-base      # inline completions (default)
 ollama pull qwen3.8:27b-mlx              # agent chat (default)
 ```
 
-From VS Code, **LocalPilot: Start Ollama** opens a terminal named "Ollama" running
-`ollama serve`, and **LocalPilot: Pull Model** pulls the completion or chat model
-with progress. The chat view's status pill offers the same actions when Ollama is
-down or a model is missing; the status bar item opens a menu with them too.
+**LocalPilot: Start Ollama** starts Ollama inside a no-network sandbox (macOS
+`sandbox-exec` with the bundled `sandbox/no-network.sb`; only loopback is reachable
+and DNS is blocked), with `OLLAMA_NO_CLOUD=1` and `OLLAMA_HOST=127.0.0.1:11434`:
+
+- If `~/Library/LaunchAgents/local.ollama.sandboxed.plist` exists, it (re)starts that
+  launch agent (`local.ollama.sandboxed`).
+- Otherwise it opens a terminal named "Ollama" running `ollama serve` under
+  `sandbox-exec`.
+- On other systems it starts nothing and says so: start Ollama yourself with
+  `OLLAMA_NO_CLOUD=1`.
+
+The chat view's status pill and the status bar menu offer **Start Ollama** when Ollama
+is down, and **Copy pull command** (copies `ollama pull <model>`) when a model is missing.
+
+## Commands run in a sandbox
+
+Terminal commands the agent runs (after you approve them) run through
+`sandbox-exec` with the same no-network profile, so they cannot reach the network
+(`npm install`, `git clone`, `curl` to a remote host fail). When a command exits
+non-zero its stderr ends with "(LocalPilot runs commands without network access)".
+Off macOS, or if `sandbox-exec` or the profile is missing, commands are not run.
 
 ## Settings
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `localpilot.ollamaUrl` | `http://localhost:11434` | Base URL of the local Ollama server. |
+| `localpilot.ollamaUrl` | `http://localhost:11434` | Base URL of Ollama. Must point at this machine (localhost); other hosts are refused. |
 | `localpilot.completionModel` | `qwen2.5-coder:0.5b-base` | FIM model for inline completions; `qwen2.5-coder:1.5b-base` is the higher-quality alternative. |
 | `localpilot.chatModel` | `qwen3.8:27b-mlx` | Tool-calling model for agent chat. |
 | `localpilot.completionsEnabled` | `true` | Show ghost-text completions. **Client-side**: no core restart. Also toggled by **LocalPilot: Toggle Inline Completions**. |
@@ -139,12 +158,13 @@ Walk this after installing a new build (folder open, Ollama models pulled):
 1. **Ollama down banner** — quit Ollama (`pkill ollama` / quit the app), run
    **LocalPilot: Restart Core**: the chat view shows **Ollama down** and the status
    bar shows the problem.
-2. **Start Ollama** — click **Start Ollama** in the chat view: a terminal named
-   "Ollama" runs `ollama serve`, and the banner clears.
-3. **Pull model** — set `localpilot.completionModel` to a model you don't have
+2. **Start Ollama** — click **Start Ollama** in the chat view: the sandboxed Ollama
+   starts (the launch agent restarts, or a terminal named "Ollama" runs
+   `sandbox-exec -f …/sandbox/no-network.sb ollama serve`), and the banner clears.
+3. **Model missing** — set `localpilot.completionModel` to a model you don't have
    (e.g. `qwen2.5-coder:1.5b-base` after `ollama rm` of it): the chat view shows
-   **Model missing**; click **Pull model** and watch the progress notification
-   finish with "… is ready".
+   **Model missing**; click **Copy pull command**: the clipboard holds
+   `ollama pull <model>` and nothing is downloaded by LocalPilot.
 4. **Ghost text in Python** — in a `.py` file type `def fibonacci(n):` and a newline:
    grey ghost text appears; `Tab` accepts it.
 5. **Ghost text in a notebook** — open an `.ipynb`, type in a code cell: ghost text
@@ -154,6 +174,8 @@ Walk this after installing a new build (folder open, Ollama models pulled):
    is applied and the file is saved (no dirty dot on its tab).
 7. **Run command, denied** — ask the chat to run `ls` (or the tests): a command
    card appears; click **Deny**: nothing runs, and the agent says it was denied.
+   Then ask it to run `curl -sS -m 5 https://example.com` and **Approve**: it fails
+   and the output ends with "(LocalPilot runs commands without network access)".
 8. **Chat edit in a notebook** — open an `.ipynb`, put the cursor in a code cell,
    attach it in the chat and ask for a change to that cell: the diff card shows the
    cell (`….ipynb.cell<N>.py`); click **Approve**: the cell changes in place and the
@@ -166,17 +188,24 @@ Walk this after installing a new build (folder open, Ollama models pulled):
   output channel. The core keeps `.localpilot/` out of git itself (it writes a
   `.localpilot/.gitignore`).
 - **"Ollama down"**: Ollama isn't answering at `localpilot.ollamaUrl`. Start it
-  (`ollama serve`, the Ollama app, or **LocalPilot: Start Ollama**), then pick
-  **Retry** from the status bar menu. Check `curl http://localhost:11434/api/tags`.
+  (**LocalPilot: Start Ollama** for the sandboxed one), then pick **Retry** from the
+  status bar menu. Check `curl http://localhost:11434/api/tags`. If the detail says
+  "not on this machine", `localpilot.ollamaUrl` points at another host: LocalPilot
+  refuses that on purpose; use localhost.
+- **Start Ollama does nothing / shows an error**: it needs macOS (`/usr/bin/sandbox-exec`).
+  Elsewhere start Ollama yourself with `OLLAMA_NO_CLOUD=1`.
 - **"Model missing" / no ghost text**: pull the configured model
-  (`ollama pull qwen2.5-coder:0.5b-base` or **LocalPilot: Pull Model**) and check
-  `ollama list`. Completions also pause while `localpilot.completionsEnabled` is
+  in a terminal (`ollama pull qwen2.5-coder:0.5b-base`; LocalPilot never downloads
+  models, **Copy pull command** copies the line) and check `ollama list`. Completions also pause while `localpilot.completionsEnabled` is
   off, and while a chat reply is generating (status bar: "completions paused
   during chat").
 - **Core failed to start / crashed**: see the error message and the log above;
   **LocalPilot: Restart Core** starts it again. "no core binary" means the `.vsix`
   was built for another platform: build it on this machine or set
   `localpilot.coreBinaryPath`.
+- **A command failed with no network**: agent commands run in a no-network sandbox,
+  so `npm install`, `pip install`, `git clone` and the like cannot work. Run them in
+  your own terminal.
 - **Nothing happens**: LocalPilot needs a folder open (not a single file).
 
 ## Development

@@ -7,10 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as vscode from "vscode";
 import { activate, deactivate, RESTART_DEBOUNCE_MS, type LocalPilotApi } from "../src/extension";
 import { CoreClient } from "../src/rpc/coreClient";
-import { pullModel, type CommandDeps } from "../src/commands";
-import { DEFAULT_SETTINGS } from "../src/settings";
-import { StatusBar } from "../src/statusBar";
-import { fakeWebviewView, FakeChatClient, waitFor } from "./helpers/webview";
+import { fakeWebviewView, waitFor } from "./helpers/webview";
 import { configValues, editorEvents, registry, resetMock, Uri, window, workspace, workspaceConfigKeys, type MockStatusBarItem } from "./mocks/vscode";
 
 const extensionPath = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -60,7 +57,6 @@ describe("activate", () => {
         "localpilot.completionAccepted",
         "localpilot.newSession",
         "localpilot.openChat",
-        "localpilot.pullModel",
         "localpilot.restartCore",
         "localpilot.startOllama",
         "localpilot.statusMenu",
@@ -78,10 +74,15 @@ describe("activate", () => {
     await waitFor(() => item().text === "$(sparkle) LocalPilot", 5000, "status bar ok");
     expect(item().command).toBe("localpilot.statusMenu");
 
-    // Start Ollama opens one "Ollama" terminal running `ollama serve`.
+    // Start Ollama opens one "Ollama" terminal, sandboxed (never plain `ollama serve`); off macOS nothing starts.
     await registry.commands.get("localpilot.startOllama")!();
     await registry.commands.get("localpilot.startOllama")!();
-    expect(registry.terminals.map((t) => [t.name, t.sent])).toEqual([["Ollama", ["ollama serve"]]]);
+    if (process.platform === "darwin") {
+      expect(registry.terminals.map((t) => t.name)).toEqual(["Ollama"]);
+      for (const c of registry.terminals[0].sent) expect(c).toMatch(/launchctl|sandbox-exec/);
+    } else {
+      expect(registry.terminals).toEqual([]);
+    }
 
     // Open chat focuses the view.
     await registry.commands.get("localpilot.openChat")!();
@@ -95,21 +96,14 @@ describe("activate", () => {
     expect(api.client.state).toBe("stopped");
   });
 
-  it("status_bar_reflects_ollama_down_pull_and_paused", async () => {
+  it("status_bar_reflects_ollama_down_and_paused", async () => {
     process.env.FAKE_OLLAMA = "down";
     configValues["localpilot.completionModel"] = "tiny-model:1b";
     const api = start();
     await api.ready;
     await waitFor(() => item().text === "$(warning) Ollama down", 5000, "down");
-    api.statusBar.setPull(42);
-    expect(item().text).toBe("$(cloud-download) Pulling 42%");
-    api.statusBar.setPull(undefined);
-
-    // Pull with model "" (what the chat UI sends) → the configured completion model, with progress.
-    await registry.commands.get("localpilot.pullModel")!("");
-    expect(registry.progress.length).toBeGreaterThan(0);
-    expect(registry.messages).toContainEqual({ level: "info", message: "LocalPilot: tiny-model:1b is ready." });
-    await waitFor(() => item().text === "$(sparkle) LocalPilot", 5000, "ok after pull");
+    api.statusBar.setStatus({ ollama: "ok", detail: "" });
+    expect(item().text).toBe("$(sparkle) LocalPilot");
 
     // Toggling completions pauses at once (and persists the setting).
     await registry.commands.get("localpilot.toggleCompletions")!();
@@ -260,30 +254,5 @@ describe("activate", () => {
     ui.send({ type: "chat/approve", toolCallId: call.toolCallId, decision: "deny" });
     await waitFor(() => ui.posted.some((m) => m.type === "chat/done"), 5000, "done");
     expect(item().text).toBe("$(sparkle) LocalPilot");
-  });
-
-  it("successful_pull_rechecks_ollama_status", async () => {
-    const statusBar = new StatusBar();
-    const client = new FakeChatClient((method) => (method === "ollama/status" ? { ollama: "ok", detail: "Ollama is running" } : {}));
-    const statuses: unknown[] = [];
-    const deps = {
-      client,
-      statusBar,
-      settings: () => ({ ...DEFAULT_SETTINGS }),
-      onStatus: (s: unknown) => void statuses.push(s),
-    } as unknown as CommandDeps;
-    await pullModel(deps, "m:1b");
-    expect(client.requests.map((r) => r.method)).toEqual(["ollama/pull", "ollama/status"]);
-    expect(statuses).toEqual([{ ollama: "ok", detail: "Ollama is running" }]);
-
-    // A failed pull does not claim anything new about Ollama.
-    client.requests.length = 0;
-    client.respond = (method) => {
-      if (method === "ollama/pull") throw new Error("no space left");
-      return {};
-    };
-    await pullModel(deps, "m:1b");
-    expect(client.requests.map((r) => r.method)).toEqual(["ollama/pull"]);
-    expect(registry.messages).toContainEqual({ level: "error", message: "LocalPilot: pulling m:1b failed: no space left" });
   });
 });

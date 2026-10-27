@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import type * as vscode from "vscode";
+import { commandPlan, NO_SANDBOX_NOTE, SANDBOX_EXEC } from "../sandbox";
 
 /** Wire types of the core→client `workspace/runCommand` request (core/src/protocol.rs). */
 export interface RunCommandParams {
@@ -18,6 +20,11 @@ export interface RunCommandOptions {
   timeoutMs?: number;
   /** cwd when the core sends none (the workspace root). */
   defaultCwd?: string;
+  /** The bundled no-network.sb. Commands run only inside it; without it nothing runs. */
+  sandboxProfile?: string;
+  /** Test seams. */
+  platform?: NodeJS.Platform;
+  exists?: (path: string) => boolean;
 }
 
 /** Characters of each stream returned to the core (the tail; the start is dropped). */
@@ -66,8 +73,9 @@ export function commandEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Process
 }
 
 /**
- * Runs an approved `run_command` with `shell: true` — `/bin/sh -c` on macOS/Linux,
- * `cmd.exe /d /s /c` on Windows (the core asks only after the user approved). Output is echoed to `out` and its tails returned;
+ * Runs an approved `run_command` (the core asks only after the user approved) as
+ * `/bin/sh -c` inside `sandbox-exec` with the no-network profile (macOS). Anywhere
+ * else it is not run (exit code -1). Output is echoed to `out` and its tails returned;
  * after `timeoutMs` the whole process group is killed and `exitCode` is -1.
  * Never throws.
  */
@@ -78,6 +86,18 @@ export function runCommand(params: RunCommandParams, out: vscode.OutputChannel, 
   const stderr = new Tail(OUTPUT_TAIL_BYTES);
   const posix = process.platform !== "win32";
   out.appendLine(`$ ${params.command}    (cwd: ${cwd})`);
+  const exists = opts.exists ?? existsSync;
+  const plan = commandPlan({
+    platform: opts.platform ?? process.platform,
+    command: params.command,
+    profile: opts.sandboxProfile,
+    profileExists: opts.sandboxProfile !== undefined && exists(opts.sandboxProfile),
+    sandboxExecExists: exists(SANDBOX_EXEC),
+  });
+  if (!plan.run) {
+    out.appendLine(`[${plan.stderr}]`);
+    return Promise.resolve({ exitCode: -1, stdout: "", stderr: plan.stderr });
+  }
 
   return new Promise<RunCommandResult>((resolve) => {
     let settled = false;
@@ -92,13 +112,15 @@ export function runCommand(params: RunCommandParams, out: vscode.OutputChannel, 
       } else {
         out.appendLine(`[exit code ${exitCode}]`);
       }
+      // Tells the model and the user why e.g. `npm install` failed.
+      if (exitCode !== 0) stderr.push(`${stderr.value() && !stderr.value().endsWith("\n") ? "\n" : ""}${NO_SANDBOX_NOTE}\n`);
       resolve({ exitCode, stdout: stdout.value(), stderr: stderr.value() });
     };
 
     let child: ReturnType<typeof spawn>;
     try {
       // detached → own process group, so a timeout kills the command's children too.
-      child = spawn(params.command, [], { shell: true, cwd, env: commandEnv(), detached: posix, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(plan.file, plan.args, { cwd, env: commandEnv(), detached: posix, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       settled = true;
       const msg = e instanceof Error ? e.message : String(e);

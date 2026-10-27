@@ -21,10 +21,7 @@ describe('StatusItem', () => {
     item.setConnectionState('crashed', 'core binary not found');
     expect(item.text).toBe('LocalPilot stopped');
     expect(item.tooltip).toContain('core binary not found');
-    item.setPull(41.6);
-    expect(item.text).toBe('Pulling 42%');
 
-    item.setPull(undefined);
     item.setConnectionState('ready');
     item.setStatus({ ollama: 'ok', detail: '' });
     item.setCompletionsEnabled(true);
@@ -75,8 +72,6 @@ describe('StatusItem connection errors and tooltips', () => {
     item.setConnectionState('crashed', 'boom');
     seen();
     item.setConnectionState('error', 'unreachable');
-    seen();
-    item.setPull(10);
     seen();
     for (const t of tooltips) {
       expect(t).not.toMatch(/Click to /);

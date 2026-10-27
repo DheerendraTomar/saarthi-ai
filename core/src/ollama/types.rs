@@ -202,15 +202,3 @@ pub struct ChatChunk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done_reason: Option<String>,
 }
-
-/// One NDJSON line of a streaming `/api/pull` response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PullProgress {
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed: Option<u64>,
-}

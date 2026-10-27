@@ -12,6 +12,7 @@ from jupyter_server.utils import ensure_async
 from tornado import web, websocket
 
 from .bridge import Bridge
+from .sandbox import SandboxUnavailable, ollama_start_command
 
 SETTINGS_KEY = "localpilot"
 
@@ -64,6 +65,19 @@ class RestartHandler(APIHandler):
             self.finish(json.dumps({**_bridge(self).status(), "error": str(err)}))
             return
         self.finish(json.dumps(status))
+
+
+class OllamaCommandHandler(APIHandler):
+    """`GET /localpilot/ollama-command` → `{command}` (shell line that starts Ollama in the
+    no-network sandbox) or `{error}` (sandbox unavailable). The browser types the line into a terminal."""
+
+    @web.authenticated
+    async def get(self) -> None:
+        await _authorize(self)
+        try:
+            self.finish(json.dumps({"command": ollama_start_command()}))
+        except SandboxUnavailable as err:
+            self.finish(json.dumps({"error": str(err)}))
 
 
 class _Connection:

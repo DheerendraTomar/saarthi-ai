@@ -90,6 +90,16 @@ export interface ServerStatus {
 }
 
 /** `GET /localpilot/status`. Rejects with a `ResponseError` on a non-2xx answer. */
+/** `GET /localpilot/ollama-command`: the line that starts Ollama in the no-network sandbox, or why not. */
+export async function fetchOllamaCommand(server: ServerConnection.ISettings): Promise<{ command?: string; error?: string }> {
+  const url = URLExt.join(server.baseUrl, 'localpilot', 'ollama-command');
+  const response = await ServerConnection.makeRequest(url, { method: 'GET' }, server);
+  if (!response.ok) {
+    throw await ServerConnection.ResponseError.create(response);
+  }
+  return (await response.json()) as { command?: string; error?: string };
+}
+
 export async function fetchStatus(server: ServerConnection.ISettings): Promise<ServerStatus> {
   const url = URLExt.join(server.baseUrl, 'localpilot', 'status');
   const response = await ServerConnection.makeRequest(url, { method: 'GET' }, server);

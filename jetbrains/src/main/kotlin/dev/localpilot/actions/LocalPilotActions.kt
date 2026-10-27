@@ -97,30 +97,6 @@ class RestartCoreAction : LocalPilotAction() {
     override fun perform(project: Project) = LocalPilotHost.getInstance(project).restartCore()
 }
 
-/** Pulls one of the configured models (picked from a popup) with a progress indicator. */
-class PullModelAction : LocalPilotAction() {
-    override fun perform(project: Project) = choose(project, null)
-
-    companion object {
-        /** A popup of the configured completion / chat models; picking one pulls it. [model] given → pulls it directly. */
-        fun choose(project: Project, model: String?) {
-            val host = LocalPilotHost.getInstance(project)
-            if (model != null) {
-                host.launch { host.pullModel(model) }
-                return
-            }
-            val s = LocalPilotSettings.getInstance().state
-            val items = listOf(s.completionModel to "completion model", s.chatModel to "chat model").distinctBy { it.first }
-            val step = object : BaseListPopupStep<Pair<String, String>>("Model to Pull with Ollama", items) {
-                override fun getTextFor(value: Pair<String, String>) = "${value.first}  —  ${value.second}"
-                override fun onChosen(selectedValue: Pair<String, String>, finalChoice: Boolean): PopupStep<*>? =
-                    doFinalStep { host.launch { host.pullModel(selectedValue.first) } }
-            }
-            JBPopupFactory.getInstance().createListPopup(step).showCenteredInCurrentWindow(project)
-        }
-    }
-}
-
 /** Pauses / resumes inline completions: a client-side gate (the core keeps running; no restart). */
 class ToggleCompletionsAction : ToggleAction("Inline Completions"), DumbAware {
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
@@ -195,9 +171,9 @@ object ModelPicker {
                 val step = object : BaseListPopupStep<Item>(title, items) {
                     override fun getTextFor(value: Item): String = when (value) {
                         is Item.Model -> value.choice.text
-                        Item.StartOllama -> "Start Ollama (runs `ollama serve`)"
+                        Item.StartOllama -> "Start Ollama (in a no-network sandbox)"
                         Item.Retry -> "Retry"
-                        Item.Pull -> "Pull model…"
+                        Item.Pull -> "Copy pull command"
                     }
 
                     override fun getIconFor(value: Item): Icon? = when (value) {
@@ -208,7 +184,7 @@ object ModelPicker {
                         }
                         Item.StartOllama -> AllIcons.Actions.Execute
                         Item.Retry -> AllIcons.Actions.Refresh
-                        Item.Pull -> AllIcons.Actions.Download
+                        Item.Pull -> AllIcons.Actions.Copy
                     }
 
                     override fun onChosen(selectedValue: Item, finalChoice: Boolean): PopupStep<*>? = doFinalStep {
@@ -216,7 +192,7 @@ object ModelPicker {
                             is Item.Model -> pick(project, kind, selectedValue.choice)
                             Item.StartOllama -> host.startOllama()
                             Item.Retry -> show(project, kind)
-                            Item.Pull -> PullModelAction.choose(project, null)
+                            Item.Pull -> host.copyPullCommand()
                         }
                     }
                 }

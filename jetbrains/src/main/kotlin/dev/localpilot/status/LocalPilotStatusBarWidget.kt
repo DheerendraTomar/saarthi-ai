@@ -30,17 +30,11 @@ data class StatusPresentation(val text: String, val tooltip: String, val icon: I
 
 object StatusText {
     /**
-     * Most important first (as VS Code's status bar): a running pull, a crashed / stopped core, Ollama down, model
+     * Most important first (as VS Code's status bar): a crashed / stopped core, Ollama down, model
      * missing, completions off, completions paused during a chat reply, stopped, starting, otherwise ready.
      */
     fun render(status: HostStatus, completionsEnabled: Boolean): StatusPresentation {
-        val pull = status.pullPercent
         return when {
-            pull != null -> StatusPresentation(
-                if (pull >= 0) "LocalPilot: pulling $pull%" else "LocalPilot: pulling…",
-                "LocalPilot is pulling a model with Ollama.",
-                AllIcons.Actions.Download,
-            )
             status.core == CoreState.CRASHED -> StatusPresentation(
                 "LocalPilot: crashed",
                 "The LocalPilot core is not running. Click → Restart Core (see <project>/.localpilot/core.log).",
@@ -53,7 +47,7 @@ object StatusText {
             )
             status.ollama == "modelMissing" -> StatusPresentation(
                 "LocalPilot: model missing",
-                "LocalPilot: ${status.detail.ifBlank { "a configured model is not installed" }}. Click → Pull Model.",
+                "LocalPilot: ${status.detail.ifBlank { "a configured model is not installed" }}. Run `ollama pull <model>` in a terminal.",
                 AllIcons.General.Warning,
             )
             !completionsEnabled -> StatusPresentation(

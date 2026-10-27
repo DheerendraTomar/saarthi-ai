@@ -1,7 +1,7 @@
 import { CommandRegistry } from '@lumino/commands';
 import schema from '../schema/plugin.json';
 import { CHAT_WIDGET_ID } from '../src/chat/chatWidget';
-import { COMMANDS, OLLAMA_COMMAND, OPEN_CHAT_KEYS, registerCommands, type CommandDeps, type TerminalConnection } from '../src/commands';
+import { COMMANDS, OPEN_CHAT_KEYS, registerCommands, type CommandDeps, type TerminalConnection } from '../src/commands';
 import { DEFAULT_SETTINGS, type Settings } from '../src/settings';
 
 function setup() {
@@ -11,9 +11,9 @@ function setup() {
   const terminals: TerminalConnection[] = [];
   const running = new Set<string>();
   let settings: Settings = { ...DEFAULT_SETTINGS, completionModel: 'qwen-coder', chatModel: 'qwen-chat' };
-  const progress: Array<(p: unknown) => void> = [];
   const requests: Array<[string, unknown]> = [];
   const answers = new Map<string, () => unknown>();
+  const ollama: { command?: string; error?: string } = { command: 'SANDBOXED ollama serve' };
   const deps: CommandDeps = {
     commands,
     activateById: jest.fn(),
@@ -30,15 +30,11 @@ function setup() {
     client: {
       request: (async (method: string, params?: unknown) => {
         requests.push([method, params]);
-        if (method === 'ollama/pull') for (const p of progress) p({ model: 'qwen-coder', status: 'pulling', completed: 1, total: 4 });
         const answer = answers.get(method);
         if (answer) return answer();
         return method === 'ollama/status' ? { ollama: 'ok', detail: '' } : {};
       }) as CommandDeps['client']['request'],
-      onNotification: (method: string, handler: (p: unknown) => void) => {
-        if (method === 'ollama/pullProgress') progress.push(handler);
-        return { isDisposed: false, dispose: () => progress.splice(progress.indexOf(handler), 1) };
-      }
+      onNotification: () => ({ isDisposed: false, dispose: () => undefined })
     },
     chat: { newSession: jest.fn(async () => undefined), postModels: jest.fn(async () => undefined) },
     settings: () => settings,
@@ -50,18 +46,18 @@ function setup() {
     }),
     restartCore: jest.fn(async () => undefined),
     onStatus: jest.fn(),
-    onPullProgress: jest.fn(),
+    copy: jest.fn(async () => undefined),
+    ollamaCommand: jest.fn(async () => ollama),
     ui: {
       info: jest.fn(),
       error: jest.fn(),
-      pickModel: jest.fn(async () => undefined),
       pickItem: jest.fn(async () => undefined),
       confirm: jest.fn(async () => false),
       showText: jest.fn(async () => undefined)
     }
   };
   const registered = registerCommands(deps);
-  return { commands, deps, opened, terminals, running, requests, progress, registered, answers, current: () => settings };
+  return { commands, deps, opened, terminals, running, requests, ollama, registered, answers, current: () => settings };
 }
 
 describe('open-chat shortcut', () => {
@@ -100,17 +96,17 @@ describe('commands', () => {
     expect(commands.hasCommand(COMMANDS.openChat)).toBe(false);
   });
 
-  it('start_ollama_runs_ollama_serve_in_a_terminal', async () => {
+  it('start_ollama_types_the_servers_sandboxed_command_in_a_terminal', async () => {
     const { commands, deps, opened, terminals, running } = setup();
     await commands.execute(COMMANDS.startOllama);
     expect(terminals).toHaveLength(1);
-    expect(terminals[0].send).toHaveBeenCalledWith({ type: 'stdin', content: [OLLAMA_COMMAND] });
-    expect(OLLAMA_COMMAND).toBe('ollama serve\n');
+    expect(terminals[0].send).toHaveBeenCalledWith({ type: 'stdin', content: ['SANDBOXED ollama serve\n'] });
     expect(opened).toEqual([{ name: '1' }]);
 
     // Still running: re-shown, not started twice.
     await commands.execute(COMMANDS.startOllama);
     expect(terminals).toHaveLength(1);
+    expect(deps.ollamaCommand).toHaveBeenCalledTimes(1);
     expect(opened).toEqual([{ name: '1' }, { name: '1' }]);
 
     await jest.advanceTimersByTimeAsync(3000);
@@ -122,20 +118,26 @@ describe('commands', () => {
     expect(terminals).toHaveLength(2);
   });
 
-  it('pull_model_empty_name_means_the_completion_model', async () => {
-    const { commands, deps, requests, progress } = setup();
-    await commands.execute(COMMANDS.pullModel, { model: '' });
-    expect(requests[0]).toEqual(['ollama/pull', { model: 'qwen-coder' }]);
-    expect(deps.onPullProgress).toHaveBeenNthCalledWith(1, 0);
-    expect(deps.onPullProgress).toHaveBeenNthCalledWith(2, 25);
-    expect(deps.onPullProgress).toHaveBeenLastCalledWith(undefined);
-    expect(progress).toHaveLength(0);
-    expect(deps.ui.info).toHaveBeenLastCalledWith('LocalPilot: qwen-coder is ready.');
+  it('start_ollama_shows_the_servers_refusal_and_opens_no_terminal', async () => {
+    const { commands, deps, terminals, ollama } = setup();
+    delete ollama.command;
+    ollama.error = 'LocalPilot only starts Ollama inside a no-network sandbox, which needs macOS.';
+    await commands.execute(COMMANDS.startOllama);
+    expect(terminals).toHaveLength(0);
+    expect(deps.ui.error).toHaveBeenCalledWith(expect.stringContaining('needs macOS'));
+  });
 
-    // No model given: the user picks (cancelled here → nothing pulled).
-    await commands.execute(COMMANDS.pullModel);
-    expect(deps.ui.pickModel).toHaveBeenCalledWith(['qwen-coder', 'qwen-chat']);
-    expect(requests.filter(([m]) => m === 'ollama/pull')).toHaveLength(1);
+  it('copy_pull_command_copies_and_never_pulls', async () => {
+    const { commands, deps, requests } = setup();
+    await commands.execute(COMMANDS.copyPullCommand, { model: 'qwen-coder' });
+    expect(deps.copy).toHaveBeenCalledWith('ollama pull qwen-coder');
+
+    // No model given: the user picks one of the configured models.
+    (deps.ui.pickItem as jest.Mock).mockResolvedValueOnce('qwen-chat');
+    await commands.execute(COMMANDS.copyPullCommand);
+    expect(deps.ui.pickItem).toHaveBeenCalledWith('Model to pull in a terminal', ['qwen-coder', 'qwen-chat'], 'qwen-coder');
+    expect(deps.copy).toHaveBeenLastCalledWith('ollama pull qwen-chat');
+    expect(requests.filter(([m]) => m === 'ollama/pull')).toHaveLength(0);
   });
 
   it('select_model_writes_the_picked_installed_model', async () => {

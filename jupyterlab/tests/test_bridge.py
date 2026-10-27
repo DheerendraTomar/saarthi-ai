@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -183,10 +184,9 @@ async def test_notifications_are_broadcast_and_shutdown_is_not_forwarded(
     a, b = await open_tab(), await open_tab()
     await init(a)
     await init(b)
-    # `ollama/pull` progress and the resulting status are not chat/*: every tab sees them.
-    await a.request(2, "ollama/pull", {"model": "m"})
-    for tab in (a, b):
-        await tab.notification("ollama/pullProgress", model="m", completed=100)
+    # The core never downloads models: `ollama/pull` is relayed and answered with its error.
+    reply = await a.request(2, "ollama/pull", {"model": "m"})
+    assert "ollama pull" in reply["error"]["message"]
     # A tab's shutdown must never stop the shared core.
     assert (await a.request(3, "shutdown"))["result"] == {}
     assert (await b.request(4, "ollama/status"))["result"]["ollama"] == "ok"
@@ -219,11 +219,26 @@ async def test_status_and_restart_endpoints(
     assert localpilot.core.launches == 2
 
 
+async def test_ollama_command_endpoint_returns_the_sandboxed_line(
+    jp_fetch: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from localpilot_jupyter import handlers
+
+    monkeypatch.setattr(handlers, "ollama_start_command", lambda: "SANDBOXED ollama serve")
+    assert json.loads((await jp_fetch("localpilot", "ollama-command")).body) == {"command": "SANDBOXED ollama serve"}
+
+    def refuse() -> str:
+        raise handlers.SandboxUnavailable("needs macOS")
+
+    monkeypatch.setattr(handlers, "ollama_start_command", refuse)
+    assert json.loads((await jp_fetch("localpilot", "ollama-command")).body) == {"error": "needs macOS"}
+
+
 async def test_endpoints_require_auth(
     jp_fetch: Callable[..., Any], jp_ws_fetch: Callable[..., Any], jp_http_port: int, localpilot: Bridge
 ) -> None:
     no_auth = {"Authorization": ""}
-    for method, path, body in [("GET", "status", None), ("POST", "restart", "{}")]:
+    for method, path, body in [("GET", "status", None), ("POST", "restart", "{}"), ("GET", "ollama-command", None)]:
         with pytest.raises(HTTPClientError) as err:
             await jp_fetch("localpilot", path, method=method, body=body, headers=no_auth, follow_redirects=False)
         assert err.value.code == 403, (method, path)
@@ -342,6 +357,7 @@ async def send(bridge: Bridge, tab_id: str, msg: dict) -> None:
     await bridge.handle_from_tab(tab_id, json.dumps({"jsonrpc": "2.0", **msg}))
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="commands run only in the macOS sandbox")
 async def test_run_command_answered_server_side_with_confined_cwd(bridge: Bridge, stub: StubCore) -> None:
     _, tab = await connect(bridge)
     root = bridge.root_dir

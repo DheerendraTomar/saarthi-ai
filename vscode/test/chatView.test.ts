@@ -22,7 +22,6 @@ const SESSIONS = [
 const HISTORY = [{ role: "user", content: "earlier question" }];
 
 const startOllamaCalls: number[] = [];
-const pulls: string[] = [];
 
 const chatActivity: boolean[] = [];
 
@@ -32,7 +31,6 @@ function makeProvider(client: unknown) {
     root: ROOT,
     html: () => TEMPLATE,
     startOllama: () => void startOllamaCalls.push(1),
-    pullModel: async (model) => void pulls.push(model),
     onChatActiveChanged: (active) => void chatActivity.push(active),
   });
 }
@@ -59,7 +57,6 @@ beforeEach(() => {
   resetMock();
   workspace.workspaceFolders = [{ uri: Uri.file(ROOT), name: "proj", index: 0 }];
   startOllamaCalls.length = 0;
-  pulls.length = 0;
   chatActivity.length = 0;
 });
 
@@ -121,26 +118,22 @@ describe("ChatViewProvider", () => {
     client.emit("chat/toolCall", { sessionId: "s2", toolCallId: "t1", name: "read_file", args: { path: "a.py" }, requiresApproval: false });
     client.emit("chat/toolResult", { sessionId: "s2", toolCallId: "t1", ok: true, summary: "read a.py" });
     client.emit("status", { ollama: "down", detail: "gone" });
-    client.emit("ollama/pullProgress", { model: "m", status: "pulling", completed: 1, total: 2 });
     client.emit("chat/done", { sessionId: "s2", stopReason: "done" });
-    expect(ui.posted.slice(0, 7)).toEqual([
+    expect(ui.posted.slice(0, 6)).toEqual([
       { type: "chat/token", sessionId: "s2", delta: "Hel", kind: "text" },
       { type: "chat/token", sessionId: "s2", delta: "lo", kind: "text" },
       { type: "chat/toolCall", sessionId: "s2", toolCallId: "t1", name: "read_file", args: { path: "a.py" }, requiresApproval: false },
       { type: "chat/toolResult", sessionId: "s2", toolCallId: "t1", ok: true, summary: "read a.py" },
       { type: "status", ollama: "down", detail: "gone" },
-      { type: "ollama/pullProgress", model: "m", status: "pulling", completed: 1, total: 2 },
       { type: "chat/done", sessionId: "s2", stopReason: "done" },
     ]);
 
     // chat/stop targets the current session; ollama buttons go to the commands.
     ui.send({ type: "chat/stop" });
     ui.send({ type: "ollama/start" });
-    ui.send({ type: "ollama/pull", model: "qwen2.5-coder:1.5b-base" });
-    await waitFor(() => client.of("chat/stop").length === 1 && pulls.length === 1, 5000, "stop + pull");
+    await waitFor(() => client.of("chat/stop").length === 1, 5000, "stop");
     expect(client.of("chat/stop")).toEqual([{ sessionId: "s2" }]);
     expect(startOllamaCalls).toHaveLength(1);
-    expect(pulls).toEqual(["qwen2.5-coder:1.5b-base"]);
   });
 
   it("chatView_creates_session_lazily_switches_and_reports_busy", async () => {

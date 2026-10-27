@@ -43,13 +43,6 @@ export interface ToolCardState {
   preview?: string;
 }
 
-export interface PullState {
-  model: string;
-  status: string;
-  completed?: number;
-  total?: number;
-}
-
 export interface ModelsState {
   /** Installed models; the last-known list while Ollama is unreachable. */
   list: ModelInfo[];
@@ -71,7 +64,6 @@ export interface State {
   pendingApprovals: Map<string, ToolCardState>;
   /** `"unknown"` until the host sends its first `status`. */
   status: { ollama: OllamaState | "unknown"; detail: string };
-  pull?: PullState;
   activeFile: { uri: string; selection?: Range } | null;
   /** A short, non-message notice (context full, host error). */
   notice: string | null;
@@ -257,24 +249,8 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
       }
       return { ...state, messages, streaming: null, pendingApprovals: new Map(), notice };
     }
-    case "status": {
-      // A failed pull sends no final progress; any status report ends the
-      // progress display (an ongoing pull re-sets it on its next event).
-      const next: State = { ...state, status: { ollama: event.ollama, detail: event.detail } };
-      delete next.pull;
-      return next;
-    }
-    case "ollama/pullProgress": {
-      if (event.status === "success") {
-        const next = { ...state };
-        delete next.pull;
-        return next;
-      }
-      const pull: PullState = { model: event.model, status: event.status };
-      if (event.completed !== undefined) pull.completed = event.completed;
-      if (event.total !== undefined) pull.total = event.total;
-      return { ...state, pull };
-    }
+    case "status":
+      return { ...state, status: { ollama: event.ollama, detail: event.detail } };
     case "session/list":
       return { ...state, sessions: event.sessions, currentSessionId: event.current };
     case "session/history":
@@ -291,11 +267,8 @@ export function reduce(state: State, event: HostToUi | UiEvent): State {
         ...state,
         activeFile: event.uri === null ? null : event.selection ? { uri: event.uri, selection: event.selection } : { uri: event.uri },
       };
-    case "ui/error": {
-      const next: State = { ...state, notice: event.message };
-      delete next.pull;
-      return next;
-    }
+    case "ui/error":
+      return { ...state, notice: event.message };
     case "ui/theme":
       return state; // applied to the document by App (applyTheme)
     case "models/list": {

@@ -6,7 +6,7 @@ export const STATUS_MENU_COMMAND = "localpilot.statusMenu";
 
 /**
  * The "LocalPilot" status-bar item. What it shows, most important first:
- * a running pull, a stopped core, Ollama down / model missing, completions
+ * a stopped core, Ollama down / model missing, completions
  * paused (by the user, or while a chat reply is generating), otherwise all good. Clicking it opens the LocalPilot quick pick.
  */
 export class StatusBar implements vscode.Disposable {
@@ -14,7 +14,6 @@ export class StatusBar implements vscode.Disposable {
   private status?: StatusNotification;
   private coreState: CoreState = "stopped";
   private coreError?: string;
-  private pullPercent?: number;
   private completionsEnabled = true;
   private chatActive = false;
 
@@ -49,12 +48,6 @@ export class StatusBar implements vscode.Disposable {
     this.render();
   }
 
-  /** Pull progress in percent (0–100), or undefined when no pull is running. */
-  setPull(percent: number | undefined): void {
-    this.pullPercent = percent === undefined ? undefined : Math.max(0, Math.min(100, Math.round(percent)));
-    this.render();
-  }
-
   setCompletionsEnabled(enabled: boolean): void {
     this.completionsEnabled = enabled;
     this.render();
@@ -75,10 +68,7 @@ export class StatusBar implements vscode.Disposable {
     let text = "$(sparkle) LocalPilot";
     let tooltip = "LocalPilot: running locally via Ollama";
     let background: vscode.ThemeColor | undefined;
-    if (this.pullPercent !== undefined) {
-      text = `$(cloud-download) Pulling ${this.pullPercent}%`;
-      tooltip = "LocalPilot: pulling a model";
-    } else if (this.coreState === "crashed") {
+    if (this.coreState === "crashed") {
       text = "$(error) LocalPilot stopped";
       tooltip = `LocalPilot core is not running${this.coreError ? `: ${this.coreError}` : ""}. Click to restart.`;
       background = new vscode.ThemeColor("statusBarItem.errorBackground");
@@ -88,7 +78,7 @@ export class StatusBar implements vscode.Disposable {
       background = warning;
     } else if (this.status?.ollama === "modelMissing") {
       text = "$(warning) Model missing";
-      tooltip = `LocalPilot: ${this.status.detail}. Click to pull it.`;
+      tooltip = `LocalPilot: ${this.status.detail}. Run "ollama pull <model>" in a terminal.`;
       background = warning;
     } else if (!this.completionsEnabled) {
       text = "$(debug-pause) completions paused";

@@ -1,6 +1,6 @@
 {
   "name": "localpilot-jupyter",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "LocalPilot for JupyterLab: local Ollama-backed completions and agent chat",
   "private": true,
   "license": "MIT",

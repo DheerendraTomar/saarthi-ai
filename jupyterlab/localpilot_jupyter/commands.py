@@ -1,7 +1,8 @@
 """Server-side answer to the core's `workspace/runCommand` request.
 
 The browser cannot run commands, so the server extension runs the (already
-user-approved) command itself: `shell=True` in a directory confined to the
+user-approved) command itself: `/bin/sh -c` inside the no-network sandbox (macOS
+`sandbox-exec`; anywhere else it is refused), in a directory confined to the
 Jupyter server's root, the last 16 KB of each stream returned, killed with its
 whole process group after the timeout. Never raises.
 """
@@ -14,6 +15,8 @@ import signal
 import sys
 from pathlib import Path
 from typing import Any, Optional
+
+from .sandbox import NETWORK_NOTE, SandboxUnavailable, command_argv, refusal_message
 
 #: Characters of each stream returned to the core (the tail; the start is dropped).
 OUTPUT_TAIL_CHARS = 16 * 1024
@@ -97,6 +100,10 @@ async def run_command(
     command = params.get("command") if isinstance(params, dict) else None
     if not isinstance(command, str) or not command.strip():
         return _result(-1, stderr="runCommand: missing command")
+    try:
+        argv = command_argv(command)
+    except SandboxUnavailable as err:
+        return _result(-1, stderr=refusal_message(command, str(err)) + "\n")
     cwd = params.get("cwd")
     try:
         directory = confine_cwd(cwd if isinstance(cwd, str) else None, root_dir)
@@ -105,8 +112,8 @@ async def run_command(
 
     stdout, stderr = _Tail(), _Tail()
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
             cwd=str(directory),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -135,4 +142,7 @@ async def run_command(
         readers.cancel()
         raise
     code = proc.returncode
-    return _result(code if code is not None and code >= 0 else -1, stdout.value(), stderr.value())
+    err_text = stderr.value()
+    if code != 0:
+        err_text += ("\n" if err_text and not err_text.endswith("\n") else "") + NETWORK_NOTE + "\n"
+    return _result(code if code is not None and code >= 0 else -1, stdout.value(), err_text)

@@ -8,7 +8,7 @@ import { readSettings, updateSetting, type Settings } from "../settings";
 export const CHAT_VIEW_TYPE = "localpilot.chat";
 
 /** Core notifications relayed to the webview as `{ type: <method>, ...params }`. */
-const RELAYED = ["chat/token", "chat/toolCall", "chat/toolResult", "chat/done", "status", "ollama/pullProgress"] as const;
+const RELAYED = ["chat/token", "chat/toolCall", "chat/toolResult", "chat/done", "status"] as const;
 
 export interface StatusNotification {
   ollama: "ok" | "down" | "modelMissing";
@@ -30,7 +30,6 @@ export interface ChatViewDeps {
   /** The chat-ui single-file bundle (`media/chat.html`); read when the view is first shown. */
   html: () => string;
   startOllama: () => void;
-  pullModel: (model: string) => Promise<void>;
   /** Called when the first chat turn starts (true) and when the last one ends (false). */
   onChatActiveChanged?: (active: boolean) => void;
   /** Shared `ollama/models` cache (the palette pickers use the same one); one of our own by default. */
@@ -302,9 +301,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           return;
         case "ollama/start":
           this.deps.startOllama();
-          return;
-        case "ollama/pull":
-          await this.deps.pullModel(typeof msg.model === "string" ? msg.model : "");
           return;
         case "models/list":
           return await this.postModels();

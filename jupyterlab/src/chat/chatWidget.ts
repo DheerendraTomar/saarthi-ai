@@ -8,7 +8,7 @@ import { isSafeCssValue } from './theme';
 export const CHAT_WIDGET_ID = 'localpilot-chat';
 
 /** Core notifications relayed to the UI as `{ type: <method>, ...params }`. */
-const RELAYED = ['chat/token', 'chat/toolCall', 'chat/toolResult', 'chat/done', 'status', 'ollama/pullProgress'] as const;
+const RELAYED = ['chat/token', 'chat/toolCall', 'chat/toolResult', 'chat/done', 'status'] as const;
 
 /** Sent by the server bridge to every other tab after a tab deleted chat sessions. */
 export const SESSIONS_CHANGED = 'localpilot/sessionsChanged';
@@ -81,7 +81,6 @@ export interface ChatWidgetDeps {
   copy?: (text: string) => Promise<void> | void;
   startOllama: () => void;
   /** `""` → the configured completion model. */
-  pullModel: (model: string) => Promise<void>;
   /** Called when the first chat turn starts (true) and when the last one ends (false). */
   onChatActiveChanged?: (active: boolean) => void;
   /** The host theme as `--vscode-*` custom properties (`jupyterThemeVars`). */
@@ -347,9 +346,6 @@ export class ChatWidget extends Widget {
           return;
         case 'ollama/start':
           this.deps.startOllama();
-          return;
-        case 'ollama/pull':
-          await this.deps.pullModel(typeof msg.model === 'string' ? msg.model : '');
           return;
         case 'models/list':
           return await this.postModels();

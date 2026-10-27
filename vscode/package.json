@@ -2,7 +2,7 @@
   "name": "ollama-pilot",
   "displayName": "Saarthi AI",
   "description": "Copilot-style inline completions and agent chat, running entirely on your machine via Ollama.",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "icon": "media/icon.png",
   "publisher": "thelaconicguy",
   "private": true,
@@ -53,11 +53,6 @@
       {
         "command": "localpilot.startOllama",
         "title": "Start Ollama",
-        "category": "LocalPilot"
-      },
-      {
-        "command": "localpilot.pullModel",
-        "title": "Pull Model",
         "category": "LocalPilot"
       },
       {
@@ -116,10 +111,6 @@
           "when": "workspaceFolderCount > 0"
         },
         {
-          "command": "localpilot.pullModel",
-          "when": "workspaceFolderCount > 0"
-        },
-        {
           "command": "localpilot.toggleCompletions",
           "when": "workspaceFolderCount > 0"
         },
@@ -174,7 +165,7 @@
         "localpilot.ollamaUrl": {
           "type": "string",
           "default": "http://localhost:11434",
-          "description": "Base URL of the local Ollama server. LocalPilot talks to nothing else."
+          "description": "Base URL of the Ollama server. It must point at this machine (localhost, 127.0.0.1 or ::1); any other host is refused and nothing is sent. LocalPilot talks to nothing else."
         },
         "localpilot.completionModel": {
           "type": "string",

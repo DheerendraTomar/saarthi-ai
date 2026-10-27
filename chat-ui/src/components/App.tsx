@@ -25,16 +25,26 @@ export function modelFromDetail(detail: string): string {
   return /"([^"]+)"/.exec(detail)?.[1] ?? "";
 }
 
-function StatusPill({ status, pull, bridge }: Pick<State, "status" | "pull"> & { bridge: HostBridge }) {
-  if (pull) {
-    const pct = pull.total ? ` ${Math.floor(((pull.completed ?? 0) / pull.total) * 100)}%` : "";
-    return (
-      <div class="status-pill pulling" role="status">
-        Pulling {pull.model}: {pull.status}
-        {pct}
-      </div>
-    );
-  }
+/** LocalPilot never downloads models (that would reach the internet); this copies the terminal command instead. */
+function CopyPullCommand({ model, bridge }: { model: string; bridge: HostBridge }) {
+  const [copied, setCopied] = useState(false);
+  const command = `ollama pull ${model}`;
+  return (
+    <button
+      type="button"
+      aria-label="Copy pull command"
+      title={command}
+      onClick={() => {
+        bridge.post({ type: "ui/copy", text: command });
+        setCopied(true);
+      }}
+    >
+      {copied ? "Copied" : "Copy pull command"}
+    </button>
+  );
+}
+
+function StatusPill({ status, bridge }: Pick<State, "status"> & { bridge: HostBridge }) {
   if (status.ollama === "down") {
     return (
       <div class="status-pill down" role="status" title={status.detail}>
@@ -49,13 +59,7 @@ function StatusPill({ status, pull, bridge }: Pick<State, "status" | "pull"> & {
     return (
       <div class="status-pill missing" role="status" title={status.detail}>
         <span>Model missing</span>
-        <button
-          type="button"
-          aria-label="Pull model"
-          onClick={() => bridge.post({ type: "ollama/pull", model: modelFromDetail(status.detail) })}
-        >
-          Pull model
-        </button>
+        <CopyPullCommand key={status.detail} model={modelFromDetail(status.detail)} bridge={bridge} />
       </div>
     );
   }
@@ -276,7 +280,7 @@ export function App({ bridge }: AppProps) {
           >
             <GearIcon />
           </button>
-          <StatusPill status={state.status} pull={state.pull} bridge={bridge} />
+          <StatusPill status={state.status} bridge={bridge} />
         </div>
       </header>
       {panel === "sessions" ? (

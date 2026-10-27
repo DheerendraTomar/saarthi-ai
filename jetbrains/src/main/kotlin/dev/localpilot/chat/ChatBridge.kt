@@ -220,7 +220,6 @@ class ChatBridge(
                 "ui/insertAtCursor" -> editors.insertAtCursor(msg.str("text") ?: "")
                 "ui/copy" -> editors.copy(msg.str("text") ?: "")
                 "ollama/start" -> hooks.ollama.start()
-                "ollama/pull" -> hooks.ollama.pull(msg.str("model") ?: "")
                 "models/list" -> postModelsInternal()
                 "model/select" -> chains.getValue("settings").withLock { selectModel(msg["kind"], msg["name"]) }
                 "settings/get" -> postSettings()
@@ -743,7 +742,7 @@ class ChatBridge(
 
     companion object {
         /** Core notifications relayed to the UI as `{ type: <method>, ...params }`. */
-        val RELAYED = listOf("chat/token", "chat/toolCall", "chat/toolResult", "chat/done", "status", "ollama/pullProgress")
+        val RELAYED = listOf("chat/token", "chat/toolCall", "chat/toolResult", "chat/done", "status")
         const val APPLY_EDIT = "workspace/applyEdit"
         const val RUN_COMMAND = "workspace/runCommand"
         const val INVALID_PARAMS = -32602

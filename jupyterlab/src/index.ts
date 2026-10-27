@@ -15,11 +15,11 @@ import chatHtml from './chat/chat-ui.txt';
 import { ChatWidget, type ActiveFile } from './chat/chatWidget';
 import { jupyterThemeVars } from './chat/theme';
 import { WsCoreClient } from './client';
-import { COMMANDS, checkStatus, registerCommands, startOllama, pullModel, type CommandDeps } from './commands';
+import { COMMANDS, checkStatus, registerCommands, startOllama, type CommandDeps } from './commands';
 import { DocumentSync } from './documentSync';
 import { LocalPilotInlineProvider } from './inlineProvider';
 import { unreachableStatus, watchUnreachable } from './reachability';
-import { PLUGIN_ID, fetchStatus, readSettings, restartCore, watchSettings, type Settings } from './settings';
+import { PLUGIN_ID, fetchOllamaCommand, fetchStatus, readSettings, restartCore, watchSettings, type Settings } from './settings';
 import { StatusItem } from './status';
 
 export { CoreDisconnected, ServerUnreachable, WsCoreClient, rpcUrl } from './client';
@@ -217,7 +217,6 @@ const plugin: JupyterFrontEndPlugin<void> = {
       },
       copy: (text) => Clipboard.copyToSystem(text),
       startOllama: () => void startOllama(commandDeps),
-      pullModel: (model) => pullModel(commandDeps, model),
       // The core pauses completions while chat generates (spec §5(10)); show it.
       onChatActiveChanged: (on) => status.setChatActive(on),
       // JupyterLab's --jp-* theme values under chat-ui's --vscode-* names.
@@ -293,14 +292,11 @@ const plugin: JupyterFrontEndPlugin<void> = {
         status.setStatus(s);
         chat.setStatus(s);
       },
-      onPullProgress: (percent) => status.setPull(percent),
+      copy: (text) => Clipboard.copyToSystem(text),
+      ollamaCommand: () => fetchOllamaCommand(serverSettings),
       ui: {
         info: (message) => void Notification.info(message, { autoClose: 5000 }),
         error: (message) => void Notification.error(message, { autoClose: false }),
-        pickModel: async (choices) => {
-          const result = await InputDialog.getItem({ title: 'Model to pull with Ollama', items: choices, editable: true });
-          return result.button.accept ? (result.value ?? undefined) : undefined;
-        },
         pickItem: async (title, items, selected) => {
           const at = selected === undefined ? -1 : items.indexOf(selected);
           const result = await InputDialog.getItem({ title, items, current: Math.max(0, at), editable: false });

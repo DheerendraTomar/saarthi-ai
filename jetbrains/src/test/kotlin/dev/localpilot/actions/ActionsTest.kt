@@ -98,7 +98,7 @@ class ActionsTest : BasePlatformTestCase() {
         host.onStatus(status("modelMissing"))
         assertEquals(2, shown.size)
         assertTrue(shown[0].isExpired)
-        assertEquals(listOf("Pull model", "Retry"), shown[1].actions.map { it.templateText })
+        assertEquals(listOf("Copy pull command", "Retry"), shown[1].actions.map { it.templateText })
 
         host.onStatus(status("ok"))
         assertEquals(2, shown.size)
@@ -110,7 +110,7 @@ class ActionsTest : BasePlatformTestCase() {
     fun test_plugin_xml_registers_actions_keymap_and_widget() {
         val am = ActionManager.getInstance()
         for (id in listOf(
-            "LocalPilot.OpenChat", "LocalPilot.NewSession", "LocalPilot.StartOllama", "LocalPilot.Retry", "LocalPilot.PullModel",
+            "LocalPilot.OpenChat", "LocalPilot.NewSession", "LocalPilot.StartOllama", "LocalPilot.Retry",
             "LocalPilot.SelectChatModel", "LocalPilot.SelectCompletionModel", "LocalPilot.ToggleCompletions",
             "LocalPilot.ShowCompletionStats", "LocalPilot.ResetCompletionLearning", "LocalPilot.RestartCore",
         )) {

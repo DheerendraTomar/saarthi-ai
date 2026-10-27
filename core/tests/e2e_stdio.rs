@@ -348,14 +348,9 @@ async fn ollama_down_reports_down_and_empty_completions() {
 }
 
 #[tokio::test]
-async fn protocol_errors_and_pull_progress() {
+async fn protocol_errors_and_pull_refused() {
     let mock = MockOllama::start(Script {
         models: vec!["coder".to_owned(), "chat".to_owned()],
-        pull: vec![
-            json!({"status": "pulling manifest"}),
-            json!({"status": "downloading", "digest": "sha256:1", "total": 100, "completed": 40}),
-            json!({"status": "success"}),
-        ],
         ..Script::default()
     })
     .await;
@@ -387,14 +382,17 @@ async fn protocol_errors_and_pull_progress() {
     let keys: Vec<&String> = status.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["detail", "ollama"], "{status}");
 
+    // Downloads are never triggered from LocalPilot: the user pulls in a terminal.
     let pull = core.send("ollama/pull", json!({"model": "coder"})).await;
-    let progress = core.notification("ollama/pullProgress").await;
-    assert_eq!(progress["params"]["model"], "coder");
-    assert_eq!(progress["params"]["status"], "pulling manifest");
-    let progress = core.notification("ollama/pullProgress").await;
-    assert_eq!(progress["params"]["completed"], 40);
-    assert_eq!(progress["params"]["total"], 100);
-    assert_eq!(core.response(pull).await["result"], json!({}));
+    let error = core.response(pull).await["error"].clone();
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(message.contains("ollama pull coder"), "{error}");
+    assert!(
+        mock.received_requests()
+            .iter()
+            .all(|(path, _)| path != "/api/pull"),
+        "core asked Ollama to download"
+    );
 
     core.shutdown().await;
 }

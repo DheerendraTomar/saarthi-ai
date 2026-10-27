@@ -13,7 +13,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeFalse
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.File
@@ -33,7 +33,7 @@ class RunCommandTest {
 
     @Before
     fun setUp() {
-        assumeFalse("POSIX shell tests", SystemInfo.isWindows)
+        assumeTrue("sandboxed commands need macOS", SystemInfo.isMac)
         workspace = FileUtil.createTempDirectory("ws", null)
     }
 
@@ -43,12 +43,14 @@ class RunCommandTest {
     }
 
     private fun run(command: String, cwd: String? = null, timeoutMs: Long = 60_000): JsonObject = runBlocking {
-        RunCommand(workspace.toPath(), console, timeoutMs).run(buildJsonObject {
+        RunCommand(workspace.toPath(), console, timeoutMs, PROFILE).run(buildJsonObject {
             put("command", command)
             if (cwd != null) put("cwd", cwd)
             put("sessionId", "s1")
         }).jsonObject
     }
+
+    private val PROFILE = java.nio.file.Path.of(System.getProperty("localpilot.sandboxProfile"))
 
     private fun JsonObject.exit() = this["exitCode"]!!.jsonPrimitive.int
     private fun JsonObject.out() = this["stdout"]!!.jsonPrimitive.content
@@ -61,7 +63,7 @@ class RunCommandTest {
         assertEquals(setOf("exitCode", "stdout", "stderr"), r.keys)
         assertEquals(3, r.exit())
         assertEquals("out\n${workspace.canonicalPath}\n", r.out().replace(workspace.path, workspace.canonicalPath))
-        assertEquals("err\n", r.err())
+        assertEquals("err\n(LocalPilot runs commands without network access)", r.err())
         val echoed = console.value()
         assertTrue(echoed, echoed.contains("$ echo out; echo err 1>&2; pwd; exit 3"))
         assertTrue(echoed, echoed.contains("out\n") && echoed.contains("err\n") && echoed.contains("[exit code 3]"))
@@ -116,10 +118,33 @@ class RunCommandTest {
 
     @Test
     fun runCommand_bad_params_return_error_result() {
-        val r = runBlocking { RunCommand(workspace.toPath(), console).run(buildJsonObject { put("cmd", "ls") }).jsonObject }
+        val r = runBlocking { RunCommand(workspace.toPath(), console, profile = PROFILE).run(buildJsonObject { put("cmd", "ls") }).jsonObject }
         assertEquals(-1, r.exit())
         assertFalse(r.err().isBlank())
-        val noWs = runBlocking { RunCommand(null, console).run(buildJsonObject { put("command", "ls") }).jsonObject }
+        val noWs = runBlocking { RunCommand(null, console, profile = PROFILE).run(buildJsonObject { put("command", "ls") }).jsonObject }
         assertEquals(-1, noWs.exit())
+    }
+
+    @Test
+    fun runCommand_has_no_network_but_loopback_files_work() {
+        val ok = run("echo ok")
+        assertEquals(0, ok.exit())
+        assertEquals("ok\n", ok.out())
+        assertEquals("", ok.err())
+        val net = run("curl -sS -m 5 https://example.com")
+        assertTrue(net.exit() != 0)
+        assertTrue(net.err(), net.err().endsWith("(LocalPilot runs commands without network access)"))
+    }
+
+    @Test
+    fun runCommand_fails_closed_without_profile() {
+        val r = runBlocking { RunCommand(workspace.toPath(), console, profile = java.nio.file.Path.of("/nonexistent/x.sb")).run(buildJsonObject { put("command", "touch ran") }).jsonObject }
+        // A missing profile makes sandbox-exec itself fail, never an unsandboxed run.
+        assertTrue(r.exit() != 0)
+        assertFalse(File(workspace, "ran").exists())
+        val none = runBlocking { RunCommand(workspace.toPath(), console, profile = null).run(buildJsonObject { put("command", "touch ran") }).jsonObject }
+        assertEquals(-1, none.exit())
+        assertTrue(none.err(), none.err().startsWith("LocalPilot runs commands only inside a no-network sandbox (macOS). Not run: touch ran"))
+        assertFalse(File(workspace, "ran").exists())
     }
 }
