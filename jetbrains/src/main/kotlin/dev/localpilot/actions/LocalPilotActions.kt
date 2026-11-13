@@ -9,7 +9,7 @@ import com.intellij.openapi.actionSystem.ToggleAction
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.asContextElement
-import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
@@ -264,7 +264,7 @@ class CompletionStatsDialog(private val project: Project, private val stats: Com
             override fun actionPerformed(e: ActionEvent?) {
                 val file = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(Path.of(path))
                 if (file != null) {
-                    FileEditorManager.getInstance(project).openFile(file, true)
+                    OpenFileDescriptor(project, file).navigate(true)
                     close(OK_EXIT_CODE)
                 }
             }

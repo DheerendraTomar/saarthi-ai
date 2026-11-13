@@ -56,6 +56,7 @@ intellijPlatform {
     pluginConfiguration {
         version = providers.gradleProperty("pluginVersion")
         changeNotes = """
+            <p><b>0.2.1</b>: compatibility with PyCharm 2026.3 (no deprecated API).</p>
             <p><b>0.2.0</b>: published as Saarthi AI. Everything stays on your machine.</p>
             <ul>
               <li>Only an Ollama on this computer (localhost) is used; other addresses are refused.</li>
@@ -79,6 +80,8 @@ intellijPlatform {
                 IntelliJPlatformType.fromCode(providers.gradleProperty("platformType").get()),
                 providers.gradleProperty("platformVersion").get(),
             )
+            // Also check the newest release, where the Marketplace runs its own verification.
+            create(IntelliJPlatformType.fromCode(providers.gradleProperty("platformType").get()), "2026.3")
         }
     }
 }
